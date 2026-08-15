@@ -851,6 +851,24 @@ app.put('/api/admin/orders/:id/status', verifyAdmin, async (req, res) => {
 });
 
 // Vercel Serverless Export
+app.get('/api/admin/exchanges', verifyAdmin, async (req, res) => {
+  try {
+    res.status(200).json({ exchanges: [] });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+app.get('/api/admin/logistics', verifyAdmin, async (req, res) => {
+  try {
+    res.status(200).json({ logistics: [] });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
 export default app;
 
 if (process.env.VERCEL !== '1') {
