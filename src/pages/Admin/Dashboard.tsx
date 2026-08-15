@@ -25,12 +25,19 @@ export default function Dashboard() {
       .finally(() => setLoading(false));
   }, []);
 
-  const stats = data?.stats || [
+  const defaultStats = [
     { label: "Today's Revenue", value: "₹0", change: "0%", icon: IndianRupee },
     { label: "Pending Orders", value: "0", change: "0", icon: ShoppingBag },
     { label: "Low Stock Items", value: "0", change: "0", icon: Package },
-    { label: "Active Exchanges", value: "0", change: "0", icon: RefreshCw },
+    { label: "Total Customers", value: "0", change: "0", icon: RefreshCw },
   ];
+
+  const stats = data?.stats ? data.stats.map((stat: any, index: number) => ({
+    label: stat.title || defaultStats[index]?.label,
+    value: stat.value,
+    change: stat.change,
+    icon: defaultStats[index]?.icon || Package
+  })) : defaultStats;
 
   return (
     <motion.div 
