@@ -219,12 +219,12 @@ export default function AdminOrders() {
                 <div>
                   <label className="block text-xs uppercase tracking-[2px] text-white/40 mb-2">Status</label>
                   <select value={statusInput} onChange={e => setStatusInput(e.target.value)} className="w-full bg-white/5 border border-white/10 rounded-xl h-12 px-4 text-sm text-white focus:outline-none focus:border-white/30">
-                    <option value="PENDING">PENDING</option>
-                    <option value="CONFIRMED">CONFIRMED</option>
-                    <option value="PACKED">PACKED</option>
-                    <option value="SHIPPED">SHIPPED</option>
-                    <option value="OUT_FOR_DELIVERY">OUT FOR DELIVERY</option>
-                    <option value="DELIVERED">DELIVERED</option>
+                    <option value="PENDING" className="bg-[#111] text-white">PENDING</option>
+                    <option value="CONFIRMED" className="bg-[#111] text-white">CONFIRMED</option>
+                    <option value="PACKED" className="bg-[#111] text-white">PACKED</option>
+                    <option value="SHIPPED" className="bg-[#111] text-white">SHIPPED</option>
+                    <option value="OUT_FOR_DELIVERY" className="bg-[#111] text-white">OUT FOR DELIVERY</option>
+                    <option value="DELIVERED" className="bg-[#111] text-white">DELIVERED</option>
                   </select>
                 </div>
                 <div>
