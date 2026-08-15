@@ -117,12 +117,15 @@ export default function QuickViewModal({ product, onClose, onSelectProduct, zInd
     }
   }, [product, isTopmost]);
 
+  const selectedVariant = product?.variants?.find(v => v.color === selectedColor && v.size === selectedSize);
+  const displayPrice = selectedVariant?.price || product?.price || 0;
+
   if (!product) return null;
 
   const handleAddToCart = () => {
     addToCart({
       name: product.name,
-      price: String(product.price),
+      price: String(displayPrice),
       img: currentImage as string,
       size: selectedSize,
       color: selectedColor,
@@ -194,7 +197,7 @@ export default function QuickViewModal({ product, onClose, onSelectProduct, zInd
               <div className="p-8 md:p-12 flex-1">
                 <p className="text-sm font-medium tracking-[2px] text-textSecondary uppercase mb-4">Limited Edition</p>
                 <h2 className="font-serif italic text-4xl md:text-5xl leading-none mb-4">{product.name}</h2>
-                <p className="text-2xl font-medium mb-8">{product.price}</p>
+                <p className="text-2xl font-medium mb-8">₹{displayPrice}</p>
                 
                 <p className="text-textSecondary font-light leading-relaxed mb-8">
                   A brutalist approach to modern luxury. Heavyweight fabrication and architectural 

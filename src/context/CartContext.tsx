@@ -97,8 +97,9 @@ export function CartProvider({ children }: { children: ReactNode }) {
   };
 
   const cartTotal = items.reduce((total, item) => {
-    const priceNum = parseFloat(item.price.replace(/[^0-9.]/g, ''));
-    return total + priceNum * item.quantity;
+    if (!item.price || String(item.price) === 'undefined') return total;
+    const priceNum = parseFloat(String(item.price).replace(/[^0-9.]/g, ''));
+    return total + (isNaN(priceNum) ? 0 : priceNum * item.quantity);
   }, 0);
 
   return (

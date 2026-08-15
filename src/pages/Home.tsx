@@ -359,7 +359,7 @@ export default function Home() {
                 </div>
                 <div className="flex justify-between items-end pt-5">
                   <h4 className="font-medium text-lg">{product.name}</h4>
-                  <span className="font-medium text-textSecondary">${product.price}</span>
+                  <span className="font-medium text-textSecondary">₹{product.price || (product.variants && product.variants.length > 0 ? product.variants[0].price : 0)}</span>
                 </div>
               </div>
             )) : (

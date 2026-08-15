@@ -41,7 +41,7 @@ export default function ProductDetails() {
   
   // Find specific variant to check stock and price override
   const specificVariant = product.variants?.find((v: any) => v.color === selectedColor && v.size === selectedSize);
-  const displayPrice = specificVariant?.price || product.price;
+  const displayPrice = specificVariant?.price || product.price || (product.variants && product.variants.length > 0 ? product.variants[0].price : 0);
   const isOutOfStock = specificVariant && specificVariant.stock <= 0;
 
   // Optimize Cloudinary image (f_auto, q_auto, w_auto)
@@ -79,7 +79,7 @@ export default function ProductDetails() {
         </div>
         <div className="w-full md:w-1/2 flex flex-col justify-center">
           <h1 className="font-serif italic text-4xl md:text-5xl mb-4">{product.name}</h1>
-          <p className="text-2xl font-medium mb-8">${displayPrice}</p>
+          <p className="text-2xl font-medium mb-8">₹{displayPrice}</p>
           <p className="text-textSecondary font-light leading-relaxed mb-8">{product.description || product.short_description}</p>
           
           <div className="flex gap-4 mb-6">

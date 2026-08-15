@@ -58,7 +58,7 @@ export default function Collections() {
                    <Link to={`/product/${product.slug}`}>
                      <h4 className="font-medium text-lg hover:underline">{product.name}</h4>
                    </Link>
-                   <span className="font-medium text-textSecondary">${product.price}</span>
+                   <span className="font-medium text-textSecondary">₹{product.price || (product.variants && product.variants.length > 0 ? product.variants[0].price : 0)}</span>
                  </div>
                </div>
              );

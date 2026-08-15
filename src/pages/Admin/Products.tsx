@@ -122,7 +122,7 @@ export default function Products() {
                   <tr key={product.id} className="border-b border-white/5 hover:bg-white/5 transition-colors group">
                     <td className="px-6 py-4 font-medium text-sm">{product.name}</td>
                     <td className="px-6 py-4 text-sm text-white/60">{product.category}</td>
-                    <td className="px-6 py-4 text-sm">{product.price}</td>
+                    <td className="px-6 py-4 text-sm">₹{product.price || (product.variants && product.variants.length > 0 ? product.variants[0].price : 0)}</td>
                     <td className="px-6 py-4 text-sm text-white/60">{product.variants?.length || 0} variants</td>
                     <td className="px-6 py-4 text-sm">
                       {product.variants?.reduce((total: number, v: any) => total + (v.stock || 0), 0) > 0 ? (
