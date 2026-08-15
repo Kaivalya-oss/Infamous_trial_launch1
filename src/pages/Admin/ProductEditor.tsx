@@ -123,10 +123,9 @@ export default function ProductEditor() {
   const { watch, reset, formState: { isDirty } } = methods;
   const formData = watch();
 
-  // Load existing draft if ID exists
   useEffect(() => {
     if (id && id !== 'new') {
-      api.get(`/api/products/${id}`)
+      api.get(`/api/admin/products/${id}`)
         .then(res => {
           reset(res.data.product);
           setLastSaved(new Date());
