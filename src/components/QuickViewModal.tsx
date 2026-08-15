@@ -13,7 +13,7 @@ interface Product {
   name: string;
   price: string | number;
   img?: string; // Fallback
-  variants?: Array<{ sku: string; color: string; size: string; price: number; stock: number }>;
+  variants?: Array<{ id?: number; sku: string; color: string; size: string; price: number; stock: number }>;
   media?: Array<{ cloudinary_url: string; is_cover: boolean; variant_id?: number }>;
 }
 

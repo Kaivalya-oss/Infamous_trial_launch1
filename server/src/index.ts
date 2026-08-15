@@ -14,10 +14,15 @@ import nodemailer from 'nodemailer';
 dotenv.config();
 
 // --- RAZORPAY INSTANCE ---
-const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID || '',
-  key_secret: process.env.RAZORPAY_KEY_SECRET || '',
-});
+let razorpay: any;
+if (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET) {
+  razorpay = new Razorpay({
+    key_id: process.env.RAZORPAY_KEY_ID,
+    key_secret: process.env.RAZORPAY_KEY_SECRET,
+  });
+} else {
+  console.warn('RAZORPAY_KEY_ID or RAZORPAY_KEY_SECRET is missing. Online payments will fail.');
+}
 
 // --- EMAIL TRANSPORTER ---
 const emailTransporter = process.env.SMTP_HOST ? nodemailer.createTransport({
@@ -482,6 +487,10 @@ app.post('/api/checkout/create-order', authenticateToken, async (req: any, res) 
   if (!items || items.length === 0) return res.status(400).json({ message: 'Cart is empty' });
 
   try {
+    if (!razorpay) {
+      return res.status(500).json({ message: 'Payment gateway is not configured on this server.' });
+    }
+
     // Calculate total from DB prices (NEVER trust frontend prices)
     let totalAmount = 0;
     for (const item of items) {
