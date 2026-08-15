@@ -112,7 +112,7 @@ export default function Inventory() {
                 </tr>
               ) : (
                 inventoryMatrix.map((item) => {
-                  const itemTotal = Object.values(item.sizes).reduce((sum: any, val: any) => sum + val, 0);
+                  const itemTotal = Object.values(item.sizes || {}).reduce((sum: any, val: any) => sum + val, 0);
                   
                   return (
                     <tr key={item.id} className="border-b border-white/5 hover:bg-white/5 transition-colors">
@@ -128,7 +128,8 @@ export default function Inventory() {
                       </td>
                       
                       {['XS', 'S', 'M', 'L', 'XL', 'XXL'].map(size => {
-                        const qty = item.sizes[size as keyof typeof item.sizes];
+                        const sizesObj = item.sizes || {};
+                        const qty = sizesObj[size as keyof typeof sizesObj] || 0;
                         const isLow = qty > 0 && qty <= 5;
                         const isOut = qty === 0;
                         
