@@ -81,10 +81,18 @@ export default function Checkout() {
     }
 
     setIsLoading(true);
+    
+    const invalidItems = items.filter(item => !item.variant_id);
+    if (invalidItems.length > 0) {
+      alert("Some items in your cart are corrupted or no longer available (missing variant data). Please remove them and add them again.");
+      setIsLoading(false);
+      return;
+    }
+
     try {
       // Map local cart items to API expected format
       const checkoutItems = items.map(item => ({
-        variant_id: parseInt(item.id), // Ensure your cart item IDs map correctly, or handle string UUIDs if variants use UUID
+        variant_id: item.variant_id, // Use the correct variant_id we added to CartItem
         name: item.name,
         quantity: item.quantity
       }));
