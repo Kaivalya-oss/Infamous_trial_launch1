@@ -9,6 +9,7 @@ import Home from './pages/Home';
 import ProductDetails from './pages/ProductDetails';
 import Collections from './pages/Collections';
 import Checkout from './pages/Checkout';
+import OrderSuccess from './pages/OrderSuccess';
 import Login from './pages/Auth/Login';
 import Register from './pages/Auth/Register';
 import ForgotPassword from './pages/Auth/ForgotPassword';
@@ -47,6 +48,7 @@ export default function App() {
               <Route path="/collections" element={<Collections />} />
               <Route path="/product/:slug" element={<ProductDetails />} />
               <Route path="/checkout" element={<Checkout />} />
+              <Route path="/order-success/:orderId" element={<OrderSuccess />} />
               <Route path="/auth/login" element={<Login />} />
               <Route path="/auth/register" element={<Register />} />
               <Route path="/auth/forgot-password" element={<ForgotPassword />} />
