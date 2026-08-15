@@ -63,7 +63,8 @@ export default function ProductDetails() {
       img: currentImage,
       size: selectedSize,
       color: selectedColor,
-      quantity
+      quantity,
+      variant_id: specificVariant?.id || (product.variants && product.variants.length > 0 ? product.variants[0].id : undefined)
     } as any);
   };
 

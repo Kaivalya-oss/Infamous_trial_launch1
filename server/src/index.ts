@@ -309,6 +309,7 @@ app.post('/api/cart/merge', authenticateToken, async (req: any, res) => {
       cartId = cartRes.rows[0].id;
     }
     for (const incoming of localItems) {
+      if (!incoming.variant_id) continue;
       await pool.query(`
         INSERT INTO cart_items (cart_id, variant_id, quantity) 
         VALUES ($1, $2, $3)
