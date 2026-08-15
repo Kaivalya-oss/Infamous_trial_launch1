@@ -42,8 +42,10 @@ export function CartProvider({ children }: { children: ReactNode }) {
     // If authenticated, sync with the remote database
     if (isAuthenticated) {
       const timer = setTimeout(() => {
-        api.post('/api/cart/sync', { items })
-          .catch(err => console.error("Failed to sync persistent cart:", err));
+        if (items.length > 0) {
+          api.post('/api/cart/merge', { localItems: items })
+            .catch(err => console.error("Failed to sync persistent cart:", err));
+        }
       }, 1000); // 1-second debounce to prevent spamming the API on rapid quantity changes
       return () => clearTimeout(timer);
     }
