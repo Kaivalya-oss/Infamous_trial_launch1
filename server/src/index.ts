@@ -17,11 +17,12 @@ const port = process.env.PORT || 5000;
 const allowedOrigins = [
   'http://localhost:5173',
   'http://localhost:3000',
-  process.env.FRONTEND_URL
-].filter(Boolean);
+  process.env.FRONTEND_URL,
+  'https://infamous-trial-launch1-seven.vercel.app'
+].filter(Boolean) as string[];
 
 app.use(cors({
-  origin: true,
+  origin: allowedOrigins,
   credentials: true
 }));
 app.use(express.json());
