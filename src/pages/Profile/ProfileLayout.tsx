@@ -36,7 +36,7 @@ export default function ProfileLayout() {
       <div className="max-w-[1400px] mx-auto pt-16 px-6 md:px-12">
         <div className="mb-12">
           <h1 className="font-serif italic text-[48px] md:text-[64px] leading-none mb-4">My Account</h1>
-          <p className="text-textSecondary font-light">Welcome back{user?.firstName ? `, ${user.firstName}` : ''}.</p>
+          <p className="text-textSecondary font-light">Welcome back{user?.name ? `, ${user.name.split(' ')[0]}` : ''}.</p>
         </div>
 
         <div className="flex flex-col md:flex-row gap-12">
