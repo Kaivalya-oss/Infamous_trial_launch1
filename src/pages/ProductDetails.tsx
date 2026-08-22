@@ -46,14 +46,22 @@ export default function ProductDetails() {
 
   // Optimize Cloudinary image (f_auto, q_auto, w_auto)
   const getOptimizedUrl = (url: string) => {
-    if (!url) return '/placeholder.png';
+    if (!url) return '';
     if (!url.includes('cloudinary.com')) return url;
     return url.replace('/upload/', '/upload/f_auto,q_auto,w_auto,dpr_auto/');
   };
 
-  const currentImage = product.media && product.media.length > 0 
-    ? getOptimizedUrl(product.media[0].cloudinary_url) 
-    : '/placeholder.png';
+  const getVariantImage = () => {
+    if (!product.media || product.media.length === 0) return '';
+    if (specificVariant?.id) {
+      const variantMedia = product.media.find((m: any) => m.variant_id === specificVariant.id);
+      if (variantMedia) return getOptimizedUrl(variantMedia.cloudinary_url);
+    }
+    const coverMedia = product.media.find((m: any) => m.is_cover);
+    if (coverMedia) return getOptimizedUrl(coverMedia.cloudinary_url);
+    return getOptimizedUrl(product.media[0].cloudinary_url);
+  };
+  const currentImage = getVariantImage();
 
   const handleAddToCart = () => {
     if (isOutOfStock) return;

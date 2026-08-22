@@ -343,10 +343,21 @@ export default function Home() {
       <section id="campaigns" className="h-screen w-full bg-secondary overflow-hidden">
         <div className="h-full flex items-center">
           <div ref={horizontalRef} className="flex gap-10 pl-[10vw] pr-[10vw]" style={{ width: 'max-content' }}>
-            {products.length > 0 ? products.map((product, i) => (
+            {products.length > 0 ? products.map((product, i) => {
+              const getOptimizedUrl = (url: string) => {
+                if (!url) return '';
+                if (!url.includes('cloudinary.com')) return url;
+                return url.replace('/upload/', '/upload/f_auto,q_auto,w_500,dpr_auto/');
+              };
+              
+              const currentImage = product.media && product.media.length > 0 
+                ? getOptimizedUrl(product.media.find((m: any) => m.is_cover)?.cloudinary_url || product.media[0].cloudinary_url) 
+                : '';
+
+              return (
               <div key={product.id || i} className="w-[400px] shrink-0 group cursor-pointer flex flex-col">
                 <div className="w-full h-[480px] rounded-[24px] overflow-hidden bg-white/50 relative">
-                  <img src={product.images?.cover || product.img} alt={product.name}
+                  <img src={currentImage} alt={product.name}
                     className="w-full h-full object-cover transition-transform duration-[600ms] group-hover:scale-105" />
                   <div className="absolute inset-0 bg-black/0 group-hover:bg-black/5 transition-colors duration-500 flex items-end justify-center pb-6">
                     <button 
@@ -362,7 +373,8 @@ export default function Home() {
                   <span className="font-medium text-textSecondary">₹{product.price || (product.variants && product.variants.length > 0 ? product.variants[0].price : 0)}</span>
                 </div>
               </div>
-            )) : (
+              );
+            }) : (
               <div className="w-full text-center text-white py-20 flex justify-center items-center h-[480px]">
                  <p className="text-xl">Loading dynamic products...</p>
               </div>

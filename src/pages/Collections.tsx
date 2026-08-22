@@ -18,7 +18,7 @@ export default function Collections() {
   }, []);
 
   const getOptimizedUrl = (url: string) => {
-    if (!url) return '/placeholder.png';
+    if (!url) return '';
     if (!url.includes('cloudinary.com')) return url;
     // Add Cloudinary transforms for collections grid (smaller width)
     return url.replace('/upload/', '/upload/f_auto,q_auto,w_500,dpr_auto/');
@@ -34,8 +34,8 @@ export default function Collections() {
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-8">
           {products.map((product) => {
              const currentImage = product.media && product.media.length > 0 
-                ? getOptimizedUrl(product.media[0].cloudinary_url) 
-                : '/placeholder.png';
+                ? getOptimizedUrl(product.media.find((m: any) => m.is_cover)?.cloudinary_url || product.media[0].cloudinary_url) 
+                : '';
              
              return (
                <div key={product.id} className="group cursor-pointer flex flex-col">

@@ -366,13 +366,47 @@ app.post('/api/cart/merge', authenticateToken, async (req: any, res) => {
     }
     for (const incoming of localItems) {
       if (!incoming.variant_id) continue;
-      await pool.query(`
-        INSERT INTO cart_items (cart_id, variant_id, quantity) 
-        VALUES ($1, $2, $3)
-        ON CONFLICT (cart_id, variant_id) DO UPDATE SET quantity = cart_items.quantity + EXCLUDED.quantity
-      `, [cartId, incoming.variant_id, incoming.quantity]);
+      try {
+        await pool.query(`
+          INSERT INTO cart_items (cart_id, variant_id, quantity) 
+          VALUES ($1, $2, $3)
+          ON CONFLICT (cart_id, variant_id) DO UPDATE SET quantity = cart_items.quantity + EXCLUDED.quantity
+        `, [cartId, incoming.variant_id, incoming.quantity]);
+      } catch (e: any) {
+        // Ignore foreign key violations if a variant was deleted
+        if (e.code !== '23503') throw e; 
+      }
     }
-    res.status(200).json({ message: 'Carts merged successfully' });
+    
+    // Now return the merged items back to the client
+    const mergedItemsRes = await pool.query(`
+      SELECT ci.quantity, ci.variant_id, v.color, v.size, p.name, p.price, p.id as product_id
+      FROM cart_items ci
+      JOIN product_variants v ON ci.variant_id = v.id
+      JOIN products p ON v.product_id = p.id
+      WHERE ci.cart_id = $1
+    `, [cartId]);
+    
+    // Fetch images for these items
+    const mergedItems = [];
+    for (const row of mergedItemsRes.rows) {
+      const imgRes = await pool.query(`
+        SELECT cloudinary_url FROM product_images WHERE product_id = $1 AND (variant_id = $2 OR is_cover = true) LIMIT 1
+      `, [row.product_id, row.variant_id]);
+      
+      mergedItems.push({
+        id: `${row.name}-${row.size}`,
+        name: row.name,
+        price: row.price,
+        img: imgRes.rows.length > 0 ? imgRes.rows[0].cloudinary_url : '',
+        size: row.size,
+        color: row.color,
+        quantity: row.quantity,
+        variant_id: row.variant_id
+      });
+    }
+
+    res.status(200).json({ message: 'Carts merged successfully', mergedItems });
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: 'Internal server error' });
@@ -385,7 +419,7 @@ app.get('/api/products', async (req, res) => {
     const result = await pool.query(`
       SELECT p.*,
         COALESCE(json_agg(DISTINCT jsonb_build_object('id', v.id, 'sku', v.sku, 'color', v.color, 'size', v.size, 'price', v.price, 'stock', v.stock)) FILTER (WHERE v.id IS NOT NULL), '[]') AS variants,
-        COALESCE(json_agg(DISTINCT jsonb_build_object('id', m.id, 'cloudinary_url', m.cloudinary_url, 'is_cover', m.is_cover)) FILTER (WHERE m.id IS NOT NULL), '[]') AS media
+        COALESCE(json_agg(DISTINCT jsonb_build_object('id', m.id, 'cloudinary_url', m.cloudinary_url, 'cloudinary_public_id', m.cloudinary_public_id, 'is_cover', m.is_cover, 'media_type', m.media_type, 'display_order', m.display_order, 'variant_id', m.variant_id)) FILTER (WHERE m.id IS NOT NULL), '[]') AS media
       FROM products p
       LEFT JOIN product_variants v ON p.id = v.product_id
       LEFT JOIN product_images m ON p.id = m.product_id
@@ -405,7 +439,7 @@ app.get('/api/products/:slug', async (req, res) => {
     const result = await pool.query(`
       SELECT p.*,
         COALESCE(json_agg(DISTINCT jsonb_build_object('id', v.id, 'sku', v.sku, 'color', v.color, 'size', v.size, 'price', v.price, 'stock', v.stock)) FILTER (WHERE v.id IS NOT NULL), '[]') AS variants,
-        COALESCE(json_agg(DISTINCT jsonb_build_object('id', m.id, 'cloudinary_url', m.cloudinary_url, 'is_cover', m.is_cover)) FILTER (WHERE m.id IS NOT NULL), '[]') AS media
+        COALESCE(json_agg(DISTINCT jsonb_build_object('id', m.id, 'cloudinary_url', m.cloudinary_url, 'cloudinary_public_id', m.cloudinary_public_id, 'is_cover', m.is_cover, 'media_type', m.media_type, 'display_order', m.display_order, 'variant_id', m.variant_id)) FILTER (WHERE m.id IS NOT NULL), '[]') AS media
       FROM products p
       LEFT JOIN product_variants v ON p.id = v.product_id
       LEFT JOIN product_images m ON p.id = m.product_id
@@ -753,7 +787,7 @@ app.get('/api/admin/products', verifyAdmin, async (req, res) => {
     const result = await pool.query(`
       SELECT p.*,
         COALESCE(json_agg(DISTINCT jsonb_build_object('id', v.id, 'sku', v.sku, 'color', v.color, 'size', v.size, 'price', v.price, 'stock', v.stock)) FILTER (WHERE v.id IS NOT NULL), '[]') AS variants,
-        COALESCE(json_agg(DISTINCT jsonb_build_object('id', m.id, 'cloudinary_url', m.cloudinary_url, 'is_cover', m.is_cover)) FILTER (WHERE m.id IS NOT NULL), '[]') AS media,
+        COALESCE(json_agg(DISTINCT jsonb_build_object('id', m.id, 'cloudinary_url', m.cloudinary_url, 'cloudinary_public_id', m.cloudinary_public_id, 'is_cover', m.is_cover, 'media_type', m.media_type, 'display_order', m.display_order, 'variant_id', m.variant_id)) FILTER (WHERE m.id IS NOT NULL), '[]') AS media,
         c.name as category
       FROM products p
       LEFT JOIN product_variants v ON p.id = v.product_id
@@ -775,7 +809,7 @@ app.get('/api/admin/products/:id', verifyAdmin, async (req, res) => {
     const result = await pool.query(`
       SELECT p.*,
         COALESCE(json_agg(DISTINCT jsonb_build_object('id', v.id, 'sku', v.sku, 'color', v.color, 'size', v.size, 'price', v.price, 'stock', v.stock)) FILTER (WHERE v.id IS NOT NULL), '[]') AS variants,
-        COALESCE(json_agg(DISTINCT jsonb_build_object('id', m.id, 'cloudinary_url', m.cloudinary_url, 'is_cover', m.is_cover)) FILTER (WHERE m.id IS NOT NULL), '[]') AS media,
+        COALESCE(json_agg(DISTINCT jsonb_build_object('id', m.id, 'cloudinary_url', m.cloudinary_url, 'cloudinary_public_id', m.cloudinary_public_id, 'is_cover', m.is_cover, 'media_type', m.media_type, 'display_order', m.display_order, 'variant_id', m.variant_id)) FILTER (WHERE m.id IS NOT NULL), '[]') AS media,
         c.name as category
       FROM products p
       LEFT JOIN product_variants v ON p.id = v.product_id
@@ -811,20 +845,30 @@ app.post('/api/admin/products', verifyAdmin, async (req, res) => {
 
     if (variants && Array.isArray(variants)) {
       for (const v of variants) {
+        const finalSku = v.sku || `${finalSlug}-${v.color}-${v.size}`.replace(/\s+/g, '-').toUpperCase();
         await client.query(
           `INSERT INTO product_variants (product_id, sku, color, size, price, stock, status)
            VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-          [productId, v.sku || null, v.color || '', v.size || '', v.price || 0, v.stock || 0, v.status || 'ACTIVE']
+          [productId, finalSku, v.color || '', v.size || '', v.price || 0, v.stock || 0, v.status || 'ACTIVE']
         );
       }
     }
 
+    const variantMap: Record<string, number> = {};
+    const createdVariants = await client.query('SELECT id, sku FROM product_variants WHERE product_id = $1', [productId]);
+    createdVariants.rows.forEach(v => { if (v.sku) variantMap[v.sku] = v.id; });
+
     if (media && Array.isArray(media)) {
       for (const m of media) {
+        let vId = m.variant_id;
+        if (vId && typeof vId === 'string' && variantMap[vId]) vId = variantMap[vId];
+        else if (vId && !isNaN(parseInt(vId))) vId = parseInt(vId);
+        else vId = null;
+
         await client.query(
-          `INSERT INTO product_images (product_id, cloudinary_url, is_cover)
-           VALUES ($1, $2, $3)`,
-          [productId, m.cloudinary_url || '', m.is_cover || false]
+          `INSERT INTO product_images (product_id, cloudinary_url, is_cover, cloudinary_public_id, media_type, display_order, variant_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [productId, m.cloudinary_url || '', m.is_cover || false, m.cloudinary_public_id || null, m.media_type || 'IMAGE', m.display_order || 0, vId]
         );
       }
     }
@@ -864,27 +908,50 @@ app.put('/api/admin/products/:id', verifyAdmin, async (req, res) => {
     }
     const product = result.rows[0];
 
+    const existingImages = await client.query('SELECT cloudinary_public_id FROM product_images WHERE product_id = $1 AND cloudinary_public_id IS NOT NULL', [id]);
+    const incomingPublicIds = media && Array.isArray(media) ? media.map((m: any) => m.cloudinary_public_id).filter(Boolean) : [];
+
     // Delete existing variants and images to replace them
     await client.query('DELETE FROM product_variants WHERE product_id = $1', [id]);
     await client.query('DELETE FROM product_images WHERE product_id = $1', [id]);
 
     if (variants && Array.isArray(variants)) {
       for (const v of variants) {
+        const finalSku = v.sku || `${finalSlug}-${v.color}-${v.size}`.replace(/\s+/g, '-').toUpperCase();
         await client.query(
           `INSERT INTO product_variants (product_id, sku, color, size, price, stock, status)
            VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-          [id, v.sku || null, v.color || '', v.size || '', v.price || 0, v.stock || 0, v.status || 'ACTIVE']
+          [id, finalSku, v.color || '', v.size || '', v.price || 0, v.stock || 0, v.status || 'ACTIVE']
         );
       }
     }
 
+    const variantMap: Record<string, number> = {};
+    const createdVariants = await client.query('SELECT id, sku FROM product_variants WHERE product_id = $1', [id]);
+    createdVariants.rows.forEach(v => { if (v.sku) variantMap[v.sku] = v.id; });
+
     if (media && Array.isArray(media)) {
       for (const m of media) {
+        let vId = m.variant_id;
+        if (vId && typeof vId === 'string' && variantMap[vId]) vId = variantMap[vId];
+        else if (vId && !isNaN(parseInt(vId))) vId = parseInt(vId);
+        else vId = null;
+
         await client.query(
-          `INSERT INTO product_images (product_id, cloudinary_url, is_cover)
-           VALUES ($1, $2, $3)`,
-          [id, m.cloudinary_url || '', m.is_cover || false]
+          `INSERT INTO product_images (product_id, cloudinary_url, is_cover, cloudinary_public_id, media_type, display_order, variant_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [id, m.cloudinary_url || '', m.is_cover || false, m.cloudinary_public_id || null, m.media_type || 'IMAGE', m.display_order || 0, vId]
         );
+      }
+    }
+
+    // Cleanup unreferenced Cloudinary images
+    for (const row of existingImages.rows) {
+      if (!incomingPublicIds.includes(row.cloudinary_public_id)) {
+        const refCheck = await client.query('SELECT id FROM product_images WHERE cloudinary_public_id = $1', [row.cloudinary_public_id]);
+        if (refCheck.rows.length === 0) {
+          cloudinary.uploader.destroy(row.cloudinary_public_id).catch(e => console.error('Cloudinary cleanup error', e));
+        }
       }
     }
 
@@ -901,11 +968,27 @@ app.put('/api/admin/products/:id', verifyAdmin, async (req, res) => {
 
 app.delete('/api/admin/products/:id', verifyAdmin, async (req, res) => {
   const { id } = req.params;
+  const client = await pool.connect();
   try {
-    const result = await pool.query('DELETE FROM products WHERE id = $1 RETURNING id', [id]);
-    if (result.rowCount === 0) return res.status(404).json({ message: 'Product not found' });
+    const existingImages = await client.query('SELECT cloudinary_public_id FROM product_images WHERE product_id = $1 AND cloudinary_public_id IS NOT NULL', [id]);
+    const result = await client.query('DELETE FROM products WHERE id = $1 RETURNING id', [id]);
+    if (result.rowCount === 0) {
+      client.release();
+      return res.status(404).json({ message: 'Product not found' });
+    }
+    
+    // Cleanup Cloudinary
+    for (const row of existingImages.rows) {
+      const refCheck = await client.query('SELECT id FROM product_images WHERE cloudinary_public_id = $1', [row.cloudinary_public_id]);
+      if (refCheck.rows.length === 0) {
+        cloudinary.uploader.destroy(row.cloudinary_public_id).catch(e => console.error('Cloudinary cleanup error', e));
+      }
+    }
+    
+    client.release();
     res.status(200).json({ message: 'Product deleted successfully' });
   } catch (error) {
+    client.release();
     console.error(error);
     res.status(500).json({ message: 'Internal server error' });
   }

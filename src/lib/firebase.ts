@@ -14,8 +14,17 @@ if (!firebaseConfig.apiKey && !import.meta.env.DEV) {
   throw new Error("Missing Firebase Configuration in Production. Please check environment variables.");
 }
 
-const app = initializeApp(firebaseConfig);
-export const auth: Auth = getAuth(app);
+let app;
+let auth: Auth | any = {};
+
+try {
+  app = initializeApp(firebaseConfig);
+  auth = getAuth(app);
+} catch (e) {
+  console.warn("Firebase initialization failed (likely missing config in dev):", e);
+}
+
+export { auth };
 export const googleProvider = new GoogleAuthProvider();
 
 export { signInWithPopup, signInWithPhoneNumber, RecaptchaVerifier };

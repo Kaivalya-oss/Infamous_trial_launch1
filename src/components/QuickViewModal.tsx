@@ -59,11 +59,21 @@ export default function QuickViewModal({ product, onClose, onSelectProduct, zInd
     if (uniqueSizes.length > 0 && !uniqueSizes.includes(selectedSize)) setSelectedSize(uniqueSizes[0]);
   }, [product, uniqueColors, uniqueSizes, selectedColor, selectedSize]);
 
-  // Map selected color to its specific Cloudinary image if variant media exists
-  // In a robust implementation, media table would link to variant colors.
-  const currentImage = product?.media && product.media.length > 0 
-    ? (product.media.find(m => m.is_cover)?.cloudinary_url || product.media[0].cloudinary_url)
-    : (product?.img || '/placeholder.png');
+  const getVariantImage = () => {
+    if (!product?.media || product.media.length === 0) return '';
+    
+    // selectedVariant is declared later, so we manually find it here based on state
+    const variantId = product?.variants?.find(v => v.color === selectedColor && v.size === selectedSize)?.id;
+    if (variantId) {
+      const variantMedia = product.media.find(m => m.variant_id === variantId);
+      if (variantMedia) return variantMedia.cloudinary_url;
+    }
+    
+    const coverMedia = product.media.find(m => m.is_cover);
+    if (coverMedia) return coverMedia.cloudinary_url;
+    return product.media[0].cloudinary_url;
+  };
+  const currentImage = getVariantImage();
 
   // Check if user purchased the product
   useEffect(() => {
