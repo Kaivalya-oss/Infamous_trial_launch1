@@ -380,7 +380,7 @@ app.post('/api/cart/merge', authenticateToken, async (req: any, res) => {
     
     // Now return the merged items back to the client
     const mergedItemsRes = await pool.query(`
-      SELECT ci.quantity, ci.variant_id, v.color, v.size, p.name, p.price, p.id as product_id
+      SELECT ci.quantity, ci.variant_id, v.color, v.size, p.name, v.price, p.id as product_id
       FROM cart_items ci
       JOIN product_variants v ON ci.variant_id = v.id
       JOIN products p ON v.product_id = p.id
