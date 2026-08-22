@@ -7,14 +7,23 @@ import { Button } from '../../components/ui/Button';
 
 export default function Inventory() {
   const [inventoryMatrix, setInventoryMatrix] = useState<any[]>([]);
+  const [rawInventory, setRawInventory] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
   const [alerts, setAlerts] = useState<any[]>([]);
+  const [searchQuery, setSearchQuery] = useState('');
+  
+  // Bulk update state
+  const [isBulkEditing, setIsBulkEditing] = useState(false);
+  const [bulkUpdates, setBulkUpdates] = useState<Record<number, number>>({});
+  const [isSaving, setIsSaving] = useState(false);
 
-  useEffect(() => {
+  const fetchInventory = () => {
+    setLoading(true);
     api.get('/api/admin/inventory')
       .then(res => {
         setInventoryMatrix(res.data.inventory || []);
+        setRawInventory(res.data.raw || []);
         setAlerts(res.data.alerts || []);
         setError(false);
       })
@@ -23,7 +32,73 @@ export default function Inventory() {
         setError(true);
       })
       .finally(() => setLoading(false));
+  };
+
+  useEffect(() => {
+    fetchInventory();
   }, []);
+
+  const handleExportCSV = () => {
+    if (!rawInventory || rawInventory.length === 0) return;
+    
+    // Filter raw inventory by search query
+    const filteredRaw = rawInventory.filter(item => {
+      const q = searchQuery.toLowerCase();
+      return (item.product_name && item.product_name.toLowerCase().includes(q)) || 
+             (item.sku && item.sku.toLowerCase().includes(q));
+    });
+
+    const headers = ['Product Name', 'SKU', 'Variant ID', 'Color', 'Size', 'Current Stock', 'Price'];
+    const rows = filteredRaw.map(item => [
+      `"${(item.product_name || '').replace(/"/g, '""')}"`,
+      `"${(item.sku || '').replace(/"/g, '""')}"`,
+      item.id,
+      `"${(item.color || '').replace(/"/g, '""')}"`,
+      `"${(item.size || '').replace(/"/g, '""')}"`,
+      item.stock,
+      item.price
+    ]);
+    
+    const csvContent = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.setAttribute('download', `infamous-inventory-${new Date().toISOString().split('T')[0]}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  const handleSaveBulkUpdate = async () => {
+    const updates = Object.keys(bulkUpdates).map(variantId => ({
+      variant_id: parseInt(variantId),
+      stock: bulkUpdates[parseInt(variantId)]
+    }));
+
+    if (updates.length === 0) {
+      setIsBulkEditing(false);
+      return;
+    }
+
+    setIsSaving(true);
+    try {
+      await api.put('/api/admin/inventory/bulk', { updates });
+      alert('Inventory updated successfully.');
+      setIsBulkEditing(false);
+      setBulkUpdates({});
+      fetchInventory();
+    } catch (error: any) {
+      console.error(error);
+      alert(error.response?.data?.message || 'Failed to update inventory');
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const filteredMatrix = inventoryMatrix.filter(item => 
+    item.product.toLowerCase().includes(searchQuery.toLowerCase())
+  );
 
   return (
     <motion.div 
@@ -38,14 +113,25 @@ export default function Inventory() {
           <p className="text-white/60 font-light">Track and manage stock quantities across all colors and sizes.</p>
         </div>
         <div className="flex gap-4">
-          <Button className="bg-white/10 border border-white/20 hover:bg-white/20 gap-2">
+          <Button onClick={handleExportCSV} className="bg-white/10 border border-white/20 hover:bg-white/20 gap-2" disabled={loading || isBulkEditing}>
             <ArrowDownToLine size={18} />
             Export CSV
           </Button>
-          <Button className="bg-white text-black hover:bg-white/90 gap-2">
-            <ArrowUpToLine size={18} />
-            Bulk Update
-          </Button>
+          {isBulkEditing ? (
+            <div className="flex gap-2">
+              <Button onClick={() => { setIsBulkEditing(false); setBulkUpdates({}); }} className="bg-white/10 border border-white/20 hover:bg-white/20" disabled={isSaving}>
+                Cancel
+              </Button>
+              <Button onClick={handleSaveBulkUpdate} className="bg-white text-black hover:bg-white/90" disabled={isSaving}>
+                {isSaving ? 'Saving...' : 'Save Changes'}
+              </Button>
+            </div>
+          ) : (
+            <Button onClick={() => setIsBulkEditing(true)} className="bg-white text-black hover:bg-white/90 gap-2">
+              <ArrowUpToLine size={18} />
+              Bulk Update
+            </Button>
+          )}
         </div>
       </div>
 
@@ -55,6 +141,8 @@ export default function Inventory() {
           <Search className="absolute left-4 top-1/2 -translate-y-1/2 text-white/40" size={18} />
           <input 
             type="text" 
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
             placeholder="Search by SKU or Product Name..." 
             className="w-full bg-white/5 border border-white/10 rounded-full h-12 pl-12 pr-6 text-sm text-white placeholder:text-white/40 focus:outline-none focus:border-white/30 transition-colors"
           />
@@ -103,15 +191,14 @@ export default function Inventory() {
                     <p className="text-sm mt-1 text-red-400/80">Please try again.</p>
                   </td>
                 </tr>
-              ) : inventoryMatrix.length === 0 ? (
+              ) : filteredMatrix.length === 0 ? (
                 <tr>
                   <td colSpan={9} className="px-6 py-12 text-center text-white/60">
-                    <p className="font-medium mb-1">Inventory is empty.</p>
-                    <p className="text-sm">Create a product to generate inventory.</p>
+                    <p className="font-medium mb-1">No inventory found.</p>
                   </td>
                 </tr>
               ) : (
-                inventoryMatrix.map((item) => {
+                filteredMatrix.map((item) => {
                   const itemTotal = Object.values(item.sizes || {}).reduce((sum: any, val: any) => sum + val, 0);
                   
                   return (
@@ -129,19 +216,34 @@ export default function Inventory() {
                       
                       {['XS', 'S', 'M', 'L', 'XL', 'XXL'].map(size => {
                         const sizesObj = item.sizes || {};
-                        const qty = sizesObj[size as keyof typeof sizesObj] || 0;
+                        const variantId = item.variants?.[size];
+                        const baseQty = sizesObj[size] || 0;
+                        const qty = bulkUpdates[variantId] !== undefined ? bulkUpdates[variantId] : baseQty;
                         const isLow = qty > 0 && qty <= 5;
                         const isOut = qty === 0;
                         
                         return (
                           <td key={size} className="px-6 py-4">
-                            <div className={`w-full h-10 rounded-[8px] border flex items-center justify-center text-sm font-medium transition-colors cursor-pointer hover:border-white/50 ${
-                              isOut ? 'bg-red-500/10 border-red-500/30 text-red-400' :
-                              isLow ? 'bg-yellow-500/10 border-yellow-500/30 text-yellow-400' :
-                              'bg-black/20 border-white/10 text-white'
-                            }`}>
-                              {qty}
-                            </div>
+                            {isBulkEditing && variantId ? (
+                              <input 
+                                type="number" 
+                                min="0" 
+                                value={qty}
+                                onChange={(e) => {
+                                  const val = parseInt(e.target.value) || 0;
+                                  setBulkUpdates(prev => ({ ...prev, [variantId]: Math.max(0, val) }));
+                                }}
+                                className="w-full h-10 rounded-[8px] border bg-black/40 border-white/30 text-white text-center text-sm font-medium focus:outline-none focus:border-white"
+                              />
+                            ) : (
+                              <div className={`w-full h-10 rounded-[8px] border flex items-center justify-center text-sm font-medium transition-colors ${
+                                isOut ? 'bg-red-500/10 border-red-500/30 text-red-400' :
+                                isLow ? 'bg-yellow-500/10 border-yellow-500/30 text-yellow-400' :
+                                'bg-black/20 border-white/10 text-white'
+                              }`}>
+                                {variantId ? qty : '-'}
+                              </div>
+                            )}
                           </td>
                         );
                       })}

@@ -1072,16 +1072,77 @@ app.get('/api/admin/customers', verifyAdmin, async (req, res) => {
   }
 });
 
+app.put('/api/admin/inventory/bulk', verifyAdmin, async (req, res) => {
+  const { updates } = req.body;
+  if (!updates || !Array.isArray(updates)) {
+    return res.status(400).json({ message: 'Invalid payload format' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    
+    for (const update of updates) {
+      const { variant_id, stock } = update;
+      
+      if (typeof variant_id !== 'number' || typeof stock !== 'number' || stock < 0) {
+        throw new Error(`Invalid data for variant ${variant_id}`);
+      }
+      
+      const result = await client.query(
+        'UPDATE product_variants SET stock = $1, updated_at = NOW() WHERE id = $2 RETURNING id',
+        [stock, variant_id]
+      );
+      
+      if (result.rowCount === 0) {
+        throw new Error(`Variant ${variant_id} not found`);
+      }
+    }
+    
+    await client.query('COMMIT');
+    res.status(200).json({ success: true, message: 'Inventory updated successfully' });
+  } catch (error: any) {
+    await client.query('ROLLBACK');
+    console.error('Bulk inventory update failed:', error.message);
+    res.status(400).json({ success: false, message: error.message || 'Failed to update inventory' });
+  } finally {
+    client.release();
+  }
+});
+
 app.get('/api/admin/inventory', verifyAdmin, async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT v.id, v.sku, v.color, v.size, v.stock, v.price, p.name as product_name
       FROM product_variants v
       JOIN products p ON v.product_id = p.id
-      ORDER BY v.stock ASC
+      ORDER BY p.name, v.color, v.size
     `);
-    const alerts = result.rows.filter(v => v.stock < 10).map(v => ({ message: `${v.product_name} (${v.color} / ${v.size}) is running low (${v.stock} left).` }));
-    res.status(200).json({ inventory: result.rows, alerts });
+    
+    // Group by product_name + color for the matrix
+    const matrixMap: any = {};
+    const alerts: any[] = [];
+    
+    for (const v of result.rows) {
+      if (v.stock < 10) {
+        alerts.push({ message: `${v.product_name} (${v.color} / ${v.size}) is running low (${v.stock} left).` });
+      }
+      
+      const key = `${v.product_name}_${v.color}`;
+      if (!matrixMap[key]) {
+        matrixMap[key] = {
+          id: key,
+          product: v.product_name,
+          color: v.color,
+          sizes: {},
+          variants: {}
+        };
+      }
+      matrixMap[key].sizes[v.size] = v.stock;
+      matrixMap[key].variants[v.size] = v.id;
+    }
+    
+    res.status(200).json({ inventory: Object.values(matrixMap), alerts, raw: result.rows });
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: 'Internal server error' });
