@@ -202,15 +202,23 @@ export default function Checkout() {
   };
 
   return (
-    <div className="min-h-screen bg-background pt-32 pb-24 px-6 md:px-12">
-      <div className="max-w-[1200px] mx-auto flex flex-col lg:flex-row gap-12">
+    <div className="min-h-screen bg-background pb-24">
+      {/* ════════════════════ CHECKOUT HEADER ════════════════════ */}
+      <nav className="w-full flex items-center justify-between px-6 md:px-12 py-6 border-b border-black/[0.08] bg-white/50 backdrop-blur-md sticky top-0 z-50">
+        <Link to="/" className="font-serif italic text-[24px] md:text-[32px] tracking-[-1px] md:tracking-[-2px] text-textPrimary hover:opacity-70 transition-opacity">
+          INFAMOUS
+        </Link>
+        <Link to="/" className="flex items-center gap-2 text-sm font-medium text-textSecondary hover:text-textPrimary transition-colors group">
+          <ArrowLeft size={16} className="group-hover:-translate-x-1 transition-transform" />
+          <span className="hidden md:inline">Back to Shopping</span>
+          <span className="md:hidden">Back</span>
+        </Link>
+      </nav>
+
+      <div className="max-w-[1200px] mx-auto flex flex-col lg:flex-row gap-12 pt-16 px-6 md:px-12">
         
         {/* Left Side: Forms */}
         <div className="flex-1">
-          <Link to="/" className="inline-flex items-center gap-2 text-sm text-textSecondary hover:text-textPrimary transition-colors mb-8">
-            <ArrowLeft size={16} /> Back to Shopping
-          </Link>
-
           <h1 className="font-serif italic text-4xl md:text-5xl mb-12">Checkout</h1>
 
           {!isAuthenticated ? (

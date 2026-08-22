@@ -20,6 +20,7 @@ import SecuritySettings from './pages/Profile/SecuritySettings';
 import Exchanges from './pages/Profile/Exchanges';
 import IntroOverlay from './components/IntroOverlay';
 import ScrollToTop from './components/ScrollToTop';
+import Footer from './components/Footer';
 
 // Admin Pages
 import AdminLayout from './pages/Admin/AdminLayout';
@@ -33,6 +34,12 @@ import AdminExchanges from './pages/Admin/Exchanges';
 import AdminLogistics from './pages/Admin/Logistics';
 import AdminSettings from './pages/Admin/Settings';
 import AdminLogin from './pages/Admin/AdminLogin';
+
+import PrivacyPolicy from './pages/Static/PrivacyPolicy';
+import TermsAndConditions from './pages/Static/TermsAndConditions';
+import ShippingPolicy from './pages/Static/ShippingPolicy';
+import ReturnsRefunds from './pages/Static/ReturnsRefunds';
+import Contact from './pages/Static/Contact';
 
 export default function App() {
   return (
@@ -52,6 +59,13 @@ export default function App() {
               <Route path="/auth/login" element={<Login />} />
               <Route path="/auth/register" element={<Register />} />
               <Route path="/auth/forgot-password" element={<ForgotPassword />} />
+              
+              {/* Static Pages */}
+              <Route path="/privacy-policy" element={<PrivacyPolicy />} />
+              <Route path="/terms-and-conditions" element={<TermsAndConditions />} />
+              <Route path="/shipping-policy" element={<ShippingPolicy />} />
+              <Route path="/returns-refunds" element={<ReturnsRefunds />} />
+              <Route path="/contact" element={<Contact />} />
               
               {/* Admin Public Route */}
               <Route path="/admin/login" element={<AdminLogin />} />
@@ -81,6 +95,7 @@ export default function App() {
                 </Route>
               </Route>
             </Routes>
+            <Footer />
           </CartProvider>
         </AdminAuthProvider>
       </AuthProvider>
