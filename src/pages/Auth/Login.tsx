@@ -39,12 +39,24 @@ export default function Login() {
   const [confirmationResult, setConfirmationResult] = useState<any>(null);
 
   useEffect(() => {
-    if (!window.recaptchaVerifier) {
-      window.recaptchaVerifier = new RecaptchaVerifier(auth, 'recaptcha-container', {
-        size: 'invisible'
-      });
+    // Initialize recaptcha when switching to phone tab if not already initialized
+    if (loginMethod === 'phone' && !window.recaptchaVerifier) {
+      try {
+        window.recaptchaVerifier = new RecaptchaVerifier(auth, 'recaptcha-container', {
+          size: 'invisible'
+        });
+      } catch (e) {
+        console.error('Failed to initialize recaptcha:', e);
+      }
     }
-  }, []);
+    
+    return () => {
+      if (window.recaptchaVerifier && loginMethod === 'email') {
+        window.recaptchaVerifier.clear();
+        window.recaptchaVerifier = null;
+      }
+    };
+  }, [loginMethod]);
 
   // Google Login Flow
   const handleGoogleLogin = async () => {
@@ -74,19 +86,48 @@ export default function Login() {
   // Phone OTP Flow
   const handleSendOtp = async () => {
     setPhoneError('');
-    if (!phoneNumber.replace(/\s+/g, '').match(/^\+91\d{10}$/)) {
-      setPhoneError('Please enter a valid 10-digit Indian number starting with +91');
+    // Normalize to E.164 format: e.g. +919373860560
+    const normalizedPhone = phoneNumber.replace(/[\s-]/g, '');
+    
+    if (!normalizedPhone.match(/^\+\d{10,15}$/)) {
+      setPhoneError('Please enter a valid phone number with country code (e.g. +919876543210)');
       return;
     }
+    
     setIsLoading(true);
     try {
+      if (!window.recaptchaVerifier) {
+        window.recaptchaVerifier = new RecaptchaVerifier(auth, 'recaptcha-container', {
+          size: 'invisible'
+        });
+      }
       const appVerifier = window.recaptchaVerifier;
-      const confirmation = await signInWithPhoneNumber(auth, phoneNumber.replace(/\s+/g, ''), appVerifier);
+      const confirmation = await signInWithPhoneNumber(auth, normalizedPhone, appVerifier);
       setConfirmationResult(confirmation);
       setOtpSent(true);
     } catch (err: any) {
-      console.error(err);
-      setPhoneError('Failed to send OTP. Please try again.');
+      console.error('Firebase Phone Auth Error:', err);
+      
+      // Reset recaptcha if it fails so user can try again
+      if (window.recaptchaVerifier) {
+        window.recaptchaVerifier.clear();
+        window.recaptchaVerifier = null;
+      }
+      
+      const errorCode = err.code;
+      if (errorCode === 'auth/operation-not-allowed') {
+        setPhoneError('SMS configuration error: Phone provider or region not allowed in Firebase.');
+      } else if (errorCode === 'auth/invalid-phone-number') {
+        setPhoneError('Invalid phone number format.');
+      } else if (errorCode === 'auth/too-many-requests') {
+        setPhoneError('Too many requests. Please try again later.');
+      } else if (errorCode === 'auth/quota-exceeded') {
+        setPhoneError('SMS quota exceeded. Please try again later.');
+      } else if (errorCode === 'auth/captcha-check-failed') {
+        setPhoneError('reCAPTCHA verification failed. Please try again.');
+      } else {
+        setPhoneError('Failed to send OTP. Please try again.');
+      }
     } finally {
       setIsLoading(false);
     }
@@ -108,7 +149,13 @@ export default function Login() {
       navigate(from, { replace: true });
     } catch (err: any) {
       console.error(err);
-      setPhoneError('Invalid OTP. Please try again.');
+      if (err.code === 'auth/invalid-verification-code') {
+        setPhoneError('Incorrect OTP. Please try again.');
+      } else if (err.code === 'auth/code-expired') {
+        setPhoneError('OTP has expired. Please request a new one.');
+      } else {
+        setPhoneError('Verification failed. Please try again.');
+      }
     } finally {
       setIsLoading(false);
     }
