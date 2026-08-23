@@ -835,18 +835,32 @@ app.post('/api/admin/products', verifyAdmin, async (req, res) => {
             }
         }
         const variantMap = {};
-        const createdVariants = await client.query('SELECT id, sku FROM product_variants WHERE product_id = $1', [productId]);
-        createdVariants.rows.forEach(v => { if (v.sku)
-            variantMap[v.sku] = v.id; });
+        const createdVariants = await client.query('SELECT id, sku FROM product_variants WHERE product_id = $1 ORDER BY id ASC', [productId]);
+        createdVariants.rows.forEach((v, idx) => {
+            if (v.sku)
+                variantMap[v.sku] = v.id;
+            variantMap[idx.toString()] = v.id;
+        });
         if (media && Array.isArray(media)) {
             for (const m of media) {
                 let vId = m.variant_id;
-                if (vId && typeof vId === 'string' && variantMap[vId])
-                    vId = variantMap[vId];
-                else if (vId && !isNaN(parseInt(vId)))
-                    vId = parseInt(vId);
-                else
+                // Resolve frontend variant_id (which could be a SKU or an array index) to the DB ID
+                if (vId !== null && vId !== undefined) {
+                    const vIdStr = vId.toString();
+                    if (variantMap[vIdStr]) {
+                        vId = variantMap[vIdStr];
+                    }
+                    else if (!isNaN(parseInt(vIdStr))) {
+                        // Fallback for existing numeric IDs (though unlikely needed for new products)
+                        vId = parseInt(vIdStr);
+                    }
+                    else {
+                        vId = null;
+                    }
+                }
+                else {
                     vId = null;
+                }
                 await client.query(`INSERT INTO product_images (product_id, cloudinary_url, is_cover, cloudinary_public_id, media_type, display_order, variant_id)
            VALUES ($1, $2, $3, $4, $5, $6, $7)`, [productId, m.cloudinary_url || '', m.is_cover || false, m.cloudinary_public_id || null, m.media_type || 'IMAGE', m.display_order || 0, vId]);
             }
@@ -856,7 +870,15 @@ app.post('/api/admin/products', verifyAdmin, async (req, res) => {
     }
     catch (error) {
         await client.query('ROLLBACK');
-        console.error(error);
+        console.error('--- PRODUCT CREATION ERROR ---');
+        console.error('Message:', error.message);
+        console.error('Code:', error.code);
+        console.error('Detail:', error.detail);
+        console.error('Constraint:', error.constraint);
+        console.error('Table:', error.table);
+        console.error('Column:', error.column);
+        console.error('Payload preview:', { name, slug, category_id, variantsCount: variants?.length, mediaCount: media?.length });
+        console.error('-----------------------------');
         res.status(500).json({ message: 'Internal server error' });
     }
     finally {
