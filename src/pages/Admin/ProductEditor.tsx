@@ -184,6 +184,7 @@ export default function ProductEditor() {
   };
 
   const onSubmit = async (data: any) => {
+    if (saveStatus === 'saving') return;
     setSaveStatus('saving');
     try {
       if (id === 'new') {
@@ -230,16 +231,17 @@ export default function ProductEditor() {
             variant="outline" 
             className="border-white/15 text-white/80 hover:bg-white/10 hover:border-white/30 hover:text-white" 
             type="button" 
+            disabled={saveStatus === 'saving'}
             onClick={() => {
               const data = methods.getValues();
               data.status = 'DRAFT';
               onSubmit(data);
             }}
           >
-            Save as Draft
+            {saveStatus === 'saving' ? 'Saving...' : 'Save as Draft'}
           </Button>
           <Button 
-            disabled={activeStep !== 3} 
+            disabled={activeStep !== 3 || saveStatus === 'saving'} 
             type="button" 
             onClick={() => {
               methods.setValue('status', 'PUBLISHED');
@@ -247,7 +249,7 @@ export default function ProductEditor() {
             }}
             className="bg-white text-black hover:bg-white/90 shadow-[0_0_20px_rgba(255,255,255,0.15)] hover:shadow-[0_0_30px_rgba(255,255,255,0.3)] disabled:opacity-50 disabled:shadow-none"
           >
-            Publish Product
+            {saveStatus === 'saving' ? 'Publishing...' : 'Publish Product'}
           </Button>
         </div>
       </div>

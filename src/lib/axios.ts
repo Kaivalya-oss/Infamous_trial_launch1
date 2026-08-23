@@ -50,8 +50,15 @@ api.interceptors.response.use(
         localStorage.setItem('infamous_token', newAccessToken);
         
         // Update header for original request and retry
-        originalRequest.headers['Authorization'] = `Bearer ${newAccessToken}`;
-        return api(originalRequest);
+        // Create a clean copy of the config to prevent Axios internals from breaking the retry
+        const retryConfig = { 
+          ...originalRequest,
+          headers: {
+            ...originalRequest.headers,
+            Authorization: `Bearer ${newAccessToken}`
+          }
+        };
+        return api(retryConfig);
       } catch (refreshError) {
         // If refresh fails (e.g., expired or invalid refresh token), logout
         localStorage.removeItem('infamous_token');
