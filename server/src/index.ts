@@ -1087,8 +1087,8 @@ app.get('/api/admin/analytics', verifyAdmin, async (req, res) => {
 app.get('/api/admin/customers', verifyAdmin, async (req, res) => {
   try {
     const result = await pool.query(`
-      SELECT u.id, u.name, u.email, u.phone_number, u.created_at, u.last_login,
-      COUNT(o.id) as total_orders, COALESCE(SUM(o.total_amount), 0) as total_spent
+      SELECT u.id, u.name, u.email, u.phone_number as phone, u.created_at as "joinDate", u.last_login, u.status,
+      COUNT(o.id) as orders, COALESCE(SUM(o.total_amount), 0) as ltv
       FROM users u
       LEFT JOIN orders o ON u.id = o.user_id
       WHERE u.role = 'USER'
@@ -1096,6 +1096,21 @@ app.get('/api/admin/customers', verifyAdmin, async (req, res) => {
       ORDER BY u.created_at DESC
     `);
     res.status(200).json({ customers: result.rows });
+  } catch (error) {
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+app.put('/api/admin/customers/:id/status', verifyAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { status } = req.body;
+  if (!['Active', 'Suspended'].includes(status)) {
+    return res.status(400).json({ message: 'Invalid status' });
+  }
+  try {
+    const result = await pool.query('UPDATE users SET status = $1 WHERE id = $2 RETURNING id, status', [status, id]);
+    if (result.rowCount === 0) return res.status(404).json({ message: 'Customer not found' });
+    res.status(200).json({ message: 'Status updated', customer: result.rows[0] });
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: 'Internal server error' });
