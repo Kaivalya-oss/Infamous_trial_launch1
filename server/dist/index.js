@@ -88,11 +88,17 @@ const allowedOrigins = [
 ].filter(Boolean);
 app.use((0, cors_1.default)({
     origin: function (origin, callback) {
-        if (!origin || allowedOrigins.includes(origin) || origin.endsWith('.vercel.app')) {
+        if (!origin ||
+            allowedOrigins.includes(origin) ||
+            origin.endsWith('.vercel.app') ||
+            origin.startsWith('http://localhost:') ||
+            origin.startsWith('http://127.0.0.1:') ||
+            origin.startsWith('http://192.168.')) {
             callback(null, true);
         }
         else {
-            callback(new Error('Not allowed by CORS'));
+            console.warn(`[CORS] Rejected origin: ${origin}`);
+            callback(null, false);
         }
     },
     credentials: true
