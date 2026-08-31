@@ -687,7 +687,17 @@ app.get('/api/orders', authenticateToken, async (req: any, res) => {
 const verifyAdmin = (req: any, res: any, next: any) => {
   authenticateToken(req, res, () => {
     if (req.user.role !== 'ADMIN' && req.user.role !== 'SUPER_ADMIN') {
-      return res.status(403).json({ message: 'Admin access required' });
+      console.warn(`[AUTH] Admin access denied for user ${req.user.userId}. Role '${req.user.role}' is not ADMIN or SUPER_ADMIN.`);
+      return res.status(403).json({ 
+        message: 'Admin access required',
+        debug: {
+          reason: 'role_mismatch',
+          userId: req.user.userId,
+          email: req.user.email,
+          role: req.user.role,
+          expectedRoles: ['ADMIN', 'SUPER_ADMIN']
+        }
+      });
     }
     next();
   });
@@ -835,6 +845,7 @@ app.get('/api/admin/products/:id', verifyAdmin, async (req, res) => {
 });
 
 app.post('/api/admin/products', verifyAdmin, async (req, res) => {
+  console.log('[ADMIN_PRODUCT_CREATE] START');
   const { name, slug, short_description, description, category_id, brand, status, seo_title, seo_description, variants, media } = req.body;
   const client = await pool.connect();
   try {
@@ -843,6 +854,7 @@ app.post('/api/admin/products', verifyAdmin, async (req, res) => {
     const finalName = name || 'Untitled Product';
     const finalSlug = slug || `draft-${Date.now()}`;
     
+    console.log('[ADMIN_PRODUCT_CREATE] PRODUCT INSERT START');
     const result = await client.query(
       `INSERT INTO products (name, slug, short_description, description, category_id, brand, status, seo_title, seo_description) 
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
@@ -850,36 +862,34 @@ app.post('/api/admin/products', verifyAdmin, async (req, res) => {
     );
     const product = result.rows[0];
     const productId = product.id;
-
-    if (variants && Array.isArray(variants)) {
-      for (const v of variants) {
-        const finalSku = v.sku || `${finalSlug}-${v.color}-${v.size}`.replace(/\s+/g, '-').toUpperCase();
-        await client.query(
-          `INSERT INTO product_variants (product_id, sku, color, size, price, stock, status)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-          [productId, finalSku, v.color || '', v.size || '', v.price || 0, v.stock || 0, v.status || 'ACTIVE']
-        );
-      }
-    }
+    console.log(`[ADMIN_PRODUCT_CREATE] PRODUCT INSERT OK. ID: ${productId}`);
 
     const variantMap: Record<string, number> = {};
-    const createdVariants = await client.query('SELECT id, sku FROM product_variants WHERE product_id = $1 ORDER BY id ASC', [productId]);
-    createdVariants.rows.forEach((v, idx) => { 
-      if (v.sku) variantMap[v.sku] = v.id; 
-      variantMap[idx.toString()] = v.id;
-    });
+    if (variants && Array.isArray(variants)) {
+      console.log(`[ADMIN_PRODUCT_CREATE] VARIANTS INSERT START (${variants.length} variants)`);
+      for (const [idx, v] of variants.entries()) {
+        const finalSku = v.sku || `${finalSlug}-${v.color}-${v.size}`.replace(/\s+/g, '-').toUpperCase();
+        const vResult = await client.query(
+          `INSERT INTO product_variants (product_id, sku, color, size, price, stock, status)
+           VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+          [productId, finalSku, v.color || '', v.size || '', v.price || 0, v.stock || 0, v.status || 'ACTIVE']
+        );
+        const newId = vResult.rows[0].id;
+        variantMap[finalSku] = newId;
+        variantMap[idx.toString()] = newId;
+      }
+      console.log('[ADMIN_PRODUCT_CREATE] VARIANTS INSERT OK');
+    }
 
     if (media && Array.isArray(media)) {
-      for (const m of media) {
+      console.log(`[ADMIN_PRODUCT_CREATE] MEDIA INSERT START (${media.length} media items)`);
+      for (const [index, m] of media.entries()) {
         let vId = m.variant_id;
         // Resolve frontend variant_id (which could be a SKU or an array index) to the DB ID
-        if (vId !== null && vId !== undefined) {
+        if (vId !== null && vId !== undefined && vId !== '') {
           const vIdStr = vId.toString();
           if (variantMap[vIdStr]) {
             vId = variantMap[vIdStr];
-          } else if (!isNaN(parseInt(vIdStr))) {
-            // Fallback for existing numeric IDs (though unlikely needed for new products)
-            vId = parseInt(vIdStr);
           } else {
             vId = null;
           }
@@ -887,28 +897,40 @@ app.post('/api/admin/products', verifyAdmin, async (req, res) => {
           vId = null;
         }
 
+        console.log(`[ADMIN_PRODUCT_CREATE] Inserting media ${index}: public_id=${m.cloudinary_public_id}, vId=${vId}`);
         await client.query(
           `INSERT INTO product_images (product_id, cloudinary_url, is_cover, cloudinary_public_id, media_type, display_order, variant_id)
            VALUES ($1, $2, $3, $4, $5, $6, $7)`,
           [productId, m.cloudinary_url || '', m.is_cover || false, m.cloudinary_public_id || null, m.media_type || 'IMAGE', m.display_order || 0, vId]
         );
       }
+      console.log('[ADMIN_PRODUCT_CREATE] MEDIA INSERT OK');
     }
 
     await client.query('COMMIT');
+    console.log('[ADMIN_PRODUCT_CREATE] TRANSACTION COMMIT OK');
     res.status(201).json({ message: 'Product created', product });
   } catch (error: any) {
     await client.query('ROLLBACK');
     console.error('--- PRODUCT CREATION ERROR ---');
-    console.error('Message:', error.message);
-    console.error('Code:', error.code);
-    console.error('Detail:', error.detail);
-    console.error('Constraint:', error.constraint);
-    console.error('Table:', error.table);
-    console.error('Column:', error.column);
+    console.error('[ADMIN_PRODUCT_CREATE] FAILED AT:', error.message);
+    console.error('error code:', error.code);
+    console.error('error message:', error.message);
+    console.error('PostgreSQL detail:', error.detail);
+    console.error('constraint:', error.constraint);
+    console.error('table:', error.table);
+    console.error('column:', error.column);
     console.error('Payload preview:', { name, slug, category_id, variantsCount: variants?.length, mediaCount: media?.length });
     console.error('-----------------------------');
-    res.status(500).json({ message: 'Internal server error' });
+    res.status(500).json({ 
+      message: 'Internal server error',
+      debug: {
+        errorMsg: error.message,
+        code: error.code,
+        detail: error.detail,
+        constraint: error.constraint
+      }
+    });
   } finally {
     client.release();
   }
@@ -945,27 +967,37 @@ app.put('/api/admin/products/:id', verifyAdmin, async (req, res) => {
     await client.query('DELETE FROM product_variants WHERE product_id = $1', [id]);
     await client.query('DELETE FROM product_images WHERE product_id = $1', [id]);
 
+    const variantMap: Record<string, number> = {};
     if (variants && Array.isArray(variants)) {
-      for (const v of variants) {
+      for (const [idx, v] of variants.entries()) {
         const finalSku = v.sku || `${finalSlug}-${v.color}-${v.size}`.replace(/\s+/g, '-').toUpperCase();
-        await client.query(
+        const vResult = await client.query(
           `INSERT INTO product_variants (product_id, sku, color, size, price, stock, status)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+           VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
           [id, finalSku, v.color || '', v.size || '', v.price || 0, v.stock || 0, v.status || 'ACTIVE']
         );
+        const newId = vResult.rows[0].id;
+        variantMap[finalSku] = newId;
+        variantMap[idx.toString()] = newId;
+        if (v.id) {
+          variantMap[v.id.toString()] = newId;
+        }
       }
     }
-
-    const variantMap: Record<string, number> = {};
-    const createdVariants = await client.query('SELECT id, sku FROM product_variants WHERE product_id = $1', [id]);
-    createdVariants.rows.forEach(v => { if (v.sku) variantMap[v.sku] = v.id; });
 
     if (media && Array.isArray(media)) {
       for (const m of media) {
         let vId = m.variant_id;
-        if (vId && typeof vId === 'string' && variantMap[vId]) vId = variantMap[vId];
-        else if (vId && !isNaN(parseInt(vId))) vId = parseInt(vId);
-        else vId = null;
+        if (vId !== null && vId !== undefined && vId !== '') {
+          const vIdStr = vId.toString();
+          if (variantMap[vIdStr]) {
+            vId = variantMap[vIdStr];
+          } else {
+            vId = null;
+          }
+        } else {
+          vId = null;
+        }
 
         await client.query(
           `INSERT INTO product_images (product_id, cloudinary_url, is_cover, cloudinary_public_id, media_type, display_order, variant_id)
