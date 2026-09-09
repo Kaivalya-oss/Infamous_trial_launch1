@@ -421,6 +421,17 @@ app.post('/api/cart/merge', authenticateToken, async (req: any, res) => {
   }
 });
 
+// --- CATEGORIES ---
+app.get('/api/categories', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM categories ORDER BY name ASC');
+    res.status(200).json({ categories: result.rows });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
 // --- PRODUCTS ---
 app.get('/api/products', async (req, res) => {
   try {
@@ -922,6 +933,10 @@ app.post('/api/admin/products', verifyAdmin, async (req, res) => {
     console.error('column:', error.column);
     console.error('Payload preview:', { name, slug, category_id, variantsCount: variants?.length, mediaCount: media?.length });
     console.error('-----------------------------');
+    if (error.code === '23503' && error.constraint === 'products_category_id_fkey') {
+      return res.status(400).json({ message: 'Invalid category selected.' });
+    }
+
     res.status(500).json({ 
       message: 'Internal server error',
       debug: {
@@ -1019,9 +1034,12 @@ app.put('/api/admin/products/:id', verifyAdmin, async (req, res) => {
 
     await client.query('COMMIT');
     res.status(200).json({ message: 'Product updated', product });
-  } catch (error) {
+  } catch (error: any) {
     await client.query('ROLLBACK');
     console.error(error);
+    if (error.code === '23503' && error.constraint === 'products_category_id_fkey') {
+      return res.status(400).json({ message: 'Invalid category selected.' });
+    }
     res.status(500).json({ message: 'Internal server error' });
   } finally {
     client.release();

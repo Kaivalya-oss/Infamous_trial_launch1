@@ -13,6 +13,13 @@ import { Input } from '../../components/ui/Input';
 
 const ProductGeneralForm = () => {
   const { register, formState: { errors } } = useFormContext();
+  const [categories, setCategories] = useState<any[]>([]);
+
+  useEffect(() => {
+    api.get('/api/categories')
+      .then(res => setCategories(res.data.categories || []))
+      .catch(err => console.error("Failed to load categories", err));
+  }, []);
   
   return (
     <div className="p-8 bg-white/5 rounded-2xl border border-white/10 flex flex-col gap-6">
@@ -43,9 +50,9 @@ const ProductGeneralForm = () => {
             className="w-full bg-black/20 border border-white/10 rounded-xl h-12 px-4 text-sm text-white focus:outline-none focus:border-white/30 appearance-none"
           >
             <option value="">Select a category</option>
-            <option value="1">Hoodies</option>
-            <option value="2">T-Shirts</option>
-            <option value="3">Pants</option>
+            {categories.map(cat => (
+              <option key={cat.id} value={cat.id}>{cat.name}</option>
+            ))}
           </select>
         </div>
         <Input 
