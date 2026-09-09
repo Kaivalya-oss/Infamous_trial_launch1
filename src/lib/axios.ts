@@ -13,16 +13,26 @@ const api = axios.create({
   }
 });
 
+const checkIsAdminRoute = (url?: string): boolean => {
+  if (!url) return false;
+  return url.includes('/api/admin') || url.includes('api/admin');
+};
+
 // Request interceptor to attach access token
 api.interceptors.request.use(
   (config) => {
-    const isAdminRoute = config.url?.startsWith('/api/admin');
+    const isAdminRoute = checkIsAdminRoute(config.url);
     const token = isAdminRoute
       ? localStorage.getItem('infamous_admin_token')
       : localStorage.getItem('infamous_token');
       
     if (token) {
-      config.headers['Authorization'] = `Bearer ${token}`;
+      if (config.headers && typeof config.headers.set === 'function') {
+        config.headers.set('Authorization', `Bearer ${token}`);
+      } else {
+        config.headers = config.headers || {};
+        config.headers['Authorization'] = `Bearer ${token}`;
+      }
     }
     return config;
   },
@@ -40,20 +50,17 @@ api.interceptors.response.use(
       originalRequest._retry = true;
       
       try {
-        const isAdminRoute = originalRequest.url?.startsWith('/api/admin');
+        const isAdminRoute = checkIsAdminRoute(originalRequest.url);
         const refreshTokenKey = isAdminRoute ? 'infamous_admin_refresh_token' : 'infamous_refresh_token';
         const tokenKey = isAdminRoute ? 'infamous_admin_token' : 'infamous_token';
         
-        let refreshToken = localStorage.getItem(refreshTokenKey);
-        // Fallback for backwards compatibility if admin token is still in the old key
-        if (!refreshToken && isAdminRoute) {
-          refreshToken = localStorage.getItem('infamous_refresh_token');
-        }
+        const refreshToken = localStorage.getItem(refreshTokenKey);
 
         if (!refreshToken) throw new Error('No refresh token available');
         
         // Attempt to refresh
-        const refreshResponse = await axios.post(`${api.defaults.baseURL}/api/auth/refresh`, {
+        const baseURL = api.defaults.baseURL || '';
+        const refreshResponse = await axios.post(`${baseURL}/api/auth/refresh`, {
           refreshToken
         });
         
@@ -63,18 +70,15 @@ api.interceptors.response.use(
         localStorage.setItem(tokenKey, newAccessToken);
         
         // Update header for original request and retry
-        // Create a clean copy of the config to prevent Axios internals from breaking the retry
-        const retryConfig = { 
-          ...originalRequest,
-          headers: {
-            ...originalRequest.headers,
-            Authorization: `Bearer ${newAccessToken}`
-          }
-        };
-        return api(retryConfig);
+        if (originalRequest.headers && typeof originalRequest.headers.set === 'function') {
+          originalRequest.headers.set('Authorization', `Bearer ${newAccessToken}`);
+        } else if (originalRequest.headers) {
+          originalRequest.headers['Authorization'] = `Bearer ${newAccessToken}`;
+        }
+        return api(originalRequest);
       } catch (refreshError) {
         // If refresh fails (e.g., expired or invalid refresh token), logout
-        const isAdminRoute = originalRequest.url?.startsWith('/api/admin');
+        const isAdminRoute = checkIsAdminRoute(originalRequest.url);
         if (isAdminRoute) {
           localStorage.removeItem('infamous_admin_token');
           localStorage.removeItem('infamous_admin_refresh_token');

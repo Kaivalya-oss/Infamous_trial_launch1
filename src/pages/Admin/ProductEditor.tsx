@@ -109,6 +109,8 @@ export default function ProductEditor() {
   const [activeStep, setActiveStep] = useState(0);
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [lastSaved, setLastSaved] = useState<Date | null>(null);
+  const [feedbackMessage, setFeedbackMessage] = useState<string | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   // Initialize React Hook Form
   const methods = useForm({
@@ -193,24 +195,40 @@ export default function ProductEditor() {
   const onSubmit = async (data: any) => {
     if (saveStatus === 'saving') return;
     setSaveStatus('saving');
+    setErrorMessage(null);
+    setFeedbackMessage(null);
     try {
       if (id === 'new') {
         const response = await api.post('/api/admin/products', data);
-        setSaveStatus('saved');
-        setLastSaved(new Date());
-        setTimeout(() => {
-          navigate(`/admin/products/${response.data.product.id}`);
-        }, 1000);
+        if (response.status === 201 || response.status === 200) {
+          const successMsg = data.status === 'PUBLISHED' 
+            ? 'Product published successfully' 
+            : 'Product saved as draft';
+          setSaveStatus('saved');
+          setFeedbackMessage(successMsg);
+          setLastSaved(new Date());
+          setTimeout(() => {
+            navigate('/admin/products');
+          }, 1000);
+        }
       } else {
-        await api.put(`/api/admin/products/${id}`, data);
-        setSaveStatus('saved');
-        setLastSaved(new Date());
+        const response = await api.put(`/api/admin/products/${id}`, data);
+        if (response.status === 200) {
+          const successMsg = data.status === 'PUBLISHED' 
+            ? 'Product published successfully' 
+            : 'Product updated successfully';
+          setSaveStatus('saved');
+          setFeedbackMessage(successMsg);
+          setLastSaved(new Date());
+          setTimeout(() => setSaveStatus('idle'), 2000);
+        }
       }
-      setTimeout(() => setSaveStatus('idle'), 2000);
-    } catch (error) {
-      console.error(error);
+    } catch (error: any) {
+      console.error('Product save error:', error);
       setSaveStatus('error');
-      setTimeout(() => setSaveStatus('idle'), 2000);
+      setFeedbackMessage(null);
+      const serverMsg = error.response?.data?.message || error.message || 'Failed to save product';
+      setErrorMessage(serverMsg);
     }
   };
 
@@ -225,7 +243,7 @@ export default function ProductEditor() {
           <div>
             <h1 className="text-[28px] font-serif italic text-white tracking-wide">{id === 'new' ? 'Create Product' : 'Edit Product'}</h1>
             <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-[1px] mt-1">
-              {saveStatus === 'saving' && <span className="text-yellow-400/80 animate-pulse">Saving draft...</span>}
+              {saveStatus === 'saving' && <span className="text-yellow-400/80 animate-pulse">Saving...</span>}
               {saveStatus === 'saved' && <span className="text-emerald-400 flex items-center gap-1.5"><CheckCircle size={14} /> Saved</span>}
               {saveStatus === 'error' && <span className="text-red-400 flex items-center gap-1.5"><AlertCircle size={14} /> Save failed</span>}
               {saveStatus === 'idle' && lastSaved && <span className="text-white/40">Last saved: {lastSaved.toLocaleTimeString()}</span>}
@@ -260,6 +278,28 @@ export default function ProductEditor() {
           </Button>
         </div>
       </div>
+
+      {feedbackMessage && (
+        <div className="mb-6 p-4 bg-emerald-500/10 border border-emerald-500/30 rounded-xl text-emerald-400 text-sm flex items-center gap-2">
+          <CheckCircle size={16} />
+          <span>{feedbackMessage}</span>
+        </div>
+      )}
+      {errorMessage && (
+        <div className="mb-6 p-4 bg-red-500/10 border border-red-500/30 rounded-xl text-red-400 text-sm flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <AlertCircle size={16} />
+            <span>{errorMessage}</span>
+          </div>
+          <button 
+            type="button" 
+            onClick={() => setErrorMessage(null)} 
+            className="text-xs text-red-400/70 hover:text-red-400 font-medium uppercase tracking-wider"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
 
       <FormProvider {...methods}>
         <form onSubmit={methods.handleSubmit(onSubmit)}>
