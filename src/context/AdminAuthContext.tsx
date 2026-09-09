@@ -27,8 +27,17 @@ export function AdminAuthProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     const storedAdmin = localStorage.getItem('infamous_admin');
-    if (storedAdmin) {
+    const hasAdminToken = !!localStorage.getItem('infamous_admin_token');
+    const hasAdminRefreshToken = !!localStorage.getItem('infamous_admin_refresh_token');
+
+    if (storedAdmin && hasAdminToken && hasAdminRefreshToken) {
+      // All three keys present — restore the admin session
       setAdmin(JSON.parse(storedAdmin));
+    } else if (storedAdmin) {
+      // Stale/incomplete session — clear everything and stay logged out
+      localStorage.removeItem('infamous_admin');
+      localStorage.removeItem('infamous_admin_token');
+      localStorage.removeItem('infamous_admin_refresh_token');
     }
     setIsLoading(false);
   }, []);

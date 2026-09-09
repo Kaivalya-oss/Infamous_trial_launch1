@@ -56,7 +56,9 @@ api.interceptors.response.use(
         
         const refreshToken = localStorage.getItem(refreshTokenKey);
 
-        if (!refreshToken) throw new Error('No refresh token available');
+        if (!refreshToken) {
+          throw new Error('Session expired: Please log in again');
+        }
         
         // Attempt to refresh
         const baseURL = api.defaults.baseURL || '';
