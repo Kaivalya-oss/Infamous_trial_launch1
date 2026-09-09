@@ -48,8 +48,8 @@ export function AdminAuthProvider({ children }: { children: React.ReactNode }) {
         };
         
         setAdmin(adminUser);
-        localStorage.setItem('infamous_token', response.data.accessToken);
-        localStorage.setItem('infamous_refresh_token', response.data.refreshToken);
+        localStorage.setItem('infamous_admin_token', response.data.accessToken);
+        localStorage.setItem('infamous_admin_refresh_token', response.data.refreshToken);
         localStorage.setItem('infamous_admin', JSON.stringify(adminUser));
       } else {
         throw new Error('Unauthorized: Admin access required');
@@ -63,8 +63,8 @@ export function AdminAuthProvider({ children }: { children: React.ReactNode }) {
 
   const logout = () => {
     setAdmin(null);
-    localStorage.removeItem('infamous_token');
-    localStorage.removeItem('infamous_refresh_token');
+    localStorage.removeItem('infamous_admin_token');
+    localStorage.removeItem('infamous_admin_refresh_token');
     localStorage.removeItem('infamous_admin');
   };
 

@@ -28,6 +28,41 @@ export default function AdminCustomers() {
       .finally(() => setLoading(false));
   };
 
+  const handleExportCSV = () => {
+    const data = searchQuery
+      ? customers.filter((c: any) =>
+          c.name?.toLowerCase().includes(searchQuery.toLowerCase()) ||
+          c.email?.toLowerCase().includes(searchQuery.toLowerCase()) ||
+          c.phone?.toLowerCase().includes(searchQuery.toLowerCase())
+        )
+      : customers;
+    if (!data || data.length === 0) {
+      alert('No customer data to export.');
+      return;
+    }
+    const headers = ['ID', 'Name', 'Email', 'Phone', 'Joined', 'Orders', 'LTV (₹)', 'Status'];
+    const rows = data.map((c: any) => [
+      c.id,
+      `"${(c.name || '').replace(/"/g, '""')}"`,
+      `"${(c.email || '').replace(/"/g, '""')}"`,
+      `"${(c.phone || '').replace(/"/g, '""')}"`,
+      `"${c.joinDate ? new Date(c.joinDate).toLocaleDateString() : ''}"`,
+      c.orders,
+      parseFloat(c.ltv || 0).toFixed(2),
+      `"${c.status || 'Active'}"`
+    ]);
+    const csvContent = [headers.join(','), ...rows.map((r: any[]) => r.join(','))].join('\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.setAttribute('download', `infamous-customers-${new Date().toISOString().split('T')[0]}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
   const toggleStatus = async (customer: any) => {
     const newStatus = customer.status === 'Active' ? 'Suspended' : 'Active';
     const confirmMessage = newStatus === 'Suspended' 
@@ -59,7 +94,7 @@ export default function AdminCustomers() {
           <h2 className="font-serif italic text-[36px] md:text-[48px] leading-none mb-2">Customers</h2>
           <p className="text-white/60 font-light">Manage user accounts, view lifetime value, and handle suspensions.</p>
         </div>
-        <Button className="bg-white/10 border border-white/20 hover:bg-white/20 gap-2">
+        <Button onClick={handleExportCSV} disabled={loading} className="bg-white/10 border border-white/20 hover:bg-white/20 gap-2">
           <Download size={18} /> Export Data
         </Button>
       </div>

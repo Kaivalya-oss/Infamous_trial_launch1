@@ -16,7 +16,11 @@ const api = axios.create({
 // Request interceptor to attach access token
 api.interceptors.request.use(
   (config) => {
-    const token = localStorage.getItem('infamous_token');
+    const isAdminRoute = config.url?.startsWith('/api/admin');
+    const token = isAdminRoute
+      ? localStorage.getItem('infamous_admin_token')
+      : localStorage.getItem('infamous_token');
+      
     if (token) {
       config.headers['Authorization'] = `Bearer ${token}`;
     }
@@ -36,7 +40,16 @@ api.interceptors.response.use(
       originalRequest._retry = true;
       
       try {
-        const refreshToken = localStorage.getItem('infamous_refresh_token');
+        const isAdminRoute = originalRequest.url?.startsWith('/api/admin');
+        const refreshTokenKey = isAdminRoute ? 'infamous_admin_refresh_token' : 'infamous_refresh_token';
+        const tokenKey = isAdminRoute ? 'infamous_admin_token' : 'infamous_token';
+        
+        let refreshToken = localStorage.getItem(refreshTokenKey);
+        // Fallback for backwards compatibility if admin token is still in the old key
+        if (!refreshToken && isAdminRoute) {
+          refreshToken = localStorage.getItem('infamous_refresh_token');
+        }
+
         if (!refreshToken) throw new Error('No refresh token available');
         
         // Attempt to refresh
@@ -47,7 +60,7 @@ api.interceptors.response.use(
         const newAccessToken = refreshResponse.data.accessToken;
         
         // Save new token
-        localStorage.setItem('infamous_token', newAccessToken);
+        localStorage.setItem(tokenKey, newAccessToken);
         
         // Update header for original request and retry
         // Create a clean copy of the config to prevent Axios internals from breaking the retry
@@ -61,13 +74,21 @@ api.interceptors.response.use(
         return api(retryConfig);
       } catch (refreshError) {
         // If refresh fails (e.g., expired or invalid refresh token), logout
-        localStorage.removeItem('infamous_token');
-        localStorage.removeItem('infamous_refresh_token');
-        localStorage.removeItem('infamous_user');
-        
-        // Redirect to login if not already there
-        if (window.location.pathname !== '/auth/login') {
-          window.location.href = '/auth/login?session_expired=true';
+        const isAdminRoute = originalRequest.url?.startsWith('/api/admin');
+        if (isAdminRoute) {
+          localStorage.removeItem('infamous_admin_token');
+          localStorage.removeItem('infamous_admin_refresh_token');
+          localStorage.removeItem('infamous_admin');
+          if (!window.location.pathname.includes('/admin/login')) {
+            window.location.href = '/admin/login?session_expired=true';
+          }
+        } else {
+          localStorage.removeItem('infamous_token');
+          localStorage.removeItem('infamous_refresh_token');
+          localStorage.removeItem('infamous_user');
+          if (window.location.pathname !== '/auth/login') {
+            window.location.href = '/auth/login?session_expired=true';
+          }
         }
         return Promise.reject(refreshError);
       }
