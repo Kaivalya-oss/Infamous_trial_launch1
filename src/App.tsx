@@ -33,6 +33,7 @@ import AdminCustomers from './pages/Admin/Customers';
 import AdminExchanges from './pages/Admin/Exchanges';
 import AdminLogistics from './pages/Admin/Logistics';
 import AdminSettings from './pages/Admin/Settings';
+import AdminReviews from './pages/Admin/Reviews';
 import AdminLogin from './pages/Admin/AdminLogin';
 
 import PrivacyPolicy from './pages/Static/PrivacyPolicy';
@@ -79,10 +80,12 @@ export default function App() {
                   <Route path="inventory" element={<AdminInventory />} />
                   <Route path="orders" element={<AdminOrders />} />
                   <Route path="customers" element={<AdminCustomers />} />
+                  <Route path="reviews" element={<AdminReviews />} />
                   <Route path="exchanges" element={<AdminExchanges />} />
                   <Route path="logistics" element={<AdminLogistics />} />
                   <Route path="settings" element={<AdminSettings />} />
                 </Route>
+
               </Route>
               
               {/* Profile Routes - Protected */}

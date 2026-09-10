@@ -3,10 +3,9 @@ import { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { X, ShoppingBag } from 'lucide-react';
 import { useCart } from '../context/CartContext';
-import { useAuth } from '../context/AuthContext';
-import api from '../lib/axios';
 import { Button } from './ui/Button';
 import { QuantitySelector } from './ui/QuantitySelector';
+import ProductReviews from './ProductReviews';
 
 interface Product {
   id?: string | number;
@@ -29,20 +28,11 @@ export default function QuickViewModal({ product, onClose, onSelectProduct, zInd
   const [selectedSize, setSelectedSize] = useState<string>('M');
   const [selectedColor, setSelectedColor] = useState<string>('Black');
   const [isSizeGuideOpen, setIsSizeGuideOpen] = useState(false);
-  const [sortReview, setSortReview] = useState<'recent' | 'highest' | 'lowest'>('recent');
   const [quantity, setQuantity] = useState(1);
-  
-  // Review Form State
-  const [reviewRating, setReviewRating] = useState(0);
-  const [reviewTitle, setReviewTitle] = useState('');
-  const [reviewComment, setReviewComment] = useState('');
-  const [isSubmittingReview, setIsSubmittingReview] = useState(false);
-  const [reviewSubmitted, setReviewSubmitted] = useState(false);
-  const [hasPurchased, setHasPurchased] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const { addToCart } = useCart();
-  const { isAuthenticated } = useAuth(); // Assume we imported useAuth
+
 
   // Extract dynamic colors and sizes from API variants
   const uniqueColors = product?.variants 
@@ -75,22 +65,6 @@ export default function QuickViewModal({ product, onClose, onSelectProduct, zInd
   };
   const currentImage = getVariantImage();
 
-  // Check if user purchased the product
-  useEffect(() => {
-    if (isAuthenticated && product) {
-      api.get(`/api/products/${product.id}/review-eligibility`)
-        .then((res: any) => {
-          setHasPurchased(res.data.eligible);
-        })
-        .catch((err: any) => {
-          console.error("Failed to verify purchase eligibility", err);
-          setHasPurchased(false);
-        });
-    } else {
-      setHasPurchased(false);
-    }
-  }, [isAuthenticated, product]);
-
   // Lock body scrolling while the modal is open
   useEffect(() => {
     if (product) {
@@ -98,14 +72,10 @@ export default function QuickViewModal({ product, onClose, onSelectProduct, zInd
       if (scrollRef.current) {
         scrollRef.current.scrollTo(0, 0);
       }
-      // Reset color and size and reviews
       setSelectedColor('Black');
       setSelectedSize('M');
       setQuantity(1);
-      setReviewSubmitted(false);
-      setReviewRating(0);
-      setReviewTitle('');
-      setReviewComment('');
+
 
       if (isTopmost) {
         // Store original overflow and padding
@@ -145,23 +115,7 @@ export default function QuickViewModal({ product, onClose, onSelectProduct, zInd
     onClose();
   };
 
-  const reviews: any[] = [];
 
-  const renderStars = (rating: number) => {
-    return Array.from({ length: 5 }).map((_, i) => (
-      <span key={i} className={i < rating ? 'text-black' : 'text-black/20'}>★</span>
-    ));
-  };
-
-  const submitReview = () => {
-    if (reviewRating === 0 || !reviewTitle || !reviewComment) return;
-    setIsSubmittingReview(true);
-    // Simulate API call
-    setTimeout(() => {
-      setIsSubmittingReview(false);
-      setReviewSubmitted(true);
-    }, 1000);
-  };
 
   return (
     <AnimatePresence>
@@ -327,137 +281,8 @@ export default function QuickViewModal({ product, onClose, onSelectProduct, zInd
                 </div>
 
                 {/* ──────────────────────── REVIEWS SECTION ──────────────────────── */}
-                <div className="border-t border-black/10 pt-12">
-                  <h3 className="font-serif italic text-3xl mb-2">Customer Reviews</h3>
-                  <div className="flex items-center gap-4 mb-8">
-                    <div className="text-2xl">{renderStars(0)}</div>
-                    <p className="font-medium">0 <span className="text-textSecondary font-light">(0 Reviews)</span></p>
-                  </div>
+                <ProductReviews productId={Number(product.id)} />
 
-                  {/* Summary Bars */}
-                  <div className="flex flex-col gap-2 mb-10">
-                    {[
-                      { stars: 5, pct: 0 },
-                      { stars: 4, pct: 0 },
-                      { stars: 3, pct: 0 },
-                      { stars: 2, pct: 0 },
-                      { stars: 1, pct: 0 }
-                    ].map((row) => (
-                      <div key={row.stars} className="flex items-center gap-3 text-sm">
-                        <span className="w-6 font-medium text-textSecondary">{row.stars}★</span>
-                        <div className="flex-1 h-2 bg-secondary rounded-full overflow-hidden">
-                          <div className="h-full bg-black" style={{ width: `${row.pct}%` }} />
-                        </div>
-                        <span className="w-8 text-right text-textSecondary">{row.pct}%</span>
-                      </div>
-                    ))}
-                  </div>
-
-                  {/* Write a Review (Conditional) */}
-                  {isAuthenticated ? (
-                    hasPurchased ? (
-                      <div className="bg-secondary rounded-[16px] p-6 mb-10">
-                        {reviewSubmitted ? (
-                          <div className="text-center py-4">
-                            <p className="font-medium text-green-700 mb-1">Thank you for your review!</p>
-                            <p className="text-sm text-textSecondary">Your feedback has been submitted successfully.</p>
-                          </div>
-                        ) : (
-                          <>
-                            <h4 className="font-medium mb-4">Write a Review</h4>
-                            <input 
-                              type="text" 
-                              placeholder="Review Title" 
-                              value={reviewTitle}
-                              onChange={(e) => setReviewTitle(e.target.value)}
-                              className="w-full bg-white border border-black/10 rounded-xl h-12 px-4 text-sm focus:outline-none focus:border-black mb-3" 
-                            />
-                            <textarea 
-                              placeholder="Share your experience..." 
-                              value={reviewComment}
-                              onChange={(e) => setReviewComment(e.target.value)}
-                              className="w-full bg-white border border-black/10 rounded-xl p-4 text-sm focus:outline-none focus:border-black min-h-[100px] mb-3" 
-                            />
-                            <div className="flex justify-between items-center">
-                              <div className="text-lg flex gap-1">
-                                {[1, 2, 3, 4, 5].map((star) => (
-                                  <button
-                                    key={star}
-                                    onClick={() => setReviewRating(star)}
-                                    className={`transition-colors ${star <= reviewRating ? 'text-black' : 'text-black/20 hover:text-black/50'}`}
-                                  >
-                                    ★
-                                  </button>
-                                ))}
-                              </div>
-                              <Button 
-                                onClick={submitReview} 
-                                isLoading={isSubmittingReview}
-                                disabled={reviewRating === 0 || !reviewTitle || !reviewComment}
-                                className="py-2 px-6 disabled:opacity-50"
-                              >
-                                Submit
-                              </Button>
-                            </div>
-                          </>
-                        )}
-                      </div>
-                    ) : (
-                      <div className="bg-secondary/50 rounded-[16px] p-6 mb-10 text-center">
-                        <p className="text-sm text-textSecondary italic">Only customers who have purchased this item can leave a review.</p>
-                      </div>
-                    )
-                  ) : (
-                    <div className="bg-secondary/50 rounded-[16px] p-6 mb-10 text-center">
-                      <p className="text-sm text-textSecondary italic">You must be logged in to write a review.</p>
-                    </div>
-                  )}
-
-                  {/* Filters */}
-                  {reviews.length > 0 && (
-                    <div className="flex justify-between items-center mb-6">
-                      <span className="font-medium text-sm">Showing {reviews.length} reviews</span>
-                      <select 
-                        value={sortReview}
-                        onChange={(e) => setSortReview(e.target.value as any)}
-                        className="bg-secondary border-none rounded-full h-8 px-4 text-xs font-medium focus:outline-none cursor-pointer"
-                      >
-                        <option value="recent">Most Recent</option>
-                        <option value="highest">Highest Rated</option>
-                        <option value="lowest">Lowest Rated</option>
-                      </select>
-                    </div>
-                  )}
-
-                  {/* Reviews List */}
-                  {reviews.length === 0 ? (
-                    <div className="text-center py-8 text-textSecondary">
-                      <p>No reviews yet. Be the first to review this product!</p>
-                    </div>
-                  ) : (
-                    <div className="flex flex-col gap-6">
-                      {reviews.map((review) => (
-                        <div key={review.id} className="border-b border-black/5 pb-6 last:border-0">
-                          <div className="flex justify-between items-start mb-2">
-                            <div>
-                              <div className="text-sm mb-1">{renderStars(review.rating)}</div>
-                              <h4 className="font-medium">{review.title}</h4>
-                            </div>
-                            <span className="text-xs text-textSecondary">{review.date}</span>
-                          </div>
-                          <p className="text-sm text-textSecondary leading-relaxed mb-3">{review.comment}</p>
-                          <div className="flex items-center gap-2">
-                            <span className="text-xs font-medium">{review.name}</span>
-                            {review.verified && (
-                              <span className="text-[10px] uppercase tracking-[1px] bg-green-50 text-green-700 px-2 py-0.5 rounded-full font-medium">Verified Purchase</span>
-                            )}
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                  
-                </div>
 
                 {/* ──────────────────────── RECOMMENDATIONS ──────────────────────── */}
                 <div className="border-t border-black/10 pt-12 mt-12">

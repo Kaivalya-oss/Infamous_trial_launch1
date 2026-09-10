@@ -6,6 +6,8 @@ import { useCart } from '../context/CartContext';
 import { ArrowLeft, ShoppingBag } from 'lucide-react';
 import { Button } from '../components/ui/Button';
 import { QuantitySelector } from '../components/ui/QuantitySelector';
+import ProductReviews from '../components/ProductReviews';
+
 
 export default function ProductDetails() {
   const { slug } = useParams();
@@ -133,6 +135,12 @@ export default function ProductDetails() {
           </div>
         </div>
       </div>
+
+      {/* Reviews Section */}
+      <div className="max-w-[1200px] mx-auto mt-16">
+        <ProductReviews productId={product.id} />
+      </div>
     </div>
   );
 }
+

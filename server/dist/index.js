@@ -429,6 +429,17 @@ app.post('/api/cart/merge', authenticateToken, async (req, res) => {
         res.status(500).json({ message: 'Internal server error' });
     }
 });
+// --- CATEGORIES ---
+app.get('/api/categories', async (req, res) => {
+    try {
+        const result = await pool.query('SELECT * FROM categories ORDER BY name ASC');
+        res.status(200).json({ categories: result.rows });
+    }
+    catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Internal server error' });
+    }
+});
 // --- PRODUCTS ---
 app.get('/api/products', async (req, res) => {
     try {
@@ -674,7 +685,17 @@ app.get('/api/orders', authenticateToken, async (req, res) => {
 const verifyAdmin = (req, res, next) => {
     authenticateToken(req, res, () => {
         if (req.user.role !== 'ADMIN' && req.user.role !== 'SUPER_ADMIN') {
-            return res.status(403).json({ message: 'Admin access required' });
+            console.warn(`[AUTH] Admin access denied for user ${req.user.userId}. Role '${req.user.role}' is not ADMIN or SUPER_ADMIN.`);
+            return res.status(403).json({
+                message: 'Admin access required',
+                debug: {
+                    reason: 'role_mismatch',
+                    userId: req.user.userId,
+                    email: req.user.email,
+                    role: req.user.role,
+                    expectedRoles: ['ADMIN', 'SUPER_ADMIN']
+                }
+            });
         }
         next();
     });
@@ -738,12 +759,12 @@ app.post('/api/shipping/calculate', (req, res) => {
         });
     }
 });
-// --- REVIEW ELIGIBILITY ---
+// --- REVIEWS SYSTEM ---
+// 1. Check Review Eligibility
 app.get('/api/products/:id/review-eligibility', authenticateToken, async (req, res) => {
     try {
         const productId = req.params.id;
-        const userId = req.user.userId; // user object is created by authenticateToken
-        // Check if the user has an order that contains this product
+        const userId = req.user.userId;
         const result = await pool.query(`
       SELECT o.id 
       FROM orders o
@@ -768,6 +789,202 @@ app.get('/api/products/:id/review-eligibility', authenticateToken, async (req, r
             eligible: false,
             reason: 'INTERNAL_SERVER_ERROR'
         });
+    }
+});
+// 2. Customer Submit Review (POST)
+app.post('/api/products/:id/reviews', authenticateToken, async (req, res) => {
+    try {
+        const productId = parseInt(req.params.id, 10);
+        const userId = req.user.userId;
+        const { rating, title, comment } = req.body;
+        if (!productId || isNaN(productId)) {
+            return res.status(400).json({ message: 'Invalid product ID' });
+        }
+        // Check product exists
+        const prodRes = await pool.query('SELECT id FROM products WHERE id = $1', [productId]);
+        if (prodRes.rows.length === 0) {
+            return res.status(404).json({ message: 'Product not found' });
+        }
+        // Validate rating
+        const ratingNum = parseInt(rating, 10);
+        if (isNaN(ratingNum) || ratingNum < 1 || ratingNum > 5) {
+            return res.status(400).json({ message: 'Rating must be an integer between 1 and 5' });
+        }
+        // Validate required title and comment
+        const cleanTitle = (title || '').trim();
+        const cleanComment = (comment || '').trim();
+        if (!cleanTitle || cleanTitle.length === 0) {
+            return res.status(400).json({ message: 'Review title is required' });
+        }
+        if (cleanTitle.length > 200) {
+            return res.status(400).json({ message: 'Title must not exceed 200 characters' });
+        }
+        if (!cleanComment || cleanComment.length === 0) {
+            return res.status(400).json({ message: 'Review comment is required' });
+        }
+        if (cleanComment.length > 2000) {
+            return res.status(400).json({ message: 'Comment must not exceed 2000 characters' });
+        }
+        // Check eligibility logic (Must have purchased and delivered order)
+        const eligibilityRes = await pool.query(`
+      SELECT o.id 
+      FROM orders o
+      JOIN order_items oi ON o.id = oi.order_id
+      JOIN product_variants pv ON oi.variant_id = pv.id
+      WHERE o.user_id = $1 AND pv.product_id = $2 AND o.status IN ('DELIVERED')
+      LIMIT 1
+    `, [userId, productId]);
+        if (!eligibilityRes.rows || eligibilityRes.rows.length === 0) {
+            return res.status(403).json({
+                message: 'Only customers who have purchased and received this product can leave a review.'
+            });
+        }
+        // Always insert review with PENDING status
+        const insertRes = await pool.query(`
+      INSERT INTO product_reviews (product_id, user_id, rating, title, comment, status)
+      VALUES ($1, $2, $3, $4, $5, 'PENDING')
+      RETURNING id, product_id, rating, title, comment, status, created_at
+    `, [productId, userId, ratingNum, cleanTitle, cleanComment]);
+        return res.status(201).json({
+            success: true,
+            message: 'Review submitted successfully and is pending moderation',
+            review: insertRes.rows[0]
+        });
+    }
+    catch (error) {
+        console.error('Submit review error:', error);
+        return res.status(500).json({ message: 'Internal server error while submitting review' });
+    }
+});
+// 3. Public Get Approved Reviews (GET)
+app.get('/api/products/:id/reviews', async (req, res) => {
+    try {
+        const productId = parseInt(req.params.id, 10);
+        if (!productId || isNaN(productId)) {
+            return res.status(400).json({ message: 'Invalid product ID' });
+        }
+        // Fetch approved reviews only
+        const reviewsRes = await pool.query(`
+      SELECT pr.id, pr.rating, pr.title, pr.comment, pr.created_at,
+             COALESCE(u.first_name, u.name, 'Verified Buyer') AS user_name
+      FROM product_reviews pr
+      JOIN users u ON pr.user_id = u.id
+      WHERE pr.product_id = $1 AND pr.status = 'APPROVED'
+      ORDER BY pr.created_at DESC
+    `, [productId]);
+        const approvedReviews = reviewsRes.rows;
+        const totalReviews = approvedReviews.length;
+        let averageRating = 0;
+        const ratingDistribution = {
+            5: { count: 0, percentage: 0 },
+            4: { count: 0, percentage: 0 },
+            3: { count: 0, percentage: 0 },
+            2: { count: 0, percentage: 0 },
+            1: { count: 0, percentage: 0 },
+        };
+        if (totalReviews > 0) {
+            const sum = approvedReviews.reduce((acc, r) => acc + r.rating, 0);
+            averageRating = Math.round((sum / totalReviews) * 10) / 10;
+            approvedReviews.forEach((r) => {
+                if (ratingDistribution[r.rating]) {
+                    ratingDistribution[r.rating].count += 1;
+                }
+            });
+            [5, 4, 3, 2, 1].forEach((star) => {
+                ratingDistribution[star].percentage = Math.round((ratingDistribution[star].count / totalReviews) * 100);
+            });
+        }
+        return res.status(200).json({
+            success: true,
+            productId,
+            averageRating,
+            totalReviews,
+            ratingDistribution,
+            reviews: approvedReviews
+        });
+    }
+    catch (error) {
+        console.error('Fetch public reviews error:', error);
+        return res.status(500).json({ message: 'Internal server error while fetching reviews' });
+    }
+});
+// 4. Admin Get Reviews (List/Search/Filter)
+app.get('/api/admin/reviews', verifyAdmin, async (req, res) => {
+    try {
+        const { status, search, productId } = req.query;
+        let queryStr = `
+      SELECT pr.id, pr.product_id, pr.user_id, pr.rating, pr.title, pr.comment, pr.status, pr.created_at, pr.updated_at,
+             p.name AS product_name, p.slug AS product_slug,
+             u.name AS user_name, u.email AS user_email
+      FROM product_reviews pr
+      JOIN products p ON pr.product_id = p.id
+      JOIN users u ON pr.user_id = u.id
+      WHERE 1=1
+    `;
+        const params = [];
+        if (status && status !== 'ALL') {
+            params.push(status);
+            queryStr += ` AND pr.status = $${params.length}`;
+        }
+        if (productId) {
+            params.push(productId);
+            queryStr += ` AND pr.product_id = $${params.length}`;
+        }
+        if (search && typeof search === 'string' && search.trim().length > 0) {
+            params.push(`%${search.trim()}%`);
+            const searchIdx = params.length;
+            queryStr += ` AND (p.name ILIKE $${searchIdx} OR u.name ILIKE $${searchIdx} OR u.email ILIKE $${searchIdx} OR pr.title ILIKE $${searchIdx} OR pr.comment ILIKE $${searchIdx})`;
+        }
+        queryStr += ` ORDER BY pr.created_at DESC`;
+        const result = await pool.query(queryStr, params);
+        const statsRes = await pool.query(`
+      SELECT 
+        COUNT(*) AS total,
+        COUNT(*) FILTER (WHERE status = 'PENDING') AS pending,
+        COUNT(*) FILTER (WHERE status = 'APPROVED') AS approved,
+        COUNT(*) FILTER (WHERE status = 'REJECTED') AS rejected
+      FROM product_reviews
+    `);
+        return res.status(200).json({
+            success: true,
+            reviews: result.rows,
+            stats: statsRes.rows[0]
+        });
+    }
+    catch (error) {
+        console.error('Admin fetch reviews error:', error);
+        return res.status(500).json({ message: 'Internal server error while fetching reviews for admin' });
+    }
+});
+// 5. Admin Moderation Status Update (Approve / Reject)
+app.patch('/api/admin/reviews/:id/status', verifyAdmin, async (req, res) => {
+    try {
+        const reviewId = parseInt(req.params.id, 10);
+        const { status } = req.body;
+        if (!reviewId || isNaN(reviewId)) {
+            return res.status(400).json({ message: 'Invalid review ID' });
+        }
+        if (!['PENDING', 'APPROVED', 'REJECTED'].includes(status)) {
+            return res.status(400).json({ message: 'Invalid status. Must be PENDING, APPROVED, or REJECTED' });
+        }
+        const updateRes = await pool.query(`
+      UPDATE product_reviews
+      SET status = $1, updated_at = CURRENT_TIMESTAMP
+      WHERE id = $2
+      RETURNING id, product_id, user_id, rating, title, comment, status, updated_at
+    `, [status, reviewId]);
+        if (updateRes.rows.length === 0) {
+            return res.status(404).json({ message: 'Review not found' });
+        }
+        return res.status(200).json({
+            success: true,
+            message: `Review #${reviewId} status updated to ${status}`,
+            review: updateRes.rows[0]
+        });
+    }
+    catch (error) {
+        console.error('Admin update review status error:', error);
+        return res.status(500).json({ message: 'Internal server error while updating review status' });
     }
 });
 app.get('/api/admin/products', verifyAdmin, async (req, res) => {
@@ -816,6 +1033,7 @@ app.get('/api/admin/products/:id', verifyAdmin, async (req, res) => {
     }
 });
 app.post('/api/admin/products', verifyAdmin, async (req, res) => {
+    console.log('[ADMIN_PRODUCT_CREATE] START');
     const { name, slug, short_description, description, category_id, brand, status, seo_title, seo_description, variants, media } = req.body;
     const client = await pool.connect();
     try {
@@ -823,36 +1041,34 @@ app.post('/api/admin/products', verifyAdmin, async (req, res) => {
         const categoryIdVal = (category_id === '' || category_id === undefined) ? null : category_id;
         const finalName = name || 'Untitled Product';
         const finalSlug = slug || `draft-${Date.now()}`;
+        console.log('[ADMIN_PRODUCT_CREATE] PRODUCT INSERT START');
         const result = await client.query(`INSERT INTO products (name, slug, short_description, description, category_id, brand, status, seo_title, seo_description) 
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`, [finalName, finalSlug, short_description || '', description || '', categoryIdVal, brand || '', status || 'DRAFT', seo_title || '', seo_description || '']);
         const product = result.rows[0];
         const productId = product.id;
-        if (variants && Array.isArray(variants)) {
-            for (const v of variants) {
-                const finalSku = v.sku || `${finalSlug}-${v.color}-${v.size}`.replace(/\s+/g, '-').toUpperCase();
-                await client.query(`INSERT INTO product_variants (product_id, sku, color, size, price, stock, status)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)`, [productId, finalSku, v.color || '', v.size || '', v.price || 0, v.stock || 0, v.status || 'ACTIVE']);
-            }
-        }
+        console.log(`[ADMIN_PRODUCT_CREATE] PRODUCT INSERT OK. ID: ${productId}`);
         const variantMap = {};
-        const createdVariants = await client.query('SELECT id, sku FROM product_variants WHERE product_id = $1 ORDER BY id ASC', [productId]);
-        createdVariants.rows.forEach((v, idx) => {
-            if (v.sku)
-                variantMap[v.sku] = v.id;
-            variantMap[idx.toString()] = v.id;
-        });
+        if (variants && Array.isArray(variants)) {
+            console.log(`[ADMIN_PRODUCT_CREATE] VARIANTS INSERT START (${variants.length} variants)`);
+            for (const [idx, v] of variants.entries()) {
+                const finalSku = v.sku || `${finalSlug}-${v.color}-${v.size}`.replace(/\s+/g, '-').toUpperCase();
+                const vResult = await client.query(`INSERT INTO product_variants (product_id, sku, color, size, price, stock, status)
+           VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`, [productId, finalSku, v.color || '', v.size || '', v.price || 0, v.stock || 0, v.status || 'ACTIVE']);
+                const newId = vResult.rows[0].id;
+                variantMap[finalSku] = newId;
+                variantMap[idx.toString()] = newId;
+            }
+            console.log('[ADMIN_PRODUCT_CREATE] VARIANTS INSERT OK');
+        }
         if (media && Array.isArray(media)) {
-            for (const m of media) {
+            console.log(`[ADMIN_PRODUCT_CREATE] MEDIA INSERT START (${media.length} media items)`);
+            for (const [index, m] of media.entries()) {
                 let vId = m.variant_id;
                 // Resolve frontend variant_id (which could be a SKU or an array index) to the DB ID
-                if (vId !== null && vId !== undefined) {
+                if (vId !== null && vId !== undefined && vId !== '') {
                     const vIdStr = vId.toString();
                     if (variantMap[vIdStr]) {
                         vId = variantMap[vIdStr];
-                    }
-                    else if (!isNaN(parseInt(vIdStr))) {
-                        // Fallback for existing numeric IDs (though unlikely needed for new products)
-                        vId = parseInt(vIdStr);
                     }
                     else {
                         vId = null;
@@ -861,25 +1077,40 @@ app.post('/api/admin/products', verifyAdmin, async (req, res) => {
                 else {
                     vId = null;
                 }
+                console.log(`[ADMIN_PRODUCT_CREATE] Inserting media ${index}: public_id=${m.cloudinary_public_id}, vId=${vId}`);
                 await client.query(`INSERT INTO product_images (product_id, cloudinary_url, is_cover, cloudinary_public_id, media_type, display_order, variant_id)
            VALUES ($1, $2, $3, $4, $5, $6, $7)`, [productId, m.cloudinary_url || '', m.is_cover || false, m.cloudinary_public_id || null, m.media_type || 'IMAGE', m.display_order || 0, vId]);
             }
+            console.log('[ADMIN_PRODUCT_CREATE] MEDIA INSERT OK');
         }
         await client.query('COMMIT');
+        console.log('[ADMIN_PRODUCT_CREATE] TRANSACTION COMMIT OK');
         res.status(201).json({ message: 'Product created', product });
     }
     catch (error) {
         await client.query('ROLLBACK');
         console.error('--- PRODUCT CREATION ERROR ---');
-        console.error('Message:', error.message);
-        console.error('Code:', error.code);
-        console.error('Detail:', error.detail);
-        console.error('Constraint:', error.constraint);
-        console.error('Table:', error.table);
-        console.error('Column:', error.column);
+        console.error('[ADMIN_PRODUCT_CREATE] FAILED AT:', error.message);
+        console.error('error code:', error.code);
+        console.error('error message:', error.message);
+        console.error('PostgreSQL detail:', error.detail);
+        console.error('constraint:', error.constraint);
+        console.error('table:', error.table);
+        console.error('column:', error.column);
         console.error('Payload preview:', { name, slug, category_id, variantsCount: variants?.length, mediaCount: media?.length });
         console.error('-----------------------------');
-        res.status(500).json({ message: 'Internal server error' });
+        if (error.code === '23503' && error.constraint === 'products_category_id_fkey') {
+            return res.status(400).json({ message: 'Invalid category selected.' });
+        }
+        res.status(500).json({
+            message: 'Internal server error',
+            debug: {
+                errorMsg: error.message,
+                code: error.code,
+                detail: error.detail,
+                constraint: error.constraint
+            }
+        });
     }
     finally {
         client.release();
@@ -907,26 +1138,35 @@ app.put('/api/admin/products/:id', verifyAdmin, async (req, res) => {
         // Delete existing variants and images to replace them
         await client.query('DELETE FROM product_variants WHERE product_id = $1', [id]);
         await client.query('DELETE FROM product_images WHERE product_id = $1', [id]);
+        const variantMap = {};
         if (variants && Array.isArray(variants)) {
-            for (const v of variants) {
+            for (const [idx, v] of variants.entries()) {
                 const finalSku = v.sku || `${finalSlug}-${v.color}-${v.size}`.replace(/\s+/g, '-').toUpperCase();
-                await client.query(`INSERT INTO product_variants (product_id, sku, color, size, price, stock, status)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)`, [id, finalSku, v.color || '', v.size || '', v.price || 0, v.stock || 0, v.status || 'ACTIVE']);
+                const vResult = await client.query(`INSERT INTO product_variants (product_id, sku, color, size, price, stock, status)
+           VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`, [id, finalSku, v.color || '', v.size || '', v.price || 0, v.stock || 0, v.status || 'ACTIVE']);
+                const newId = vResult.rows[0].id;
+                variantMap[finalSku] = newId;
+                variantMap[idx.toString()] = newId;
+                if (v.id) {
+                    variantMap[v.id.toString()] = newId;
+                }
             }
         }
-        const variantMap = {};
-        const createdVariants = await client.query('SELECT id, sku FROM product_variants WHERE product_id = $1', [id]);
-        createdVariants.rows.forEach(v => { if (v.sku)
-            variantMap[v.sku] = v.id; });
         if (media && Array.isArray(media)) {
             for (const m of media) {
                 let vId = m.variant_id;
-                if (vId && typeof vId === 'string' && variantMap[vId])
-                    vId = variantMap[vId];
-                else if (vId && !isNaN(parseInt(vId)))
-                    vId = parseInt(vId);
-                else
+                if (vId !== null && vId !== undefined && vId !== '') {
+                    const vIdStr = vId.toString();
+                    if (variantMap[vIdStr]) {
+                        vId = variantMap[vIdStr];
+                    }
+                    else {
+                        vId = null;
+                    }
+                }
+                else {
                     vId = null;
+                }
                 await client.query(`INSERT INTO product_images (product_id, cloudinary_url, is_cover, cloudinary_public_id, media_type, display_order, variant_id)
            VALUES ($1, $2, $3, $4, $5, $6, $7)`, [id, m.cloudinary_url || '', m.is_cover || false, m.cloudinary_public_id || null, m.media_type || 'IMAGE', m.display_order || 0, vId]);
             }
@@ -946,6 +1186,9 @@ app.put('/api/admin/products/:id', verifyAdmin, async (req, res) => {
     catch (error) {
         await client.query('ROLLBACK');
         console.error(error);
+        if (error.code === '23503' && error.constraint === 'products_category_id_fkey') {
+            return res.status(400).json({ message: 'Invalid category selected.' });
+        }
         res.status(500).json({ message: 'Internal server error' });
     }
     finally {
@@ -1041,8 +1284,8 @@ app.get('/api/admin/analytics', verifyAdmin, async (req, res) => {
 app.get('/api/admin/customers', verifyAdmin, async (req, res) => {
     try {
         const result = await pool.query(`
-      SELECT u.id, u.name, u.email, u.phone_number, u.created_at, u.last_login,
-      COUNT(o.id) as total_orders, COALESCE(SUM(o.total_amount), 0) as total_spent
+      SELECT u.id, u.name, u.email, u.phone_number as phone, u.created_at as "joinDate", u.last_login, u.status,
+      COUNT(o.id) as orders, COALESCE(SUM(o.total_amount), 0) as ltv
       FROM users u
       LEFT JOIN orders o ON u.id = o.user_id
       WHERE u.role = 'USER'
@@ -1050,6 +1293,22 @@ app.get('/api/admin/customers', verifyAdmin, async (req, res) => {
       ORDER BY u.created_at DESC
     `);
         res.status(200).json({ customers: result.rows });
+    }
+    catch (error) {
+        res.status(500).json({ message: 'Internal server error' });
+    }
+});
+app.put('/api/admin/customers/:id/status', verifyAdmin, async (req, res) => {
+    const { id } = req.params;
+    const { status } = req.body;
+    if (!['Active', 'Suspended'].includes(status)) {
+        return res.status(400).json({ message: 'Invalid status' });
+    }
+    try {
+        const result = await pool.query('UPDATE users SET status = $1 WHERE id = $2 RETURNING id, status', [status, id]);
+        if (result.rowCount === 0)
+            return res.status(404).json({ message: 'Customer not found' });
+        res.status(200).json({ message: 'Status updated', customer: result.rows[0] });
     }
     catch (error) {
         console.error(error);

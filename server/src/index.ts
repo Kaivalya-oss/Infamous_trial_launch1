@@ -778,13 +778,14 @@ app.post('/api/shipping/calculate', (req, res) => {
   }
 });
 
-// --- REVIEW ELIGIBILITY ---
+// --- REVIEWS SYSTEM ---
+
+// 1. Check Review Eligibility
 app.get('/api/products/:id/review-eligibility', authenticateToken, async (req: any, res) => {
   try {
     const productId = req.params.id;
-    const userId = req.user.userId; // user object is created by authenticateToken
+    const userId = req.user.userId;
     
-    // Check if the user has an order that contains this product
     const result = await pool.query(`
       SELECT o.id 
       FROM orders o
@@ -810,6 +811,231 @@ app.get('/api/products/:id/review-eligibility', authenticateToken, async (req: a
     });
   }
 });
+
+// 2. Customer Submit Review (POST)
+app.post('/api/products/:id/reviews', authenticateToken, async (req: any, res) => {
+  try {
+    const productId = parseInt(req.params.id, 10);
+    const userId = req.user.userId;
+    const { rating, title, comment } = req.body;
+
+    if (!productId || isNaN(productId)) {
+      return res.status(400).json({ message: 'Invalid product ID' });
+    }
+
+    // Check product exists
+    const prodRes = await pool.query('SELECT id FROM products WHERE id = $1', [productId]);
+    if (prodRes.rows.length === 0) {
+      return res.status(404).json({ message: 'Product not found' });
+    }
+
+    // Validate rating
+    const ratingNum = parseInt(rating, 10);
+    if (isNaN(ratingNum) || ratingNum < 1 || ratingNum > 5) {
+      return res.status(400).json({ message: 'Rating must be an integer between 1 and 5' });
+    }
+
+    // Validate required title and comment
+    const cleanTitle = (title || '').trim();
+    const cleanComment = (comment || '').trim();
+    if (!cleanTitle || cleanTitle.length === 0) {
+      return res.status(400).json({ message: 'Review title is required' });
+    }
+    if (cleanTitle.length > 200) {
+      return res.status(400).json({ message: 'Title must not exceed 200 characters' });
+    }
+    if (!cleanComment || cleanComment.length === 0) {
+      return res.status(400).json({ message: 'Review comment is required' });
+    }
+    if (cleanComment.length > 2000) {
+      return res.status(400).json({ message: 'Comment must not exceed 2000 characters' });
+    }
+
+    // Check eligibility logic (Must have purchased and delivered order)
+    const eligibilityRes = await pool.query(`
+      SELECT o.id 
+      FROM orders o
+      JOIN order_items oi ON o.id = oi.order_id
+      JOIN product_variants pv ON oi.variant_id = pv.id
+      WHERE o.user_id = $1 AND pv.product_id = $2 AND o.status IN ('DELIVERED')
+      LIMIT 1
+    `, [userId, productId]);
+
+    if (!eligibilityRes.rows || eligibilityRes.rows.length === 0) {
+      return res.status(403).json({
+        message: 'Only customers who have purchased and received this product can leave a review.'
+      });
+    }
+
+    // Always insert review with PENDING status
+    const insertRes = await pool.query(`
+      INSERT INTO product_reviews (product_id, user_id, rating, title, comment, status)
+      VALUES ($1, $2, $3, $4, $5, 'PENDING')
+      RETURNING id, product_id, rating, title, comment, status, created_at
+    `, [productId, userId, ratingNum, cleanTitle, cleanComment]);
+
+    return res.status(201).json({
+      success: true,
+      message: 'Review submitted successfully and is pending moderation',
+      review: insertRes.rows[0]
+    });
+  } catch (error) {
+    console.error('Submit review error:', error);
+    return res.status(500).json({ message: 'Internal server error while submitting review' });
+  }
+});
+
+// 3. Public Get Approved Reviews (GET)
+app.get('/api/products/:id/reviews', async (req, res) => {
+  try {
+    const productId = parseInt(req.params.id, 10);
+    if (!productId || isNaN(productId)) {
+      return res.status(400).json({ message: 'Invalid product ID' });
+    }
+
+    // Fetch approved reviews only
+    const reviewsRes = await pool.query(`
+      SELECT pr.id, pr.rating, pr.title, pr.comment, pr.created_at,
+             COALESCE(u.first_name, u.name, 'Verified Buyer') AS user_name
+      FROM product_reviews pr
+      JOIN users u ON pr.user_id = u.id
+      WHERE pr.product_id = $1 AND pr.status = 'APPROVED'
+      ORDER BY pr.created_at DESC
+    `, [productId]);
+
+    const approvedReviews = reviewsRes.rows;
+    const totalReviews = approvedReviews.length;
+
+    let averageRating = 0;
+    const ratingDistribution: Record<number, { count: number; percentage: number }> = {
+      5: { count: 0, percentage: 0 },
+      4: { count: 0, percentage: 0 },
+      3: { count: 0, percentage: 0 },
+      2: { count: 0, percentage: 0 },
+      1: { count: 0, percentage: 0 },
+    };
+
+    if (totalReviews > 0) {
+      const sum = approvedReviews.reduce((acc: number, r: any) => acc + r.rating, 0);
+      averageRating = Math.round((sum / totalReviews) * 10) / 10;
+
+      approvedReviews.forEach((r: any) => {
+        if (ratingDistribution[r.rating]) {
+          ratingDistribution[r.rating].count += 1;
+        }
+      });
+
+      [5, 4, 3, 2, 1].forEach((star) => {
+        ratingDistribution[star].percentage = Math.round((ratingDistribution[star].count / totalReviews) * 100);
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      productId,
+      averageRating,
+      totalReviews,
+      ratingDistribution,
+      reviews: approvedReviews
+    });
+  } catch (error) {
+    console.error('Fetch public reviews error:', error);
+    return res.status(500).json({ message: 'Internal server error while fetching reviews' });
+  }
+});
+
+// 4. Admin Get Reviews (List/Search/Filter)
+app.get('/api/admin/reviews', verifyAdmin, async (req, res) => {
+  try {
+    const { status, search, productId } = req.query;
+
+    let queryStr = `
+      SELECT pr.id, pr.product_id, pr.user_id, pr.rating, pr.title, pr.comment, pr.status, pr.created_at, pr.updated_at,
+             p.name AS product_name, p.slug AS product_slug,
+             u.name AS user_name, u.email AS user_email
+      FROM product_reviews pr
+      JOIN products p ON pr.product_id = p.id
+      JOIN users u ON pr.user_id = u.id
+      WHERE 1=1
+    `;
+    const params: any[] = [];
+
+    if (status && status !== 'ALL') {
+      params.push(status);
+      queryStr += ` AND pr.status = $${params.length}`;
+    }
+
+    if (productId) {
+      params.push(productId);
+      queryStr += ` AND pr.product_id = $${params.length}`;
+    }
+
+    if (search && typeof search === 'string' && search.trim().length > 0) {
+      params.push(`%${search.trim()}%`);
+      const searchIdx = params.length;
+      queryStr += ` AND (p.name ILIKE $${searchIdx} OR u.name ILIKE $${searchIdx} OR u.email ILIKE $${searchIdx} OR pr.title ILIKE $${searchIdx} OR pr.comment ILIKE $${searchIdx})`;
+    }
+
+    queryStr += ` ORDER BY pr.created_at DESC`;
+
+    const result = await pool.query(queryStr, params);
+
+    const statsRes = await pool.query(`
+      SELECT 
+        COUNT(*) AS total,
+        COUNT(*) FILTER (WHERE status = 'PENDING') AS pending,
+        COUNT(*) FILTER (WHERE status = 'APPROVED') AS approved,
+        COUNT(*) FILTER (WHERE status = 'REJECTED') AS rejected
+      FROM product_reviews
+    `);
+
+    return res.status(200).json({
+      success: true,
+      reviews: result.rows,
+      stats: statsRes.rows[0]
+    });
+  } catch (error) {
+    console.error('Admin fetch reviews error:', error);
+    return res.status(500).json({ message: 'Internal server error while fetching reviews for admin' });
+  }
+});
+
+// 5. Admin Moderation Status Update (Approve / Reject)
+app.patch('/api/admin/reviews/:id/status', verifyAdmin, async (req, res) => {
+  try {
+    const reviewId = parseInt(req.params.id, 10);
+    const { status } = req.body;
+
+    if (!reviewId || isNaN(reviewId)) {
+      return res.status(400).json({ message: 'Invalid review ID' });
+    }
+
+    if (!['PENDING', 'APPROVED', 'REJECTED'].includes(status)) {
+      return res.status(400).json({ message: 'Invalid status. Must be PENDING, APPROVED, or REJECTED' });
+    }
+
+    const updateRes = await pool.query(`
+      UPDATE product_reviews
+      SET status = $1, updated_at = CURRENT_TIMESTAMP
+      WHERE id = $2
+      RETURNING id, product_id, user_id, rating, title, comment, status, updated_at
+    `, [status, reviewId]);
+
+    if (updateRes.rows.length === 0) {
+      return res.status(404).json({ message: 'Review not found' });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: `Review #${reviewId} status updated to ${status}`,
+      review: updateRes.rows[0]
+    });
+  } catch (error) {
+    console.error('Admin update review status error:', error);
+    return res.status(500).json({ message: 'Internal server error while updating review status' });
+  }
+});
+
 
 app.get('/api/admin/products', verifyAdmin, async (req, res) => {
   try {

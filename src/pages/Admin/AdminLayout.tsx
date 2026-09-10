@@ -1,5 +1,5 @@
 import { Link, Outlet, useLocation, useNavigate } from 'react-router-dom';
-import { LayoutDashboard, Package, Archive, ShoppingBag, Users, RefreshCw, Truck, Settings, LogOut } from 'lucide-react';
+import { LayoutDashboard, Package, Archive, ShoppingBag, Users, MessageSquare, RefreshCw, Truck, Settings, LogOut } from 'lucide-react';
 import { useAdminAuth } from '../../context/AdminAuthContext';
 
 export default function AdminLayout() {
@@ -18,10 +18,12 @@ export default function AdminLayout() {
     { name: 'Inventory', path: '/admin/inventory', icon: Archive },
     { name: 'Orders', path: '/admin/orders', icon: ShoppingBag },
     { name: 'Customers', path: '/admin/customers', icon: Users },
+    { name: 'Reviews', path: '/admin/reviews', icon: MessageSquare },
     { name: 'Exchanges', path: '/admin/exchanges', icon: RefreshCw },
     { name: 'Logistics', path: '/admin/logistics', icon: Truck },
     { name: 'Settings', path: '/admin/settings', icon: Settings },
   ];
+
 
   return (
     <div className="min-h-screen bg-[#0a0a0a] text-white flex">
