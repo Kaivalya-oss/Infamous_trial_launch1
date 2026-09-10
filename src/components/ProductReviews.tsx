@@ -108,6 +108,8 @@ export default function ProductReviews({ productId }: ProductReviewsProps) {
         setReviewRating(0);
         setReviewTitle('');
         setReviewComment('');
+        // Re-fetch so the new review appears immediately
+        fetchPublicReviews();
       }
     } catch (err: any) {
       const msg = err.response?.data?.message || 'Failed to submit review. Please try again.';
@@ -183,7 +185,7 @@ export default function ProductReviews({ productId }: ProductReviewsProps) {
                 <CheckCircle className="mx-auto mb-2 text-green-600" size={32} />
                 <p className="font-medium text-green-700 text-lg mb-1">Thank you for your review!</p>
                 <p className="text-sm text-textSecondary max-w-md mx-auto">
-                  Your review has been submitted successfully and is currently under moderation. It will be displayed publicly once approved by our admin team.
+                  Your review has been published and is now visible on the product page.
                 </p>
                 <button
                   onClick={() => setReviewSubmitted(false)}

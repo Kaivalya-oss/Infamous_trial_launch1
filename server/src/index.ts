@@ -867,16 +867,16 @@ app.post('/api/products/:id/reviews', authenticateToken, async (req: any, res) =
       });
     }
 
-    // Always insert review with PENDING status
+    // Insert review as APPROVED so it is immediately publicly visible
     const insertRes = await pool.query(`
       INSERT INTO product_reviews (product_id, user_id, rating, title, comment, status)
-      VALUES ($1, $2, $3, $4, $5, 'PENDING')
+      VALUES ($1, $2, $3, $4, $5, 'APPROVED')
       RETURNING id, product_id, rating, title, comment, status, created_at
     `, [productId, userId, ratingNum, cleanTitle, cleanComment]);
 
     return res.status(201).json({
       success: true,
-      message: 'Review submitted successfully and is pending moderation',
+      message: 'Review submitted successfully',
       review: insertRes.rows[0]
     });
   } catch (error) {
@@ -1036,6 +1036,32 @@ app.patch('/api/admin/reviews/:id/status', verifyAdmin, async (req, res) => {
   }
 });
 
+// 6. Admin Delete Review (permanently removes from DB)
+app.delete('/api/admin/reviews/:id', verifyAdmin, async (req, res) => {
+  try {
+    const reviewId = parseInt(req.params.id, 10);
+    if (!reviewId || isNaN(reviewId)) {
+      return res.status(400).json({ message: 'Invalid review ID' });
+    }
+
+    const deleteRes = await pool.query(
+      'DELETE FROM product_reviews WHERE id = $1 RETURNING id',
+      [reviewId]
+    );
+
+    if (deleteRes.rows.length === 0) {
+      return res.status(404).json({ message: 'Review not found' });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: `Review #${reviewId} has been permanently deleted.`
+    });
+  } catch (error) {
+    console.error('Admin delete review error:', error);
+    return res.status(500).json({ message: 'Internal server error while deleting review' });
+  }
+});
 
 app.get('/api/admin/products', verifyAdmin, async (req, res) => {
   try {

@@ -1,6 +1,6 @@
 import api from '../../lib/axios';
 import { useState, useEffect } from 'react';
-import { Search, CheckCircle2, XCircle, Clock, Star, MessageSquare, RefreshCw } from 'lucide-react';
+import { Search, Star, MessageSquare, RefreshCw, Trash2 } from 'lucide-react';
 import { Button } from '../../components/ui/Button';
 
 interface AdminReview {
@@ -32,9 +32,9 @@ export default function AdminReviews() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const [activeTab, setActiveTab] = useState<'ALL' | 'PENDING' | 'APPROVED' | 'REJECTED'>('PENDING');
+  const [activeTab, setActiveTab] = useState<'ALL' | 'PENDING' | 'APPROVED' | 'REJECTED'>('ALL');
   const [searchQuery, setSearchQuery] = useState('');
-  const [updatingId, setUpdatingId] = useState<number | null>(null);
+  const [deletingId, setDeletingId] = useState<number | null>(null);
 
   useEffect(() => {
     fetchReviews();
@@ -69,18 +69,20 @@ export default function AdminReviews() {
     fetchReviews();
   };
 
-  const handleUpdateStatus = async (id: number, newStatus: 'APPROVED' | 'REJECTED' | 'PENDING') => {
-    setUpdatingId(id);
+  const handleDeleteReview = async (id: number) => {
+    if (!window.confirm(`Permanently delete review #${id}? This cannot be undone.`)) return;
+    setDeletingId(id);
     try {
-      const res = await api.patch(`/api/admin/reviews/${id}/status`, { status: newStatus });
+      const res = await api.delete(`/api/admin/reviews/${id}`);
       if (res.data && res.data.success) {
-        // Refresh review list and stats
+        // Remove from local state immediately, then refresh stats
+        setReviews((prev) => prev.filter((r) => r.id !== id));
         await fetchReviews();
       }
     } catch (err: any) {
-      alert(err.response?.data?.message || `Failed to update status for review #${id}`);
+      alert(err.response?.data?.message || `Failed to delete review #${id}`);
     } finally {
-      setUpdatingId(null);
+      setDeletingId(null);
     }
   };
 
@@ -98,37 +100,13 @@ export default function AdminReviews() {
     );
   };
 
-  const getStatusBadge = (status: string) => {
-    switch (status) {
-      case 'APPROVED':
-        return (
-          <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium bg-green-500/10 text-green-400 border border-green-500/20">
-            <CheckCircle2 size={12} /> Approved
-          </span>
-        );
-      case 'REJECTED':
-        return (
-          <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium bg-red-500/10 text-red-400 border border-red-500/20">
-            <XCircle size={12} /> Rejected
-          </span>
-        );
-      case 'PENDING':
-      default:
-        return (
-          <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium bg-amber-500/10 text-amber-400 border border-amber-500/20">
-            <Clock size={12} /> Pending Moderation
-          </span>
-        );
-    }
-  };
-
   return (
     <div className="space-y-8">
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
-          <h1 className="font-serif italic text-3xl md:text-4xl text-white">Review Moderation</h1>
-          <p className="text-white/60 text-sm mt-1">Review, approve, or reject customer feedback before public display</p>
+          <h1 className="font-serif italic text-3xl md:text-4xl text-white">Customer Reviews</h1>
+          <p className="text-white/60 text-sm mt-1">All customer reviews are published immediately. Use Delete to remove any review.</p>
         </div>
         <Button
           onClick={fetchReviews}
@@ -149,24 +127,24 @@ export default function AdminReviews() {
           </div>
           <p className="text-3xl font-semibold text-white">{stats.total}</p>
         </div>
-        <div className="bg-amber-500/5 border border-amber-500/20 rounded-2xl p-5">
-          <div className="flex justify-between items-center text-amber-400 text-xs font-medium uppercase tracking-wider mb-2">
-            <span>Pending Moderation</span>
-            <Clock size={16} />
-          </div>
-          <p className="text-3xl font-semibold text-amber-400">{stats.pending}</p>
-        </div>
         <div className="bg-green-500/5 border border-green-500/20 rounded-2xl p-5">
           <div className="flex justify-between items-center text-green-400 text-xs font-medium uppercase tracking-wider mb-2">
-            <span>Approved</span>
-            <CheckCircle2 size={16} />
+            <span>Published</span>
+            <MessageSquare size={16} />
           </div>
           <p className="text-3xl font-semibold text-green-400">{stats.approved}</p>
         </div>
+        <div className="bg-amber-500/5 border border-amber-500/20 rounded-2xl p-5">
+          <div className="flex justify-between items-center text-amber-400 text-xs font-medium uppercase tracking-wider mb-2">
+            <span>Legacy Pending</span>
+            <MessageSquare size={16} />
+          </div>
+          <p className="text-3xl font-semibold text-amber-400">{stats.pending}</p>
+        </div>
         <div className="bg-red-500/5 border border-red-500/20 rounded-2xl p-5">
           <div className="flex justify-between items-center text-red-400 text-xs font-medium uppercase tracking-wider mb-2">
-            <span>Rejected</span>
-            <XCircle size={16} />
+            <span>Legacy Rejected</span>
+            <MessageSquare size={16} />
           </div>
           <p className="text-3xl font-semibold text-red-400">{stats.rejected}</p>
         </div>
@@ -176,7 +154,7 @@ export default function AdminReviews() {
       <div className="flex flex-col md:flex-row gap-4 justify-between items-stretch md:items-center bg-white/5 p-4 rounded-2xl border border-white/10">
         {/* Status Tabs */}
         <div className="flex items-center gap-2 overflow-x-auto pb-2 md:pb-0">
-          {(['PENDING', 'ALL', 'APPROVED', 'REJECTED'] as const).map((tab) => (
+          {(['ALL', 'APPROVED', 'PENDING', 'REJECTED'] as const).map((tab) => (
             <button
               key={tab}
               onClick={() => setActiveTab(tab)}
@@ -186,10 +164,10 @@ export default function AdminReviews() {
                   : 'text-white/60 hover:text-white hover:bg-white/5'
               }`}
             >
-              {tab === 'PENDING' && `Pending (${stats.pending})`}
               {tab === 'ALL' && `All (${stats.total})`}
-              {tab === 'APPROVED' && `Approved (${stats.approved})`}
-              {tab === 'REJECTED' && `Rejected (${stats.rejected})`}
+              {tab === 'APPROVED' && `Published (${stats.approved})`}
+              {tab === 'PENDING' && `Legacy Pending (${stats.pending})`}
+              {tab === 'REJECTED' && `Legacy Rejected (${stats.rejected})`}
             </button>
           ))}
         </div>
@@ -214,14 +192,14 @@ export default function AdminReviews() {
         </div>
       )}
 
-      {/* Reviews Table / List */}
+      {/* Reviews List */}
       {loading ? (
         <div className="py-16 text-center text-white/40 text-sm">Loading reviews...</div>
       ) : reviews.length === 0 ? (
         <div className="py-16 text-center bg-white/5 rounded-2xl border border-white/10 text-white/40">
           <MessageSquare className="mx-auto mb-3 text-white/20" size={36} />
           <p className="text-base font-medium text-white/80">No reviews found</p>
-          <p className="text-xs text-white/50 mt-1">There are no reviews matching the current status filter or search query.</p>
+          <p className="text-xs text-white/50 mt-1">There are no reviews matching the current filter or search query.</p>
         </div>
       ) : (
         <div className="space-y-4">
@@ -234,8 +212,6 @@ export default function AdminReviews() {
               <div className="space-y-3 flex-1">
                 {/* Meta Row */}
                 <div className="flex flex-wrap items-center gap-3 text-xs">
-                  {getStatusBadge(review.status)}
-                  <span className="text-white/40">•</span>
                   {renderStars(review.rating)}
                   <span className="text-white/40">•</span>
                   <span className="text-white/60">
@@ -271,38 +247,17 @@ export default function AdminReviews() {
                 </div>
               </div>
 
-              {/* Action Buttons */}
+              {/* Delete Action */}
               <div className="flex md:flex-col gap-2 w-full md:w-auto shrink-0 pt-2 md:pt-0 border-t md:border-t-0 border-white/10">
-                {review.status !== 'APPROVED' && (
-                  <Button
-                    onClick={() => handleUpdateStatus(review.id, 'APPROVED')}
-                    disabled={updatingId === review.id}
-                    className="flex-1 md:w-32 bg-green-600 hover:bg-green-500 text-white text-xs font-medium py-2 px-4 rounded-xl transition-all"
-                  >
-                    {updatingId === review.id ? 'Updating...' : 'Approve'}
-                  </Button>
-                )}
-
-                {review.status !== 'REJECTED' && (
-                  <Button
-                    onClick={() => handleUpdateStatus(review.id, 'REJECTED')}
-                    disabled={updatingId === review.id}
-                    variant="outline"
-                    className="flex-1 md:w-32 border-red-500/30 text-red-400 hover:bg-red-500/10 hover:text-red-300 text-xs font-medium py-2 px-4 rounded-xl transition-all"
-                  >
-                    {updatingId === review.id ? 'Updating...' : 'Reject'}
-                  </Button>
-                )}
-
-                {review.status !== 'PENDING' && (
-                  <button
-                    onClick={() => handleUpdateStatus(review.id, 'PENDING')}
-                    disabled={updatingId === review.id}
-                    className="text-[11px] text-white/40 hover:text-white/80 transition-colors text-center py-1"
-                  >
-                    Reset to Pending
-                  </button>
-                )}
+                <Button
+                  onClick={() => handleDeleteReview(review.id)}
+                  disabled={deletingId === review.id}
+                  variant="outline"
+                  className="flex-1 md:w-32 border-red-500/30 text-red-400 hover:bg-red-500/10 hover:text-red-300 text-xs font-medium py-2 px-4 rounded-xl transition-all flex items-center justify-center gap-1.5"
+                >
+                  <Trash2 size={13} />
+                  {deletingId === review.id ? 'Deleting...' : 'Delete'}
+                </Button>
               </div>
             </div>
           ))}
@@ -311,3 +266,4 @@ export default function AdminReviews() {
     </div>
   );
 }
+
