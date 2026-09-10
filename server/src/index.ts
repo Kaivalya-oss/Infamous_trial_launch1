@@ -1550,13 +1550,643 @@ app.put('/api/admin/orders/:id/status', verifyAdmin, async (req, res) => {
   }
 });
 
-// Vercel Serverless Export
+// ============================================================
+// --- EXCHANGE SYSTEM ---
+// ============================================================
+
+// Helper: Determine logistics fee from pincode (Rs.99 Mumbai, Rs.149 elsewhere)
+function getLogisticsFee(pincode: string): number {
+  return (pincode || '').startsWith('400') ? 99 : 149;
+}
+
+// Valid status transitions (forward only)
+const EXCHANGE_TRANSITIONS: Record<string, string[]> = {
+  PENDING:           ['APPROVED', 'REJECTED'],
+  APPROVED:          ['PICKUP_SCHEDULED'],
+  AWAITING_PAYMENT:  [],
+  PAYMENT_CONFIRMED: ['PICKUP_SCHEDULED'],
+  PICKUP_SCHEDULED:  ['ITEM_RECEIVED'],
+  ITEM_RECEIVED:     ['DISPATCHED'],
+  DISPATCHED:        ['COMPLETED'],
+  COMPLETED:         [],
+  REJECTED:          [],
+  CANCELLED:         [],
+};
+
+// --- CUSTOMER: Get exchange-eligible delivered orders ---
+app.get('/api/exchanges/eligible-orders', authenticateToken, async (req: any, res) => {
+  const userId = req.user.userId;
+  try {
+    // Get DELIVERED orders within 7 days of delivery
+    const ordersRes = await pool.query(`
+      SELECT o.id, o.order_number, o.created_at, o.shipping_address,
+             osh.created_at AS delivered_at
+      FROM orders o
+      JOIN order_status_history osh ON o.id = osh.order_id AND osh.status = 'DELIVERED'
+      WHERE o.user_id = $1
+        AND o.status = 'DELIVERED'
+        AND osh.created_at >= CURRENT_TIMESTAMP - INTERVAL '7 days'
+      ORDER BY osh.created_at DESC
+    `, [userId]);
+
+    const orders = [];
+
+    for (const order of ordersRes.rows) {
+      // Get order items that are still eligible (no active non-terminal exchange)
+      const itemsRes = await pool.query(`
+        SELECT oi.id AS order_item_id, oi.variant_id, oi.product_name, oi.sku, oi.price, oi.quantity,
+               pv.color, pv.size, pv.stock,
+               p.id AS product_id,
+               (SELECT pi.cloudinary_url
+                FROM product_images pi
+                WHERE pi.product_id = p.id AND pi.is_cover = true
+                LIMIT 1) AS image_url
+        FROM order_items oi
+        JOIN product_variants pv ON oi.variant_id = pv.id
+        JOIN products p ON pv.product_id = p.id
+        WHERE oi.order_id = $1
+          AND NOT EXISTS (
+            SELECT 1 FROM product_exchanges pe
+            WHERE pe.order_item_id = oi.id
+              AND pe.status NOT IN ('REJECTED', 'CANCELLED', 'COMPLETED')
+          )
+      `, [order.id]);
+
+      if (itemsRes.rows.length > 0) {
+        orders.push({
+          id: order.id,
+          order_number: order.order_number,
+          created_at: order.created_at,
+          delivered_at: order.delivered_at,
+          shipping_address: order.shipping_address,
+          items: itemsRes.rows,
+        });
+      }
+    }
+
+    res.status(200).json({ orders });
+  } catch (error) {
+    console.error('Exchange eligible-orders error:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// --- CUSTOMER: Get replacement options for a specific order item ---
+app.get('/api/exchanges/replacement-options', authenticateToken, async (req: any, res) => {
+  const userId = req.user.userId;
+  const { order_item_id } = req.query;
+
+  if (!order_item_id) return res.status(400).json({ message: 'order_item_id is required' });
+
+  try {
+    // Verify ownership and get original item details
+    const itemRes = await pool.query(`
+      SELECT oi.id, oi.variant_id, oi.price AS price_original, oi.quantity,
+             pv.product_id, pv.color AS original_color, pv.size AS original_size,
+             o.shipping_address
+      FROM order_items oi
+      JOIN orders o ON oi.order_id = o.id
+      JOIN product_variants pv ON oi.variant_id = pv.id
+      WHERE oi.id = $1 AND o.user_id = $2 AND o.status = 'DELIVERED'
+    `, [order_item_id, userId]);
+
+    if (itemRes.rows.length === 0) {
+      return res.status(404).json({ message: 'Order item not found or not eligible' });
+    }
+
+    const item = itemRes.rows[0];
+    const address = typeof item.shipping_address === 'string'
+      ? JSON.parse(item.shipping_address)
+      : item.shipping_address;
+    const logisticsFee = getLogisticsFee(address?.pincode || '');
+
+    // Get all other variants of the same product with stock > 0
+    const variantsRes = await pool.query(`
+      SELECT pv.id, pv.sku, pv.color, pv.size, pv.price, pv.stock
+      FROM product_variants pv
+      WHERE pv.product_id = $1
+        AND pv.id != $2
+        AND pv.stock > 0
+        AND pv.status = 'ACTIVE'
+      ORDER BY pv.size, pv.color
+    `, [item.product_id, item.variant_id]);
+
+    res.status(200).json({
+      same_product_variants: variantsRes.rows,
+      price_original: item.price_original,
+      logistics_fee: logisticsFee,
+    });
+  } catch (error) {
+    console.error('Exchange replacement-options error:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// --- CUSTOMER: Submit an exchange request ---
+app.post('/api/exchanges', authenticateToken, async (req: any, res) => {
+  const userId = req.user.userId;
+  const { order_item_id, requested_variant_id, reason, customer_notes } = req.body;
+
+  if (!order_item_id || !requested_variant_id || !reason) {
+    return res.status(400).json({ message: 'order_item_id, requested_variant_id, and reason are required' });
+  }
+
+  const cleanReason = (reason || '').trim();
+  if (cleanReason.length === 0 || cleanReason.length > 100) {
+    return res.status(400).json({ message: 'Reason must be 1-100 characters' });
+  }
+
+  try {
+    // Verify ownership + order is DELIVERED
+    const itemRes = await pool.query(`
+      SELECT oi.id, oi.order_id, oi.variant_id AS original_variant_id, oi.price AS price_original, oi.quantity,
+             o.shipping_address, o.status AS order_status,
+             osh.created_at AS delivered_at
+      FROM order_items oi
+      JOIN orders o ON oi.order_id = o.id
+      JOIN order_status_history osh ON o.id = osh.order_id AND osh.status = 'DELIVERED'
+      WHERE oi.id = $1 AND o.user_id = $2
+      LIMIT 1
+    `, [order_item_id, userId]);
+
+    if (itemRes.rows.length === 0) {
+      return res.status(404).json({ message: 'Order item not found or not delivered' });
+    }
+
+    const item = itemRes.rows[0];
+
+    if (item.order_status !== 'DELIVERED') {
+      return res.status(403).json({ message: 'Exchange can only be initiated for delivered orders' });
+    }
+
+    // Check 7-day window
+    const deliveredAt = new Date(item.delivered_at);
+    const daysSinceDelivery = (Date.now() - deliveredAt.getTime()) / (1000 * 60 * 60 * 24);
+    if (daysSinceDelivery > 7) {
+      return res.status(403).json({ message: 'Exchange window has closed. Exchanges must be initiated within 7 days of delivery.' });
+    }
+
+    // Check no active exchange exists for this item
+    const existingRes = await pool.query(`
+      SELECT id FROM product_exchanges
+      WHERE order_item_id = $1
+        AND status NOT IN ('REJECTED', 'CANCELLED', 'COMPLETED')
+    `, [order_item_id]);
+
+    if (existingRes.rows.length > 0) {
+      return res.status(409).json({ message: 'An active exchange request already exists for this item.' });
+    }
+
+    // Verify requested variant exists, has stock, and is different from original
+    const requestedVariantRes = await pool.query(`
+      SELECT pv.id, pv.price, pv.stock, pv.color, pv.size, pv.product_id, pv.status
+      FROM product_variants pv
+      WHERE pv.id = $1
+    `, [requested_variant_id]);
+
+    if (requestedVariantRes.rows.length === 0) {
+      return res.status(404).json({ message: 'Requested variant not found' });
+    }
+
+    const requestedVariant = requestedVariantRes.rows[0];
+
+    if (requestedVariant.status !== 'ACTIVE') {
+      return res.status(400).json({ message: 'Requested variant is not available' });
+    }
+
+    if (requestedVariant.id === item.original_variant_id) {
+      return res.status(400).json({ message: 'Requested variant is the same as the original. Please select a different size.' });
+    }
+
+    if (requestedVariant.stock < 1) {
+      return res.status(400).json({ message: 'Requested variant is out of stock' });
+    }
+
+    // Compute financials (server-side only)
+    const priceOriginal = parseFloat(item.price_original);
+    const priceReplacement = parseFloat(requestedVariant.price);
+    const priceDifference = priceReplacement - priceOriginal;
+    const address = typeof item.shipping_address === 'string'
+      ? JSON.parse(item.shipping_address)
+      : item.shipping_address;
+    const logisticsFee = getLogisticsFee(address?.pincode || '');
+    const totalDue = Math.max(0, priceDifference) + logisticsFee;
+
+    // Determine exchange_type (same product = SIZE_SWAP, different product = PRODUCT_SWAP)
+    // Get original variant's product_id
+    const origVariantRes = await pool.query('SELECT product_id FROM product_variants WHERE id = $1', [item.original_variant_id]);
+    const origProductId = origVariantRes.rows[0]?.product_id;
+    const exchangeType = origProductId === requestedVariant.product_id ? 'SIZE_SWAP' : 'PRODUCT_SWAP';
+
+    // Insert exchange request (always PENDING)
+    const insertRes = await pool.query(`
+      INSERT INTO product_exchanges
+        (user_id, order_id, order_item_id, original_variant_id, quantity, requested_variant_id,
+         exchange_type, reason, customer_notes, price_original, price_replacement, price_difference, logistics_fee)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+      RETURNING *
+    `, [
+      userId, item.order_id, order_item_id, item.original_variant_id, 1, requested_variant_id,
+      exchangeType, cleanReason, customer_notes || null,
+      priceOriginal, priceReplacement, priceDifference, logisticsFee
+    ]);
+
+    const exchange = insertRes.rows[0];
+
+    res.status(201).json({
+      success: true,
+      message: 'Exchange request submitted successfully',
+      exchange: {
+        ...exchange,
+        total_due: totalDue,
+      },
+    });
+  } catch (error) {
+    console.error('Exchange submit error:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// --- CUSTOMER: List own exchange requests ---
+app.get('/api/exchanges', authenticateToken, async (req: any, res) => {
+  const userId = req.user.userId;
+  try {
+    const result = await pool.query(`
+      SELECT pe.*,
+             o.order_number,
+             orig_pv.color AS original_color, orig_pv.size AS original_size,
+             orig_p.name AS original_product_name,
+             req_pv.color AS replacement_color, req_pv.size AS replacement_size,
+             req_p.name AS replacement_product_name,
+             (SELECT pi.cloudinary_url FROM product_images pi WHERE pi.product_id = orig_p.id AND pi.is_cover = true LIMIT 1) AS original_image_url
+      FROM product_exchanges pe
+      JOIN orders o ON pe.order_id = o.id
+      JOIN product_variants orig_pv ON pe.original_variant_id = orig_pv.id
+      JOIN products orig_p ON orig_pv.product_id = orig_p.id
+      JOIN product_variants req_pv ON pe.requested_variant_id = req_pv.id
+      JOIN products req_p ON req_pv.product_id = req_p.id
+      WHERE pe.user_id = $1
+      ORDER BY pe.created_at DESC
+    `, [userId]);
+
+    const exchanges = result.rows.map((row: any) => ({
+      id: row.id,
+      order_number: row.order_number,
+      exchange_type: row.exchange_type,
+      reason: row.reason,
+      customer_notes: row.customer_notes,
+      status: row.status,
+      price_original: row.price_original,
+      price_replacement: row.price_replacement,
+      price_difference: row.price_difference,
+      logistics_fee: row.logistics_fee,
+      total_due: Math.max(0, parseFloat(row.price_difference)) + parseFloat(row.logistics_fee),
+      admin_notes: row.admin_notes,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      original: {
+        product_name: row.original_product_name,
+        color: row.original_color,
+        size: row.original_size,
+        image_url: row.original_image_url,
+      },
+      replacement: {
+        product_name: row.replacement_product_name,
+        color: row.replacement_color,
+        size: row.replacement_size,
+      },
+    }));
+
+    res.status(200).json({ exchanges });
+  } catch (error) {
+    console.error('Exchange list error:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// --- CUSTOMER: Get single exchange detail ---
+app.get('/api/exchanges/:id', authenticateToken, async (req: any, res) => {
+  const userId = req.user.userId;
+  const { id } = req.params;
+  try {
+    const result = await pool.query(`
+      SELECT pe.*,
+             o.order_number,
+             orig_pv.color AS original_color, orig_pv.size AS original_size, orig_pv.sku AS original_sku,
+             orig_p.name AS original_product_name,
+             req_pv.color AS replacement_color, req_pv.size AS replacement_size, req_pv.sku AS replacement_sku,
+             req_p.name AS replacement_product_name
+      FROM product_exchanges pe
+      JOIN orders o ON pe.order_id = o.id
+      JOIN product_variants orig_pv ON pe.original_variant_id = orig_pv.id
+      JOIN products orig_p ON orig_pv.product_id = orig_p.id
+      JOIN product_variants req_pv ON pe.requested_variant_id = req_pv.id
+      JOIN products req_p ON req_pv.product_id = req_p.id
+      WHERE pe.id = $1 AND pe.user_id = $2
+    `, [id, userId]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Exchange request not found' });
+    }
+
+    const row = result.rows[0];
+    res.status(200).json({
+      exchange: {
+        ...row,
+        total_due: Math.max(0, parseFloat(row.price_difference)) + parseFloat(row.logistics_fee),
+      },
+    });
+  } catch (error) {
+    console.error('Exchange detail error:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// --- CUSTOMER: Cancel a PENDING exchange ---
+app.delete('/api/exchanges/:id', authenticateToken, async (req: any, res) => {
+  const userId = req.user.userId;
+  const { id } = req.params;
+  try {
+    const exRes = await pool.query('SELECT id, status FROM product_exchanges WHERE id = $1 AND user_id = $2', [id, userId]);
+    if (exRes.rows.length === 0) return res.status(404).json({ message: 'Exchange request not found' });
+
+    if (exRes.rows[0].status !== 'PENDING') {
+      return res.status(400).json({ message: 'Only PENDING exchange requests can be cancelled.' });
+    }
+
+    await pool.query(
+      'UPDATE product_exchanges SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+      ['CANCELLED', id]
+    );
+
+    res.status(200).json({ success: true, message: 'Exchange request cancelled.' });
+  } catch (error) {
+    console.error('Exchange cancel error:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// --- CUSTOMER: Create Razorpay order for exchange fee payment ---
+app.post('/api/exchanges/:id/pay-fee', authenticateToken, async (req: any, res) => {
+  const userId = req.user.userId;
+  const { id } = req.params;
+  try {
+    if (!razorpay) return res.status(500).json({ message: 'Payment gateway not configured' });
+
+    const exRes = await pool.query(
+      'SELECT id, status, price_difference, logistics_fee FROM product_exchanges WHERE id = $1 AND user_id = $2',
+      [id, userId]
+    );
+    if (exRes.rows.length === 0) return res.status(404).json({ message: 'Exchange not found' });
+
+    const exchange = exRes.rows[0];
+    if (exchange.status !== 'AWAITING_PAYMENT') {
+      return res.status(400).json({ message: 'Exchange is not in AWAITING_PAYMENT status.' });
+    }
+
+    const totalDue = Math.max(0, parseFloat(exchange.price_difference)) + parseFloat(exchange.logistics_fee);
+    if (totalDue <= 0) {
+      return res.status(400).json({ message: 'No payment required for this exchange.' });
+    }
+
+    const amountInPaise = Math.round(totalDue * 100);
+    const razorpayOrder = await razorpay.orders.create({
+      amount: amountInPaise,
+      currency: 'INR',
+      receipt: `ex_${id}_${Date.now()}`,
+    });
+
+    // Store Razorpay order id on the exchange record
+    await pool.query(
+      'UPDATE product_exchanges SET razorpay_order_id = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+      [razorpayOrder.id, id]
+    );
+
+    res.status(200).json({
+      razorpay_order_id: razorpayOrder.id,
+      amount: amountInPaise,
+      currency: 'INR',
+      key_id: process.env.RAZORPAY_KEY_ID,
+    });
+  } catch (error) {
+    console.error('Exchange pay-fee error:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// --- CUSTOMER: Verify fee payment ---
+app.post('/api/exchanges/:id/verify-fee-payment', authenticateToken, async (req: any, res) => {
+  const userId = req.user.userId;
+  const { id } = req.params;
+  const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+
+  if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+    return res.status(400).json({ message: 'Missing Razorpay payment data' });
+  }
+
+  const body = razorpay_order_id + '|' + razorpay_payment_id;
+  const expectedSig = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET || '').update(body).digest('hex');
+  if (expectedSig !== razorpay_signature) {
+    return res.status(400).json({ success: false, message: 'Payment verification failed. Invalid signature.' });
+  }
+
+  try {
+    const exRes = await pool.query(
+      'SELECT id, status FROM product_exchanges WHERE id = $1 AND user_id = $2',
+      [id, userId]
+    );
+    if (exRes.rows.length === 0) return res.status(404).json({ message: 'Exchange not found' });
+    if (exRes.rows[0].status !== 'AWAITING_PAYMENT') {
+      return res.status(400).json({ message: 'Exchange is not awaiting payment.' });
+    }
+
+    await pool.query(`
+      UPDATE product_exchanges
+      SET status = 'PAYMENT_CONFIRMED',
+          razorpay_order_id = $1,
+          razorpay_payment_id = $2,
+          razorpay_signature = $3,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = $4
+    `, [razorpay_order_id, razorpay_payment_id, razorpay_signature, id]);
+
+    res.status(200).json({ success: true, message: 'Payment confirmed. Your exchange is being processed.' });
+  } catch (error) {
+    console.error('Exchange verify-fee-payment error:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// --- ADMIN: List all exchange requests ---
 app.get('/api/admin/exchanges', verifyAdmin, async (req, res) => {
   try {
-    res.status(200).json({ exchanges: [] });
+    const { status, search } = req.query;
+
+    let queryStr = `
+      SELECT pe.*,
+             o.order_number,
+             u.name AS customer_name, u.email AS customer_email,
+             orig_pv.color AS original_color, orig_pv.size AS original_size, orig_pv.sku AS original_sku,
+             orig_p.name AS original_product_name,
+             req_pv.color AS replacement_color, req_pv.size AS replacement_size, req_pv.sku AS replacement_sku,
+             req_p.name AS replacement_product_name
+      FROM product_exchanges pe
+      JOIN orders o ON pe.order_id = o.id
+      JOIN users u ON pe.user_id = u.id
+      JOIN product_variants orig_pv ON pe.original_variant_id = orig_pv.id
+      JOIN products orig_p ON orig_pv.product_id = orig_p.id
+      JOIN product_variants req_pv ON pe.requested_variant_id = req_pv.id
+      JOIN products req_p ON req_pv.product_id = req_p.id
+      WHERE 1=1
+    `;
+    const params: any[] = [];
+
+    if (status && status !== 'ALL') {
+      params.push(status);
+      queryStr += ` AND pe.status = $${params.length}`;
+    }
+
+    if (search && typeof search === 'string' && search.trim().length > 0) {
+      params.push(`%${search.trim()}%`);
+      const idx = params.length;
+      queryStr += ` AND (u.name ILIKE $${idx} OR u.email ILIKE $${idx} OR o.order_number ILIKE $${idx} OR orig_p.name ILIKE $${idx})`;
+    }
+
+    queryStr += ' ORDER BY pe.created_at DESC';
+
+    const result = await pool.query(queryStr, params);
+
+    const statsRes = await pool.query(`
+      SELECT
+        COUNT(*) AS total,
+        COUNT(*) FILTER (WHERE status = 'PENDING') AS pending,
+        COUNT(*) FILTER (WHERE status = 'APPROVED') AS approved,
+        COUNT(*) FILTER (WHERE status = 'AWAITING_PAYMENT') AS awaiting_payment,
+        COUNT(*) FILTER (WHERE status = 'PAYMENT_CONFIRMED') AS payment_confirmed,
+        COUNT(*) FILTER (WHERE status IN ('PICKUP_SCHEDULED','ITEM_RECEIVED','DISPATCHED')) AS in_progress,
+        COUNT(*) FILTER (WHERE status = 'COMPLETED') AS completed,
+        COUNT(*) FILTER (WHERE status = 'REJECTED') AS rejected,
+        COUNT(*) FILTER (WHERE status = 'CANCELLED') AS cancelled
+      FROM product_exchanges
+    `);
+
+    const exchanges = result.rows.map((row: any) => ({
+      id: row.id,
+      order_number: row.order_number,
+      customer_name: row.customer_name,
+      customer_email: row.customer_email,
+      exchange_type: row.exchange_type,
+      reason: row.reason,
+      customer_notes: row.customer_notes,
+      status: row.status,
+      price_original: row.price_original,
+      price_replacement: row.price_replacement,
+      price_difference: row.price_difference,
+      logistics_fee: row.logistics_fee,
+      total_due: Math.max(0, parseFloat(row.price_difference)) + parseFloat(row.logistics_fee),
+      admin_notes: row.admin_notes,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      original: {
+        product_name: row.original_product_name,
+        sku: row.original_sku,
+        color: row.original_color,
+        size: row.original_size,
+      },
+      replacement: {
+        product_name: row.replacement_product_name,
+        sku: row.replacement_sku,
+        color: row.replacement_color,
+        size: row.replacement_size,
+      },
+    }));
+
+    res.status(200).json({ exchanges, stats: statsRes.rows[0] });
   } catch (error) {
-    console.error(error);
+    console.error('Admin list exchanges error:', error);
     res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// --- ADMIN: Update exchange status ---
+app.patch('/api/admin/exchanges/:id/status', verifyAdmin, async (req: any, res) => {
+  const { id } = req.params;
+  const { status, admin_notes } = req.body;
+
+  const validStatuses = ['APPROVED','REJECTED','PICKUP_SCHEDULED','ITEM_RECEIVED','DISPATCHED','COMPLETED'];
+  if (!validStatuses.includes(status)) {
+    return res.status(400).json({ message: `Invalid status. Must be one of: ${validStatuses.join(', ')}` });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const exRes = await client.query('SELECT * FROM product_exchanges WHERE id = $1 FOR UPDATE', [id]);
+    if (exRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Exchange not found' });
+    }
+
+    const exchange = exRes.rows[0];
+    const allowedNext = EXCHANGE_TRANSITIONS[exchange.status] || [];
+    if (!allowedNext.includes(status)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        message: `Cannot transition from ${exchange.status} to ${status}. Allowed transitions: ${allowedNext.join(', ') || 'none'}`
+      });
+    }
+
+    // Special case: APPROVED — determine if payment is needed
+    let finalStatus = status;
+    if (status === 'APPROVED') {
+      const totalDue = Math.max(0, parseFloat(exchange.price_difference)) + parseFloat(exchange.logistics_fee);
+      finalStatus = totalDue > 0 ? 'AWAITING_PAYMENT' : 'PAYMENT_CONFIRMED';
+    }
+
+    // Special case: ITEM_RECEIVED — decrement replacement stock atomically
+    if (status === 'ITEM_RECEIVED') {
+      const stockRes = await client.query(
+        'SELECT stock FROM product_variants WHERE id = $1 FOR UPDATE',
+        [exchange.requested_variant_id]
+      );
+      if (stockRes.rows.length === 0) throw new Error('Replacement variant not found');
+      if (stockRes.rows[0].stock < exchange.quantity) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          message: `Insufficient stock for replacement variant (${stockRes.rows[0].stock} available, ${exchange.quantity} needed). Please reconcile inventory first.`
+        });
+      }
+      await client.query(
+        'UPDATE product_variants SET stock = stock - $1, updated_at = NOW() WHERE id = $2',
+        [exchange.quantity, exchange.requested_variant_id]
+      );
+    }
+
+    const updateRes = await client.query(`
+      UPDATE product_exchanges
+      SET status = $1,
+          admin_notes = COALESCE($2, admin_notes),
+          processed_by = $3,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = $4
+      RETURNING *
+    `, [finalStatus, admin_notes || null, req.user.userId, id]);
+
+    await client.query('COMMIT');
+
+    res.status(200).json({
+      success: true,
+      message: `Exchange #${id} status updated to ${finalStatus}`,
+      exchange: updateRes.rows[0],
+      actual_status: finalStatus,
+    });
+  } catch (error: any) {
+    await client.query('ROLLBACK');
+    console.error('Admin exchange status update error:', error);
+    res.status(500).json({ message: error.message || 'Internal server error' });
+  } finally {
+    client.release();
   }
 });
 
