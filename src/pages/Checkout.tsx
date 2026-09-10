@@ -355,7 +355,8 @@ export default function Checkout() {
                         quantity={item.quantity} 
                         onIncrease={() => updateQuantity(item.id, item.quantity + 1)} 
                         onDecrease={() => item.quantity > 1 ? updateQuantity(item.id, item.quantity - 1) : removeFromCart(item.id)} 
-                        size="sm" 
+                        size="sm"
+                        maxQuantity={item.stock}
                       />
                     </div>
                   </div>

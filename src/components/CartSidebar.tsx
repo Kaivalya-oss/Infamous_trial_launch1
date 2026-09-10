@@ -83,7 +83,8 @@ export default function CartSidebar() {
                               removeFromCart(item.id);
                             }
                           }} 
-                          size="sm" 
+                          size="sm"
+                          maxQuantity={item.stock}
                         />
                         <span className="font-medium">{item.price}</span>
                       </div>

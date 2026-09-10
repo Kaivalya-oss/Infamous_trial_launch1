@@ -297,7 +297,7 @@ app.get('/api/cart', authenticateToken, async (req, res) => {
             return res.status(200).json({ items: [] });
         const cartId = cartRes.rows[0].id;
         const itemsRes = await pool.query(`
-      SELECT ci.id as cart_item_id, ci.quantity, v.id as variant_id, v.sku, v.price, v.color, v.size, p.name as product_name, p.slug
+      SELECT ci.id as cart_item_id, ci.quantity, v.id as variant_id, v.sku, v.price, v.color, v.size, v.stock, p.name as product_name, p.slug
       FROM cart_items ci
       JOIN product_variants v ON ci.variant_id = v.id
       JOIN products p ON v.product_id = p.id
@@ -314,6 +314,20 @@ app.post('/api/cart/items', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     const { variantId, quantity } = req.body;
     try {
+        // Validate quantity is a positive integer
+        const qty = parseInt(quantity, 10);
+        if (isNaN(qty) || qty < 1) {
+            return res.status(400).json({ message: 'Quantity must be a positive integer' });
+        }
+        // Server-side stock check
+        const stockRes = await pool.query('SELECT stock FROM product_variants WHERE id = $1', [variantId]);
+        if (stockRes.rows.length === 0) {
+            return res.status(404).json({ message: 'Variant not found' });
+        }
+        const availableStock = stockRes.rows[0].stock;
+        if (qty > availableStock) {
+            return res.status(409).json({ message: `Only ${availableStock} units available for this variant` });
+        }
         let cartRes = await pool.query('SELECT id FROM cart WHERE user_id = $1', [userId]);
         let cartId;
         if (cartRes.rows.length === 0) {
@@ -323,11 +337,12 @@ app.post('/api/cart/items', authenticateToken, async (req, res) => {
         else {
             cartId = cartRes.rows[0].id;
         }
+        // Use SET semantics on conflict for add — prevents double-counting
         await pool.query(`
       INSERT INTO cart_items (cart_id, variant_id, quantity) 
       VALUES ($1, $2, $3)
-      ON CONFLICT (cart_id, variant_id) DO UPDATE SET quantity = cart_items.quantity + EXCLUDED.quantity
-    `, [cartId, variantId, quantity]);
+      ON CONFLICT (cart_id, variant_id) DO UPDATE SET quantity = EXCLUDED.quantity
+    `, [cartId, variantId, qty]);
         res.status(200).json({ message: 'Item added to cart' });
     }
     catch (error) {
@@ -340,11 +355,25 @@ app.put('/api/cart/items/:variantId', authenticateToken, async (req, res) => {
     const variantId = req.params.variantId;
     const { quantity } = req.body;
     try {
+        // Validate quantity is a positive integer
+        const qty = parseInt(quantity, 10);
+        if (isNaN(qty) || qty < 1) {
+            return res.status(400).json({ message: 'Quantity must be a positive integer' });
+        }
+        // Server-side stock check
+        const stockRes = await pool.query('SELECT stock FROM product_variants WHERE id = $1', [variantId]);
+        if (stockRes.rows.length === 0) {
+            return res.status(404).json({ message: 'Variant not found' });
+        }
+        const availableStock = stockRes.rows[0].stock;
+        if (qty > availableStock) {
+            return res.status(409).json({ message: `Only ${availableStock} units available for this variant` });
+        }
         const cartRes = await pool.query('SELECT id FROM cart WHERE user_id = $1', [userId]);
         if (cartRes.rows.length === 0)
             return res.status(404).json({ message: 'Cart not found' });
         const cartId = cartRes.rows[0].id;
-        await pool.query('UPDATE cart_items SET quantity = $1 WHERE cart_id = $2 AND variant_id = $3', [quantity, cartId, variantId]);
+        await pool.query('UPDATE cart_items SET quantity = $1 WHERE cart_id = $2 AND variant_id = $3', [qty, cartId, variantId]);
         res.status(200).json({ message: 'Quantity updated' });
     }
     catch (error) {
@@ -397,9 +426,9 @@ app.post('/api/cart/merge', authenticateToken, async (req, res) => {
                     throw e;
             }
         }
-        // Now return the merged items back to the client
+        // Now return the merged items back to the client (includes stock for UI max-quantity)
         const mergedItemsRes = await pool.query(`
-      SELECT ci.quantity, ci.variant_id, v.color, v.size, p.name, v.price, p.id as product_id
+      SELECT ci.quantity, ci.variant_id, v.color, v.size, v.stock, p.name, v.price, p.id as product_id
       FROM cart_items ci
       JOIN product_variants v ON ci.variant_id = v.id
       JOIN products p ON v.product_id = p.id
@@ -419,6 +448,7 @@ app.post('/api/cart/merge', authenticateToken, async (req, res) => {
                 size: row.size,
                 color: row.color,
                 quantity: row.quantity,
+                stock: row.stock,
                 variant_id: row.variant_id
             });
         }
