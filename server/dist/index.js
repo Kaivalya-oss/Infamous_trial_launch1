@@ -1328,7 +1328,7 @@ app.put('/api/admin/inventory/bulk', verifyAdmin, async (req, res) => {
             if (typeof variant_id !== 'number' || typeof stock !== 'number' || stock < 0) {
                 throw new Error(`Invalid data for variant ${variant_id}`);
             }
-            const result = await client.query('UPDATE product_variants SET stock = $1, updated_at = NOW() WHERE id = $2 RETURNING id', [stock, variant_id]);
+            const result = await client.query('UPDATE product_variants SET stock = $1 WHERE id = $2 RETURNING id', [stock, variant_id]);
             if (result.rowCount === 0) {
                 throw new Error(`Variant ${variant_id} not found`);
             }
@@ -1991,7 +1991,7 @@ app.patch('/api/admin/exchanges/:id/status', verifyAdmin, async (req, res) => {
                     message: `Insufficient stock for replacement variant (${stockRes.rows[0].stock} available, ${exchange.quantity} needed). Please reconcile inventory first.`
                 });
             }
-            await client.query('UPDATE product_variants SET stock = stock - $1, updated_at = NOW() WHERE id = $2', [exchange.quantity, exchange.requested_variant_id]);
+            await client.query('UPDATE product_variants SET stock = stock - $1 WHERE id = $2', [exchange.quantity, exchange.requested_variant_id]);
         }
         const updateRes = await client.query(`
       UPDATE product_exchanges

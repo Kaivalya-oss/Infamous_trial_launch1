@@ -1411,7 +1411,7 @@ app.put('/api/admin/inventory/bulk', verifyAdmin, async (req, res) => {
       }
       
       const result = await client.query(
-        'UPDATE product_variants SET stock = $1, updated_at = NOW() WHERE id = $2 RETURNING id',
+        'UPDATE product_variants SET stock = $1 WHERE id = $2 RETURNING id',
         [stock, variant_id]
       );
       
@@ -2158,7 +2158,7 @@ app.patch('/api/admin/exchanges/:id/status', verifyAdmin, async (req: any, res) 
         });
       }
       await client.query(
-        'UPDATE product_variants SET stock = stock - $1, updated_at = NOW() WHERE id = $2',
+        'UPDATE product_variants SET stock = stock - $1 WHERE id = $2',
         [exchange.quantity, exchange.requested_variant_id]
       );
     }
