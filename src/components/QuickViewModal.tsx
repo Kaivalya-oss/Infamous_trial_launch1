@@ -19,12 +19,11 @@ interface Product {
 interface QuickViewModalProps {
   product: Product | null;
   onClose: () => void;
-  onSelectProduct?: (product: Product) => void;
   zIndex?: number;
   isTopmost?: boolean;
 }
 
-export default function QuickViewModal({ product, onClose, onSelectProduct, zIndex = 999, isTopmost = true }: QuickViewModalProps) {
+export default function QuickViewModal({ product, onClose, zIndex = 999, isTopmost = true }: QuickViewModalProps) {
   const [selectedSize, setSelectedSize] = useState<string>('M');
   const [selectedColor, setSelectedColor] = useState<string>('Black');
   const [isSizeGuideOpen, setIsSizeGuideOpen] = useState(false);
@@ -283,30 +282,6 @@ export default function QuickViewModal({ product, onClose, onSelectProduct, zInd
                 {/* ──────────────────────── REVIEWS SECTION ──────────────────────── */}
                 <ProductReviews productId={Number(product.id)} />
 
-
-                {/* ──────────────────────── RECOMMENDATIONS ──────────────────────── */}
-                <div className="border-t border-black/10 pt-12 mt-12">
-                  <h3 className="font-serif italic text-3xl mb-8">You May Also Like</h3>
-                  <div className="flex gap-6 overflow-x-auto pb-4 snap-x">
-                    {[
-                      { name: 'Oversized Zip Hoodie', price: '$165', img: '/product_3_1782146269435.png' },
-                      { name: 'Washed Canvas Jacket', price: '$320', img: '/featured_collection_1782146151168.png' },
-                      { name: 'Studio Oversized Tee', price: '$95', img: '/product_2_1782146252833.png' }
-                    ].map((rec, idx) => (
-                      <div 
-                        key={idx} 
-                        className="w-[200px] shrink-0 snap-start group cursor-pointer"
-                        onClick={() => onSelectProduct && onSelectProduct(rec as Product)}
-                      >
-                        <div className="w-full h-[250px] bg-secondary rounded-[16px] overflow-hidden mb-4 relative">
-                          <img src={rec.img} alt={rec.name} className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-105" />
-                        </div>
-                        <h4 className="font-medium text-sm line-clamp-1">{rec.name}</h4>
-                        <p className="text-textSecondary text-sm">{rec.price}</p>
-                      </div>
-                    ))}
-                  </div>
-                </div>
 
               </div>
             </div>

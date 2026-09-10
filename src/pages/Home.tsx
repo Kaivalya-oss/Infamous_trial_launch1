@@ -458,7 +458,6 @@ export default function Home() {
           key={`${product.id}-${index}`}
           product={product} 
           onClose={() => setProductStack(prev => prev.filter((_, i) => i !== index))}
-          onSelectProduct={(p) => setProductStack(prev => [...prev, p])}
           zIndex={999 + index}
           isTopmost={index === productStack.length - 1}
         />
