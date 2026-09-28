@@ -1,7 +1,7 @@
 import api from '../../lib/axios';
 import { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { AlertCircle, RefreshCw, X, ChevronRight, ChevronLeft, Package, Tag, IndianRupee, CheckCircle2, Clock, Truck, XCircle } from 'lucide-react';
+import { AlertCircle, RefreshCw, RotateCcw, X, ChevronRight, ChevronLeft, Package, Tag, IndianRupee, CheckCircle2, Clock, Truck, XCircle } from 'lucide-react';
 import { Button } from '../../components/ui/Button';
 import { Input } from '../../components/ui/Input';
 
@@ -53,6 +53,22 @@ interface ExchangeRecord {
   replacement: { product_name: string; color: string; size: string };
 }
 
+interface ReturnRecord {
+  id: number;
+  order_number: string;
+  status: string;
+  reason: string;
+  refund_amount: string;
+  admin_notes: string | null;
+  created_at: string;
+  updated_at: string;
+  product_name: string;
+  sku: string;
+  color: string;
+  size: string;
+  image_url: string | null;
+}
+
 // ─── Status badge helper ──────────────────────────────────────────────────────
 
 const STATUS_CONFIG: Record<string, { label: string; color: string; icon: any }> = {
@@ -62,6 +78,7 @@ const STATUS_CONFIG: Record<string, { label: string; color: string; icon: any }>
   PAYMENT_CONFIRMED: { label: 'Payment Confirmed',    color: 'bg-emerald-500/15 text-emerald-600 border-emerald-400/30', icon: CheckCircle2 },
   PICKUP_SCHEDULED:  { label: 'Pickup Scheduled',     color: 'bg-purple-500/15 text-purple-600 border-purple-400/30', icon: Truck },
   ITEM_RECEIVED:     { label: 'Item Received',        color: 'bg-cyan-500/15 text-cyan-600 border-cyan-400/30', icon: Package },
+  REFUND_INITIATED:  { label: 'Refund Initiated',     color: 'bg-amber-500/15 text-amber-600 border-amber-400/30', icon: IndianRupee },
   DISPATCHED:        { label: 'Dispatched',           color: 'bg-indigo-500/15 text-indigo-600 border-indigo-400/30', icon: Truck },
   COMPLETED:         { label: 'Completed',            color: 'bg-green-500/15 text-green-700 border-green-400/30', icon: CheckCircle2 },
   REJECTED:          { label: 'Rejected',             color: 'bg-red-500/15 text-red-600 border-red-400/30', icon: XCircle },
@@ -457,6 +474,270 @@ function ExchangeModal({ onClose, onSuccess }: { onClose: () => void; onSuccess:
   );
 }
 
+// ─── Return Modal ─────────────────────────────────────────────────────────────
+
+const RETURN_REASONS = [
+  'Defective or Damaged Product',
+  'Wrong Item Received',
+  'Quality Not As Expected',
+  'Changed My Mind',
+  'Other',
+];
+
+function ReturnModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: () => void }) {
+  const [step, setStep] = useState(1);
+  const [eligibleOrders, setEligibleOrders] = useState<EligibleOrder[]>([]);
+  const [loadingOrders, setLoadingOrders] = useState(true);
+  const [selectedOrder, setSelectedOrder] = useState<EligibleOrder | null>(null);
+  const [selectedItem, setSelectedItem] = useState<OrderItem | null>(null);
+  const [reason, setReason] = useState('');
+  const [customerNotes, setCustomerNotes] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState('');
+
+  useEffect(() => {
+    api.get('/api/exchanges/eligible-orders')
+      .then(res => setEligibleOrders(res.data.orders || []))
+      .catch(() => setEligibleOrders([]))
+      .finally(() => setLoadingOrders(false));
+  }, []);
+
+  const handleSubmit = async () => {
+    if (!selectedItem || !reason) return;
+    setSubmitting(true);
+    setSubmitError('');
+    try {
+      await api.post('/api/returns', {
+        order_item_id: selectedItem.order_item_id,
+        reason,
+        customer_notes: customerNotes.trim() || undefined,
+      });
+      onSuccess();
+      onClose();
+    } catch (err: any) {
+      setSubmitError(err.response?.data?.message || 'Failed to submit return. Please try again.');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const STEP_LABELS = ['Select Order', 'Select Item', 'Reason', 'Review'];
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+      <motion.div
+        initial={{ opacity: 0, scale: 0.95, y: 20 }}
+        animate={{ opacity: 1, scale: 1, y: 0 }}
+        exit={{ opacity: 0, scale: 0.95, y: 20 }}
+        transition={{ duration: 0.3, ease: 'easeOut' }}
+        className="w-full max-w-2xl bg-white rounded-[28px] shadow-2xl overflow-hidden max-h-[90vh] flex flex-col"
+      >
+        {/* Header */}
+        <div className="p-6 border-b border-black/8 flex items-center justify-between shrink-0">
+          <div>
+            <h2 className="font-serif italic text-2xl leading-none">Return for Refund</h2>
+            <p className="text-xs text-textSecondary mt-1 uppercase tracking-[1px]">Step {step} of 4 — {STEP_LABELS[step - 1]}</p>
+          </div>
+          <button onClick={onClose} className="w-10 h-10 rounded-full bg-black/5 hover:bg-black/10 flex items-center justify-center transition-colors">
+            <X size={18} />
+          </button>
+        </div>
+
+        {/* Progress bar */}
+        <div className="h-0.5 bg-black/8 shrink-0">
+          <motion.div
+            className="h-full bg-black"
+            initial={false}
+            animate={{ width: `${(step / 4) * 100}%` }}
+            transition={{ duration: 0.4, ease: 'easeInOut' }}
+          />
+        </div>
+
+        {/* Body */}
+        <div className="flex-1 overflow-y-auto p-6">
+          <AnimatePresence mode="wait">
+
+            {/* Step 1: Select Order */}
+            {step === 1 && (
+              <motion.div key="rs1" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -20 }} transition={{ duration: 0.25 }}>
+                <h3 className="font-medium mb-1">Select your delivered order</h3>
+                <p className="text-sm text-textSecondary mb-5">Only orders delivered within the last 7 days are eligible.</p>
+                {loadingOrders ? (
+                  <div className="text-sm text-textSecondary animate-pulse">Loading eligible orders...</div>
+                ) : eligibleOrders.length === 0 ? (
+                  <div className="p-6 rounded-[16px] border border-black/10 text-center text-textSecondary text-sm">
+                    No eligible orders found. Returns must be initiated within 7 days of delivery.
+                  </div>
+                ) : (
+                  <div className="flex flex-col gap-3">
+                    {eligibleOrders.map(order => (
+                      <button
+                        key={order.id}
+                        onClick={() => { setSelectedOrder(order); setStep(2); }}
+                        className="w-full text-left p-5 rounded-[16px] border border-black/10 hover:border-black/30 hover:bg-black/[0.02] transition-all flex justify-between items-center group"
+                      >
+                        <div>
+                          <p className="font-medium text-sm">Order #{order.order_number}</p>
+                          <p className="text-xs text-textSecondary mt-0.5">
+                            Delivered {new Date(order.delivered_at).toLocaleDateString()} · {order.items.length} item{order.items.length !== 1 ? 's' : ''}
+                          </p>
+                        </div>
+                        <ChevronRight size={18} className="text-textSecondary group-hover:text-black transition-colors" />
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </motion.div>
+            )}
+
+            {/* Step 2: Select Item */}
+            {step === 2 && selectedOrder && (
+              <motion.div key="rs2" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -20 }} transition={{ duration: 0.25 }}>
+                <h3 className="font-medium mb-1">Select item to return</h3>
+                <p className="text-sm text-textSecondary mb-5">Order #{selectedOrder.order_number}</p>
+                <div className="flex flex-col gap-3">
+                  {selectedOrder.items.map(item => (
+                    <button
+                      key={item.order_item_id}
+                      onClick={() => { setSelectedItem(item); setStep(3); }}
+                      className="w-full text-left p-5 rounded-[16px] border border-black/10 hover:border-black/30 hover:bg-black/[0.02] transition-all flex gap-4 items-center group"
+                    >
+                      {item.image_url ? (
+                        <img src={item.image_url} alt={item.product_name} className="w-14 h-14 rounded-[10px] object-cover shrink-0 bg-gray-100" />
+                      ) : (
+                        <div className="w-14 h-14 rounded-[10px] bg-gray-100 flex items-center justify-center shrink-0">
+                          <Package size={20} className="text-gray-400" />
+                        </div>
+                      )}
+                      <div className="flex-1 min-w-0">
+                        <p className="font-medium text-sm truncate">{item.product_name}</p>
+                        <p className="text-xs text-textSecondary mt-0.5">{item.color} · Size {item.size}</p>
+                        <p className="text-xs text-textSecondary">SKU: {item.sku} · ₹{parseFloat(item.price).toLocaleString()}</p>
+                      </div>
+                      <ChevronRight size={18} className="text-textSecondary group-hover:text-black transition-colors shrink-0" />
+                    </button>
+                  ))}
+                </div>
+              </motion.div>
+            )}
+
+            {/* Step 3: Reason */}
+            {step === 3 && (
+              <motion.div key="rs3" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -20 }} transition={{ duration: 0.25 }}>
+                <h3 className="font-medium mb-1">Why do you want to return this item?</h3>
+                <p className="text-sm text-textSecondary mb-5">Select the reason that best describes your situation.</p>
+                <div className="flex flex-col gap-2 mb-6">
+                  {RETURN_REASONS.map(r => (
+                    <button
+                      key={r}
+                      onClick={() => setReason(r)}
+                      className={`w-full text-left px-4 py-3 rounded-[12px] border text-sm transition-all ${
+                        reason === r
+                          ? 'border-black bg-black/5 font-medium'
+                          : 'border-black/10 hover:border-black/30'
+                      }`}
+                    >
+                      {r}
+                    </button>
+                  ))}
+                </div>
+                <div>
+                  <label className="text-xs font-medium tracking-[1px] uppercase text-textSecondary mb-2 block">Additional notes (optional)</label>
+                  <textarea
+                    value={customerNotes}
+                    onChange={e => setCustomerNotes(e.target.value)}
+                    maxLength={500}
+                    rows={3}
+                    placeholder="Any additional context for our team..."
+                    className="w-full border-b border-black/15 focus:border-black outline-none text-sm font-light resize-none py-2 bg-transparent placeholder:text-textSecondary/50 transition-colors"
+                  />
+                </div>
+              </motion.div>
+            )}
+
+            {/* Step 4: Review & Submit */}
+            {step === 4 && selectedItem && (
+              <motion.div key="rs4" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -20 }} transition={{ duration: 0.25 }}>
+                <h3 className="font-medium mb-1">Review your return request</h3>
+                <p className="text-sm text-textSecondary mb-5">Please confirm the details below before submitting.</p>
+
+                <div className="space-y-3 mb-6">
+                  <div className="p-4 rounded-[14px] border border-black/10 flex items-start gap-3">
+                    <div className="w-8 h-8 rounded-full bg-red-50 flex items-center justify-center shrink-0 mt-0.5">
+                      <RotateCcw size={14} className="text-red-500" />
+                    </div>
+                    <div>
+                      <p className="text-xs text-textSecondary uppercase tracking-[1px] mb-0.5">Returning</p>
+                      <p className="font-medium text-sm">{selectedItem.product_name}</p>
+                      <p className="text-xs text-textSecondary">{selectedItem.color} · Size {selectedItem.size} · ₹{parseFloat(selectedItem.price).toLocaleString()}</p>
+                    </div>
+                  </div>
+
+                  <div className="p-4 rounded-[14px] bg-gray-50 border border-black/8 space-y-2">
+                    <div className="flex justify-between text-sm">
+                      <span className="text-textSecondary">Reason</span>
+                      <span className="font-medium">{reason}</span>
+                    </div>
+                    <div className="flex justify-between text-sm">
+                      <span className="text-textSecondary">Refund amount</span>
+                      <span className="font-semibold text-green-600">₹{parseFloat(selectedItem.price).toLocaleString()}</span>
+                    </div>
+                  </div>
+
+                  <div className="p-4 rounded-[14px] bg-green-50 border border-green-200/60 text-xs text-green-800 flex gap-2">
+                    <CheckCircle2 size={14} className="shrink-0 mt-0.5" />
+                    <span>Your return will be approved immediately. Our team will schedule a pickup and process your refund after the item is received and inspected.</span>
+                  </div>
+                </div>
+
+                {submitError && (
+                  <div className="p-4 mb-4 rounded-[12px] bg-red-50 border border-red-200 text-sm text-red-700">
+                    {submitError}
+                  </div>
+                )}
+
+                <Button onClick={handleSubmit} isLoading={submitting} className="w-full">
+                  Submit Return Request
+                </Button>
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
+
+        {/* Footer navigation */}
+        <div className="p-6 border-t border-black/8 flex justify-between shrink-0">
+          <Button
+            variant="outline"
+            onClick={() => {
+              if (step > 1) setStep(s => s - 1);
+              else onClose();
+            }}
+            className="h-11 px-6"
+          >
+            <ChevronLeft size={16} className="mr-1" />
+            {step === 1 ? 'Cancel' : 'Back'}
+          </Button>
+
+          {step < 4 && (
+            <Button
+              onClick={() => setStep(s => s + 1)}
+              disabled={
+                (step === 1 && !selectedOrder) ||
+                (step === 2 && !selectedItem) ||
+                (step === 3 && !reason)
+              }
+              className="h-11 px-6"
+            >
+              Continue
+              <ChevronRight size={16} className="ml-1" />
+            </Button>
+          )}
+        </div>
+      </motion.div>
+    </div>
+  );
+}
+
 // ─── Pay Now Modal (Razorpay for exchange fee) ────────────────────────────────
 
 function loadRazorpayScript(): Promise<boolean> {
@@ -476,7 +757,10 @@ export default function Exchanges() {
   const [exchanges, setExchanges] = useState<ExchangeRecord[]>([]);
   const [loadingExchanges, setLoadingExchanges] = useState(true);
   const [showModal, setShowModal] = useState(false);
+  const [showReturnModal, setShowReturnModal] = useState(false);
   const [payingExchangeId, setPayingExchangeId] = useState<number | null>(null);
+  const [returns, setReturns] = useState<ReturnRecord[]>([]);
+  const [loadingReturns, setLoadingReturns] = useState(true);
 
   const fetchExchanges = () => {
     setLoadingExchanges(true);
@@ -486,7 +770,15 @@ export default function Exchanges() {
       .finally(() => setLoadingExchanges(false));
   };
 
-  useEffect(() => { fetchExchanges(); }, []);
+  const fetchReturns = () => {
+    setLoadingReturns(true);
+    api.get('/api/returns')
+      .then(res => setReturns(res.data.returns || []))
+      .catch(() => setReturns([]))
+      .finally(() => setLoadingReturns(false));
+  };
+
+  useEffect(() => { fetchExchanges(); fetchReturns(); }, []);
 
   const handleCancel = async (id: number) => {
     if (!window.confirm('Cancel this exchange request?')) return;
@@ -540,6 +832,8 @@ export default function Exchanges() {
 
   const activeExchanges = exchanges.filter(ex => !['COMPLETED', 'REJECTED', 'CANCELLED'].includes(ex.status));
   const pastExchanges = exchanges.filter(ex => ['COMPLETED', 'REJECTED', 'CANCELLED'].includes(ex.status));
+  const activeReturns = returns.filter(r => !['COMPLETED', 'CANCELLED'].includes(r.status));
+  const pastReturns = returns.filter(r => ['COMPLETED', 'CANCELLED'].includes(r.status));
 
   return (
     <>
@@ -548,6 +842,12 @@ export default function Exchanges() {
           <ExchangeModal
             onClose={() => setShowModal(false)}
             onSuccess={() => { fetchExchanges(); }}
+          />
+        )}
+        {showReturnModal && (
+          <ReturnModal
+            onClose={() => setShowReturnModal(false)}
+            onSuccess={() => { fetchReturns(); }}
           />
         )}
       </AnimatePresence>
@@ -665,8 +965,70 @@ export default function Exchanges() {
           </div>
         )}
 
+        {/* ───────── RETURNS SECTION ───────── */}
+
+        {/* Active Returns */}
+        {activeReturns.length > 0 && (
+          <div className="mb-12">
+            <h3 className="text-sm font-medium tracking-[2px] text-textSecondary uppercase mb-6">Active Returns</h3>
+            <div className="flex flex-col gap-4">
+              {activeReturns.map(ret => (
+                <div key={ret.id} className="bg-white border border-black/10 rounded-[24px] p-6 flex flex-col md:flex-row gap-6 justify-between">
+                  <div className="flex gap-4 items-start">
+                    {ret.image_url ? (
+                      <img src={ret.image_url} alt="" className="w-14 h-14 rounded-[12px] object-cover shrink-0 bg-gray-100" />
+                    ) : (
+                      <div className="w-14 h-14 rounded-[12px] bg-secondary flex items-center justify-center shrink-0">
+                        <RotateCcw size={20} />
+                      </div>
+                    )}
+                    <div>
+                      <p className="text-xs text-textSecondary uppercase tracking-[1px] mb-1">Return #{ret.id} · Order #{ret.order_number}</p>
+                      <p className="font-medium text-sm mb-1">
+                        {ret.product_name} / {ret.size}
+                      </p>
+                      <p className="text-xs text-textSecondary">Reason: {ret.reason}</p>
+                      {ret.admin_notes && (
+                        <p className="text-xs text-black/60 mt-1 italic">Note: {ret.admin_notes}</p>
+                      )}
+                      <div className="flex items-center gap-2 mt-1">
+                        <IndianRupee size={12} className="text-green-600" />
+                        <span className="text-xs text-green-600 font-medium">Refund: ₹{parseFloat(ret.refund_amount).toLocaleString()}</span>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="flex flex-col gap-2 items-start md:items-end shrink-0">
+                    <StatusBadge status={ret.status} />
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Past Returns */}
+        {pastReturns.length > 0 && (
+          <div className="mb-12">
+            <h3 className="text-sm font-medium tracking-[2px] text-textSecondary uppercase mb-6">Past Returns</h3>
+            <div className="flex flex-col gap-3">
+              {pastReturns.map(ret => (
+                <div key={ret.id} className="bg-white/60 border border-black/8 rounded-[20px] p-5 flex flex-col sm:flex-row gap-4 justify-between items-start sm:items-center">
+                  <div>
+                    <p className="text-xs text-textSecondary uppercase tracking-[1px] mb-1">Return #{ret.id}</p>
+                    <p className="font-medium text-sm">{ret.product_name} / {ret.size}</p>
+                    <p className="text-xs text-textSecondary mt-0.5">{new Date(ret.created_at).toLocaleDateString()} · ₹{parseFloat(ret.refund_amount).toLocaleString()}</p>
+                  </div>
+                  <StatusBadge status={ret.status} />
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* ───────── CTAs ───────── */}
+
         {/* Initiate New Exchange */}
-        <div>
+        <div className="mb-8">
           <h3 className="text-sm font-medium tracking-[2px] text-textSecondary uppercase mb-6">Initiate New Exchange</h3>
           <div className="bg-[#111111] text-white rounded-[24px] p-8 md:p-10 relative overflow-hidden">
             <div className="absolute top-0 right-0 w-64 h-64 bg-white/5 rounded-full blur-3xl -translate-y-1/2 translate-x-1/4" />
@@ -676,6 +1038,21 @@ export default function Exchanges() {
             </p>
             <Button onClick={() => setShowModal(true)} className="bg-white text-black hover:bg-white/90">
               Select Order to Exchange
+            </Button>
+          </div>
+        </div>
+
+        {/* Initiate New Return */}
+        <div>
+          <h3 className="text-sm font-medium tracking-[2px] text-textSecondary uppercase mb-6">Return for Refund</h3>
+          <div className="bg-[#111111] text-white rounded-[24px] p-8 md:p-10 relative overflow-hidden">
+            <div className="absolute top-0 left-0 w-64 h-64 bg-white/5 rounded-full blur-3xl -translate-y-1/2 -translate-x-1/4" />
+            <h4 className="font-serif italic text-3xl mb-4">Return an Item</h4>
+            <p className="text-white/70 font-light mb-8 max-w-md">
+              Not satisfied? Return a delivered item for a full refund. No approval required.
+            </p>
+            <Button onClick={() => setShowReturnModal(true)} className="bg-white text-black hover:bg-white/90">
+              Start a Return
             </Button>
           </div>
         </div>

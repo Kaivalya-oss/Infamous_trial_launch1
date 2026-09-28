@@ -31,7 +31,7 @@ import AdminInventory from './pages/Admin/Inventory';
 import AdminOrders from './pages/Admin/Orders';
 import AdminCustomers from './pages/Admin/Customers';
 import AdminExchanges from './pages/Admin/Exchanges';
-import AdminLogistics from './pages/Admin/Logistics';
+import AdminReturns from './pages/Admin/Returns';
 import AdminSettings from './pages/Admin/Settings';
 import AdminReviews from './pages/Admin/Reviews';
 import AdminLogin from './pages/Admin/AdminLogin';
@@ -82,7 +82,7 @@ export default function App() {
                   <Route path="customers" element={<AdminCustomers />} />
                   <Route path="reviews" element={<AdminReviews />} />
                   <Route path="exchanges" element={<AdminExchanges />} />
-                  <Route path="logistics" element={<AdminLogistics />} />
+                  <Route path="returns" element={<AdminReturns />} />
                   <Route path="settings" element={<AdminSettings />} />
                 </Route>
 

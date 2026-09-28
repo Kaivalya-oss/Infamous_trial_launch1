@@ -1,6 +1,7 @@
 import { Link, Outlet, useLocation, useNavigate } from 'react-router-dom';
-import { LayoutDashboard, Package, Archive, ShoppingBag, Users, MessageSquare, RefreshCw, Truck, Settings, LogOut } from 'lucide-react';
+import { LayoutDashboard, Package, Archive, ShoppingBag, Users, MessageSquare, RefreshCw, RotateCcw, Settings, LogOut } from 'lucide-react';
 import { useAdminAuth } from '../../context/AdminAuthContext';
+import AdminNotifications from '../../components/admin/AdminNotifications';
 
 export default function AdminLayout() {
   const location = useLocation();
@@ -20,7 +21,7 @@ export default function AdminLayout() {
     { name: 'Customers', path: '/admin/customers', icon: Users },
     { name: 'Reviews', path: '/admin/reviews', icon: MessageSquare },
     { name: 'Exchanges', path: '/admin/exchanges', icon: RefreshCw },
-    { name: 'Logistics', path: '/admin/logistics', icon: Truck },
+    { name: 'Returns', path: '/admin/returns', icon: RotateCcw },
     { name: 'Settings', path: '/admin/settings', icon: Settings },
   ];
 
@@ -76,6 +77,11 @@ export default function AdminLayout() {
         {/* Subtle background glow */}
         <div className="absolute top-0 right-0 w-[500px] h-[500px] bg-white/5 rounded-full blur-[100px] pointer-events-none -translate-y-1/2 translate-x-1/2" />
         
+        {/* Top Header Section */}
+        <div className="relative z-20 flex justify-end mb-8">
+          <AdminNotifications />
+        </div>
+
         <div className="relative z-10">
           <Outlet />
         </div>
