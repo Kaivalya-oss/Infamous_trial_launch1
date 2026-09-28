@@ -37,7 +37,7 @@ function loadRazorpayScript(): Promise<boolean> {
 
 export default function Checkout() {
   const { items, updateQuantity, removeFromCart, cartTotal, setIsCartOpen, clearCart } = useCart();
-  const { user, isAuthenticated } = useAuth();
+  const { user, isAuthenticated, updateUser } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
   
@@ -49,11 +49,51 @@ export default function Checkout() {
   const [addressData, setAddressData] = useState<CheckoutFormValues | null>(null);
   const [processingMessage, setProcessingMessage] = useState('');
   const isSubmittingRef = useRef(false); // Prevent double-clicks
+
+  // Contact completion state
+  const [contactEmail, setContactEmail] = useState('');
+  const [contactPhone, setContactPhone] = useState('');
+  const [hasProfileEmail, setHasProfileEmail] = useState(false);
+  const [hasProfilePhone, setHasProfilePhone] = useState(false);
+  const [contactEmailError, setContactEmailError] = useState('');
+  const [contactPhoneError, setContactPhoneError] = useState('');
   
   useEffect(() => {
     if (items.length === 0 && step < 4) navigate('/');
     setIsCartOpen(false);
   }, [items, navigate, setIsCartOpen, step]);
+
+  // Fetch authenticated customer profile to prefill email & phone
+  useEffect(() => {
+    let isMounted = true;
+    if (isAuthenticated) {
+      api.get('/api/profile').then(response => {
+        if (!isMounted) return;
+        const u = response.data?.user;
+        if (u) {
+          if (u.email && u.email.trim()) {
+            setContactEmail(u.email.trim());
+            setHasProfileEmail(true);
+          }
+          if (u.phone_number && u.phone_number.trim()) {
+            setContactPhone(u.phone_number.trim());
+            setHasProfilePhone(true);
+          }
+        }
+      }).catch(() => {
+        if (!isMounted) return;
+        if (user?.email && user.email.trim()) {
+          setContactEmail(user.email.trim());
+          setHasProfileEmail(true);
+        }
+        if (user?.phone_number && user.phone_number.trim()) {
+          setContactPhone(user.phone_number.trim());
+          setHasProfilePhone(true);
+        }
+      });
+    }
+    return () => { isMounted = false; };
+  }, [isAuthenticated, user]);
 
   const { register, handleSubmit, watch, formState: { errors } } = useForm<CheckoutFormValues>({
     resolver: zodResolver(checkoutSchema),
@@ -73,6 +113,34 @@ export default function Checkout() {
   }, [watchPincode]);
 
   const onAddressSubmit = (data: CheckoutFormValues) => {
+    let valid = true;
+    setContactEmailError('');
+    setContactPhoneError('');
+
+    const trimmedEmail = contactEmail.trim();
+    if (!hasProfileEmail) {
+      if (!trimmedEmail) {
+        setContactEmailError('Email address is required.');
+        valid = false;
+      } else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmedEmail)) {
+        setContactEmailError('Please enter a valid email address.');
+        valid = false;
+      }
+    }
+
+    const trimmedPhone = contactPhone.trim();
+    if (!hasProfilePhone) {
+      if (!trimmedPhone) {
+        setContactPhoneError('Phone number is required.');
+        valid = false;
+      } else if (trimmedPhone.replace(/\D/g, '').length < 10) {
+        setContactPhoneError('Please enter a valid 10-digit phone number.');
+        valid = false;
+      }
+    }
+
+    if (!valid) return;
+
     setAddressData(data);
     setStep(2);
   };
@@ -121,15 +189,26 @@ export default function Checkout() {
         handler: async (response: any) => {
           setProcessingMessage('Verifying payment...');
           try {
-            // Step 3: Verify payment + create order
+            // Step 3: Verify payment + create order with contact snapshot
             const verifyRes = await api.post('/api/checkout/verify-payment', {
               razorpay_order_id: response.razorpay_order_id,
               razorpay_payment_id: response.razorpay_payment_id,
               razorpay_signature: response.razorpay_signature,
               items: checkoutItems,
               address: addressData,
+              contact: {
+                email: contactEmail,
+                phone: contactPhone,
+              },
               idempotencyKey: idempotencyKey.current,
             });
+
+            if (verifyRes.data?.finalEmail || verifyRes.data?.finalPhone) {
+              updateUser({
+                email: verifyRes.data.finalEmail || user?.email,
+                phone_number: verifyRes.data.finalPhone || user?.phone_number,
+              });
+            }
 
             clearCart();
             navigate(`/order-success/${verifyRes.data.orderId}`);
@@ -141,8 +220,8 @@ export default function Checkout() {
         },
         prefill: {
           name: user?.name || addressData?.fullName || '',
-          email: user?.email || '',
-          contact: addressData?.phone || '',
+          email: contactEmail || user?.email || '',
+          contact: contactPhone || addressData?.phone || '',
         },
         theme: { color: '#000000' },
         modal: {
@@ -183,8 +262,19 @@ export default function Checkout() {
       const { data } = await api.post('/api/checkout/cod', {
         items: checkoutItems,
         address: addressData,
+        contact: {
+          email: contactEmail,
+          phone: contactPhone,
+        },
         idempotencyKey: idempotencyKey.current,
       });
+
+      if (data?.finalEmail || data?.finalPhone) {
+        updateUser({
+          email: data.finalEmail || user?.email,
+          phone_number: data.finalPhone || user?.phone_number,
+        });
+      }
 
       clearCart();
       navigate(`/order-success/${data.orderId}`);
@@ -231,16 +321,62 @@ export default function Checkout() {
             </div>
           ) : (
             <>
-              {/* Step 1: Address */}
+              {/* Step 1: Contact Information & Address */}
               <div className={`transition-opacity duration-500 ${step !== 1 ? 'opacity-50 pointer-events-none' : ''}`}>
                 <h2 className="text-sm font-medium tracking-[2px] text-textSecondary uppercase mb-6 flex items-center gap-3">
                   <span className="w-6 h-6 rounded-full bg-textPrimary text-white flex items-center justify-center text-xs">1</span>
-                  Shipping Address
+                  Contact & Shipping Address
                 </h2>
                 <form id="address-form" onSubmit={handleSubmit(onAddressSubmit)} className="flex flex-col gap-6 bg-white/50 backdrop-blur-sm p-8 rounded-[24px] border border-black/10">
+                  {/* CONTACT INFORMATION SECTION */}
+                  <div className="pb-6 border-b border-black/10">
+                    <h3 className="text-sm font-medium tracking-[2px] text-textSecondary uppercase mb-6 flex items-center justify-between">
+                      <span>Contact Information</span>
+                      {hasProfileEmail && hasProfilePhone && (
+                        <span className="text-xs text-green-700 bg-green-50 px-2.5 py-1 rounded-full font-normal lowercase tracking-normal flex items-center gap-1">
+                          <ShieldCheck size={14} /> Profile Complete
+                        </span>
+                      )}
+                    </h3>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                      <div>
+                        <Input
+                          label="Email Address"
+                          type="email"
+                          placeholder="customer@example.com"
+                          value={contactEmail}
+                          onChange={(e) => !hasProfileEmail && setContactEmail(e.target.value)}
+                          disabled={hasProfileEmail}
+                          readOnly={hasProfileEmail}
+                          error={contactEmailError}
+                          className={hasProfileEmail ? "bg-black/[0.03] cursor-not-allowed text-textSecondary font-medium" : ""}
+                        />
+                        {hasProfileEmail && (
+                          <p className="text-[11px] text-textSecondary mt-1">Saved on your profile (read-only)</p>
+                        )}
+                      </div>
+                      <div>
+                        <Input
+                          label="Phone Number"
+                          placeholder="+91 98765 43210"
+                          value={contactPhone}
+                          onChange={(e) => !hasProfilePhone && setContactPhone(e.target.value)}
+                          disabled={hasProfilePhone}
+                          readOnly={hasProfilePhone}
+                          error={contactPhoneError}
+                          className={hasProfilePhone ? "bg-black/[0.03] cursor-not-allowed text-textSecondary font-medium" : ""}
+                        />
+                        {hasProfilePhone && (
+                          <p className="text-[11px] text-textSecondary mt-1">Saved on your profile (read-only)</p>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* SHIPPING ADDRESS SECTION */}
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                     <Input label="Full Name" placeholder="John Doe" {...register("fullName")} error={errors.fullName?.message} />
-                    <Input label="Phone Number" placeholder="+91 98765 43210" {...register("phone")} error={errors.phone?.message} />
+                    <Input label="Delivery Phone" placeholder="+91 98765 43210" {...register("phone")} error={errors.phone?.message} />
                   </div>
                   <Input label="Complete Address" placeholder="Flat, House no., Building" {...register("address")} error={errors.address?.message} />
                   <div className="grid grid-cols-1 md:grid-cols-3 gap-6">

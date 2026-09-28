@@ -101,6 +101,13 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
 });
 
+// Inline migration for order contact snapshot columns
+pool.query(`
+  ALTER TABLE orders ADD COLUMN IF NOT EXISTS customer_email VARCHAR(255);
+  ALTER TABLE orders ADD COLUMN IF NOT EXISTS customer_phone VARCHAR(50);
+`).catch((err: any) => console.error('Failed to migrate order contact snapshot columns:', err.message));
+
+
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
@@ -651,7 +658,17 @@ app.get('/api/products/:slug', async (req, res) => {
 // --- ORDERS & CHECKOUT ---
 
 // Helper: create order inside a DB transaction (shared by Razorpay + COD)
-async function createOrderTransaction(client: any, userId: number, items: {variant_id: number, quantity: number}[], address: any, paymentMethod: string, paymentStatus: string, razorpayData?: {orderId: string, paymentId: string, signature: string}, idempotencyKey?: string) {
+async function createOrderTransaction(
+  client: any,
+  userId: number,
+  items: {variant_id: number, quantity: number}[],
+  address: any,
+  paymentMethod: string,
+  paymentStatus: string,
+  razorpayData?: {orderId: string, paymentId: string, signature: string},
+  idempotencyKey?: string,
+  contactData?: { email?: string; phone?: string; phone_number?: string }
+) {
   // Idempotency check
   if (idempotencyKey) {
     const existing = await client.query('SELECT id, order_number FROM orders WHERE idempotency_key = $1', [idempotencyKey]);
@@ -661,6 +678,48 @@ async function createOrderTransaction(client: any, userId: number, items: {varia
   if (razorpayData?.paymentId) {
     const existing = await client.query('SELECT id FROM payments WHERE razorpay_payment_id = $1', [razorpayData.paymentId]);
     if (existing.rows.length > 0) throw new Error('This payment has already been processed.');
+  }
+
+  // Lock user record FOR UPDATE strictly using req.user.userId
+  const userRes = await client.query(
+    'SELECT email, phone_number, email_verified, phone_verified FROM users WHERE id = $1 FOR UPDATE',
+    [userId]
+  );
+  if (userRes.rows.length === 0) throw new Error('User not found');
+  const userRow = userRes.rows[0];
+
+  // 1. EMAIL LOGIC & OVERWRITE PROTECTION RULE
+  let finalEmail = (userRow.email || '').trim();
+  if (!finalEmail) {
+    const submittedEmail = (contactData?.email || '').trim().toLowerCase();
+    if (!submittedEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(submittedEmail)) {
+      throw new Error('A valid email address is required to complete your order.');
+    }
+    // Check uniqueness against other users
+    const uniqRes = await client.query('SELECT id FROM users WHERE LOWER(email) = LOWER($1) AND id != $2', [submittedEmail, userId]);
+    if (uniqRes.rows.length > 0) {
+      throw new Error('This email address is already registered to another account.');
+    }
+    // Update user profile with missing email (preserving email_verified)
+    await client.query('UPDATE users SET email = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [submittedEmail, userId]);
+    finalEmail = submittedEmail;
+  }
+
+  // 2. PHONE LOGIC & OVERWRITE PROTECTION RULE
+  let finalPhone = (userRow.phone_number || '').trim();
+  if (!finalPhone) {
+    const submittedPhone = (contactData?.phone_number || contactData?.phone || address?.phone || '').trim();
+    if (!submittedPhone || submittedPhone.replace(/\D/g, '').length < 10) {
+      throw new Error('A valid 10-digit phone number is required to complete your order.');
+    }
+    // Check uniqueness against other users
+    const uniqRes = await client.query('SELECT id FROM users WHERE phone_number = $1 AND id != $2', [submittedPhone, userId]);
+    if (uniqRes.rows.length > 0) {
+      throw new Error('This phone number is already registered to another account.');
+    }
+    // Update user profile with missing phone (preserving phone_verified)
+    await client.query('UPDATE users SET phone_number = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [submittedPhone, userId]);
+    finalPhone = submittedPhone;
   }
 
   let totalAmount = 0;
@@ -681,8 +740,8 @@ async function createOrderTransaction(client: any, userId: number, items: {varia
 
   const orderNumber = `INF-${new Date().getFullYear()}-${crypto.randomInt(10000, 99999)}`;
   const orderRes = await client.query(
-    `INSERT INTO orders (order_number, user_id, total_amount, status, shipping_address, idempotency_key) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-    [orderNumber, userId, totalAmount, 'CONFIRMED', JSON.stringify(address), idempotencyKey || null]
+    `INSERT INTO orders (order_number, user_id, total_amount, status, shipping_address, customer_email, customer_phone, idempotency_key) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+    [orderNumber, userId, totalAmount, 'CONFIRMED', JSON.stringify(address), finalEmail, finalPhone, idempotencyKey || null]
   );
   const order = orderRes.rows[0];
 
@@ -710,7 +769,7 @@ async function createOrderTransaction(client: any, userId: number, items: {varia
     await client.query('DELETE FROM cart_items WHERE cart_id = $1', [cartRes.rows[0].id]);
   }
 
-  return { duplicate: false, orderId: order.id, orderNumber, totalAmount, order, orderItems };
+  return { duplicate: false, orderId: order.id, orderNumber, totalAmount, order, orderItems, finalEmail, finalPhone };
 }
 
 // Step 1: Create Razorpay order (pre-payment)
@@ -756,7 +815,7 @@ app.post('/api/checkout/create-order', authenticateToken, async (req: any, res) 
 // Step 2: Verify Razorpay payment + create order
 app.post('/api/checkout/verify-payment', authenticateToken, async (req: any, res) => {
   const userId = req.user.userId;
-  const { razorpay_order_id, razorpay_payment_id, razorpay_signature, items, address, idempotencyKey } = req.body;
+  const { razorpay_order_id, razorpay_payment_id, razorpay_signature, items, address, contact, idempotencyKey } = req.body;
 
   // Verify signature
   const body = razorpay_order_id + '|' + razorpay_payment_id;
@@ -768,7 +827,7 @@ app.post('/api/checkout/verify-payment', authenticateToken, async (req: any, res
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const result = await createOrderTransaction(client, userId, items, address, 'RAZORPAY', 'PAID', { orderId: razorpay_order_id, paymentId: razorpay_payment_id, signature: razorpay_signature }, idempotencyKey);
+    const result = await createOrderTransaction(client, userId, items, address, 'RAZORPAY', 'PAID', { orderId: razorpay_order_id, paymentId: razorpay_payment_id, signature: razorpay_signature }, idempotencyKey, contact);
     await client.query('COMMIT');
 
     if (result.duplicate) {
@@ -784,7 +843,7 @@ app.post('/api/checkout/verify-payment', authenticateToken, async (req: any, res
       if (customer.phone_number) logSmsNotification(customer.phone_number, `INFAMOUS: Your order #${result.orderNumber} has been placed. Total: ₹${result.totalAmount}. We'll keep you updated!`);
     }
 
-    res.status(200).json({ success: true, message: 'Payment verified & order created', orderId: result.orderId, orderNumber: result.orderNumber, totalAmount: result.totalAmount });
+    res.status(200).json({ success: true, message: 'Payment verified & order created', orderId: result.orderId, orderNumber: result.orderNumber, totalAmount: result.totalAmount, finalEmail: result.finalEmail, finalPhone: result.finalPhone });
   } catch (error: any) {
     await client.query('ROLLBACK');
     console.error('Payment verification transaction failed:', error.message);
@@ -797,13 +856,13 @@ app.post('/api/checkout/verify-payment', authenticateToken, async (req: any, res
 // COD checkout
 app.post('/api/checkout/cod', authenticateToken, async (req: any, res) => {
   const userId = req.user.userId;
-  const { items, address, idempotencyKey } = req.body;
+  const { items, address, contact, idempotencyKey } = req.body;
   if (!items || items.length === 0) return res.status(400).json({ message: 'Cart is empty' });
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const result = await createOrderTransaction(client, userId, items, address, 'COD', 'PENDING', undefined, idempotencyKey);
+    const result = await createOrderTransaction(client, userId, items, address, 'COD', 'PENDING', undefined, idempotencyKey, contact);
     await client.query('COMMIT');
 
     if (result.duplicate) {
@@ -818,7 +877,7 @@ app.post('/api/checkout/cod', authenticateToken, async (req: any, res) => {
       if (customer.phone_number) logSmsNotification(customer.phone_number, `INFAMOUS: Your COD order #${result.orderNumber} is confirmed. Total: ₹${result.totalAmount}. Pay on delivery.`);
     }
 
-    res.status(200).json({ success: true, message: 'COD order placed', orderId: result.orderId, orderNumber: result.orderNumber, totalAmount: result.totalAmount });
+    res.status(200).json({ success: true, message: 'COD order placed', orderId: result.orderId, orderNumber: result.orderNumber, totalAmount: result.totalAmount, finalEmail: result.finalEmail, finalPhone: result.finalPhone });
   } catch (error: any) {
     await client.query('ROLLBACK');
     console.error('COD checkout failed:', error.message);
