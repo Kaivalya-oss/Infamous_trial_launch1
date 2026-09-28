@@ -159,6 +159,7 @@ app.post('/api/auth/register', async (req, res) => {
         const result = await pool.query('INSERT INTO users (name, email, password_hash) VALUES ($1, $2, $3) RETURNING id, name, email, role', [name, email, hash]);
         const user = result.rows[0];
         await pool.query('INSERT INTO cart (user_id) VALUES ($1)', [user.id]);
+        await pool.query(`INSERT INTO admin_notifications (type, title, message, reference_id, reference_type) VALUES ($1, $2, $3, $4, $5)`, ['NEW_CUSTOMER', 'New Customer Registered', `New customer ${name} (${email}) signed up.`, user.id.toString(), 'USER']).catch((err) => console.error('Failed to create notification:', err));
         const tokens = await generateTokens(user.id, user.email, user.role);
         res.status(201).json({ message: 'Registration successful', ...tokens, user });
     }
@@ -286,6 +287,109 @@ app.post('/api/auth/reset-password', async (req, res) => {
     catch (error) {
         console.error(error);
         res.status(500).json({ message: 'Internal server error' });
+    }
+});
+// Change password (authenticated)
+app.post('/api/auth/update-password', authenticateToken, async (req, res) => {
+    const userId = req.user.userId;
+    const { currentPassword, newPassword } = req.body;
+    if (!currentPassword || !newPassword) {
+        return res.status(400).json({ message: 'Current password and new password are required' });
+    }
+    if (typeof newPassword !== 'string' || newPassword.length < 8) {
+        return res.status(400).json({ message: 'Password must be at least 8 characters' });
+    }
+    try {
+        const userRes = await pool.query('SELECT password_hash, auth_provider FROM users WHERE id = $1', [userId]);
+        if (userRes.rows.length === 0) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+        const user = userRes.rows[0];
+        if (!user.password_hash) {
+            return res.status(400).json({ message: 'Cannot change password for social or phone login account' });
+        }
+        const isMatch = await bcrypt_1.default.compare(currentPassword, user.password_hash);
+        if (!isMatch) {
+            return res.status(400).json({ message: 'Incorrect current password' });
+        }
+        const newHash = await bcrypt_1.default.hash(newPassword, 10);
+        await pool.query('UPDATE users SET password_hash = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [newHash, userId]);
+        return res.status(200).json({ message: 'Password updated successfully' });
+    }
+    catch (error) {
+        console.error('Update password error:', error);
+        return res.status(500).json({ message: 'Internal server error' });
+    }
+});
+// Profile endpoints (authenticated)
+app.get('/api/profile', authenticateToken, async (req, res) => {
+    const userId = req.user.userId;
+    try {
+        const userRes = await pool.query('SELECT id, first_name, last_name, name, email, phone_number, role, email_verified, phone_verified FROM users WHERE id = $1', [userId]);
+        if (userRes.rows.length === 0) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+        const user = userRes.rows[0];
+        const addrRes = await pool.query('SELECT full_name, phone, address_line1, address_line2, city, state, postal_code, country FROM addresses WHERE user_id = $1 AND is_default = true ORDER BY created_at DESC LIMIT 1', [userId]);
+        let addressStr = '';
+        if (addrRes.rows.length > 0) {
+            const addr = addrRes.rows[0];
+            addressStr = [addr.address_line1, addr.address_line2, addr.city, addr.state, addr.postal_code, addr.country].filter(Boolean).join(', ');
+        }
+        return res.status(200).json({
+            user: {
+                ...user,
+                address: addressStr
+            }
+        });
+    }
+    catch (error) {
+        console.error('Fetch profile error:', error);
+        return res.status(500).json({ message: 'Internal server error' });
+    }
+});
+app.put('/api/profile', authenticateToken, async (req, res) => {
+    const userId = req.user.userId;
+    const { first_name, last_name, email, phone_number, address } = req.body;
+    if (!email || typeof email !== 'string' || !email.includes('@')) {
+        return res.status(400).json({ message: 'Valid email address is required' });
+    }
+    try {
+        // Check if email belongs to another user
+        const existingEmail = await pool.query('SELECT id FROM users WHERE email = $1 AND id != $2', [email, userId]);
+        if (existingEmail.rows.length > 0) {
+            return res.status(400).json({ message: 'Email address is already in use by another account' });
+        }
+        const cleanFirstName = (first_name || '').trim();
+        const cleanLastName = (last_name || '').trim();
+        const fullName = `${cleanFirstName} ${cleanLastName}`.trim() || email.split('@')[0];
+        const updateRes = await pool.query(`UPDATE users
+       SET first_name = $1, last_name = $2, name = $3, email = $4, phone_number = $5, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $6
+       RETURNING id, first_name, last_name, name, email, phone_number, role, email_verified, phone_verified`, [cleanFirstName, cleanLastName, fullName, email, phone_number || null, userId]);
+        const user = updateRes.rows[0];
+        // Upsert default shipping address if provided
+        if (address !== undefined && address !== null) {
+            const addrRes = await pool.query('SELECT id FROM addresses WHERE user_id = $1 AND is_default = true LIMIT 1', [userId]);
+            if (addrRes.rows.length > 0) {
+                await pool.query('UPDATE addresses SET address_line1 = $1, phone = COALESCE($2, phone), full_name = COALESCE($3, full_name) WHERE id = $4', [address, phone_number || '', fullName, addrRes.rows[0].id]);
+            }
+            else if (address.trim().length > 0) {
+                await pool.query(`INSERT INTO addresses (user_id, full_name, phone, address_line1, city, state, postal_code, country, is_default)
+           VALUES ($1, $2, $3, $4, 'Mumbai', 'Maharashtra', '400001', 'India', true)`, [userId, fullName, phone_number || '', address]);
+            }
+        }
+        return res.status(200).json({
+            message: 'Profile updated successfully',
+            user: {
+                ...user,
+                address: address || ''
+            }
+        });
+    }
+    catch (error) {
+        console.error('Update profile error:', error);
+        return res.status(500).json({ message: 'Internal server error' });
     }
 });
 // --- CART ---
@@ -543,6 +647,7 @@ async function createOrderTransaction(client, userId, items, address, paymentMet
     const orderNumber = `INF-${new Date().getFullYear()}-${crypto_1.default.randomInt(10000, 99999)}`;
     const orderRes = await client.query(`INSERT INTO orders (order_number, user_id, total_amount, status, shipping_address, idempotency_key) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`, [orderNumber, userId, totalAmount, 'CONFIRMED', JSON.stringify(address), idempotencyKey || null]);
     const order = orderRes.rows[0];
+    await client.query(`INSERT INTO admin_notifications (type, title, message, reference_id, reference_type) VALUES ($1, $2, $3, $4, $5)`, ['NEW_ORDER', 'New Order Received', `Order ${order.order_number} was placed for ₹${order.total_amount}.`, order.id.toString(), 'ORDER']).catch((err) => console.error('Failed to create notification:', err));
     for (const oi of orderItems) {
         await client.query('INSERT INTO order_items (order_id, variant_id, product_name, sku, price, quantity) VALUES ($1, $2, $3, $4, $5, $6)', [order.id, oi.variant_id, oi.product_name, oi.sku, oi.price, oi.quantity]);
     }
@@ -875,10 +980,12 @@ app.post('/api/products/:id/reviews', authenticateToken, async (req, res) => {
       VALUES ($1, $2, $3, $4, $5, 'APPROVED')
       RETURNING id, product_id, rating, title, comment, status, created_at
     `, [productId, userId, ratingNum, cleanTitle, cleanComment]);
+        const newReview = insertRes.rows[0];
+        await pool.query(`INSERT INTO admin_notifications (type, title, message, reference_id, reference_type) VALUES ($1, $2, $3, $4, $5)`, ['NEW_REVIEW', 'New Product Review', `A new ${ratingNum}-star review was submitted for product ${productId}.`, newReview.id.toString(), 'REVIEW']).catch(err => console.error('Failed to create notification:', err));
         return res.status(201).json({
             success: true,
             message: 'Review submitted successfully',
-            review: insertRes.rows[0]
+            review: newReview
         });
     }
     catch (error) {
@@ -1720,6 +1827,7 @@ app.post('/api/exchanges', authenticateToken, async (req, res) => {
             priceOriginal, priceReplacement, priceDifference, logisticsFee
         ]);
         const exchange = insertRes.rows[0];
+        await pool.query(`INSERT INTO admin_notifications (type, title, message, reference_id, reference_type) VALUES ($1, $2, $3, $4, $5)`, ['NEW_EXCHANGE', 'New Exchange Request', `A new ${exchangeType} exchange was requested for order item ${order_item_id}.`, exchange.id.toString(), 'EXCHANGE']).catch(err => console.error('Failed to create notification:', err));
         res.status(201).json({
             success: true,
             message: 'Exchange request submitted successfully',
@@ -2073,6 +2181,251 @@ app.patch('/api/admin/exchanges/:id/status', verifyAdmin, async (req, res) => {
 app.get('/api/admin/logistics', verifyAdmin, async (req, res) => {
     try {
         res.status(200).json({ logistics: [] });
+    }
+    catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Internal server error' });
+    }
+});
+// ============================================================
+// --- RETURN SYSTEM ---
+// ============================================================
+const RETURN_TRANSITIONS = {
+    APPROVED: ['PICKUP_SCHEDULED', 'CANCELLED'],
+    PICKUP_SCHEDULED: ['ITEM_RECEIVED', 'CANCELLED'],
+    ITEM_RECEIVED: ['REFUND_INITIATED'],
+    REFUND_INITIATED: ['COMPLETED'],
+    COMPLETED: [],
+    CANCELLED: [],
+};
+// --- CUSTOMER: Create return (auto-accepted) ---
+app.post('/api/returns', authenticateToken, async (req, res) => {
+    const userId = req.user.userId;
+    const { order_item_id, reason, customer_notes } = req.body;
+    if (!order_item_id || !reason) {
+        return res.status(400).json({ message: 'order_item_id and reason are required' });
+    }
+    const cleanReason = (reason || '').trim();
+    if (cleanReason.length === 0 || cleanReason.length > 100) {
+        return res.status(400).json({ message: 'Reason must be 1-100 characters' });
+    }
+    try {
+        // Verify ownership + DELIVERED status
+        const itemRes = await pool.query(`
+      SELECT oi.id, oi.order_id, oi.variant_id, oi.price, oi.quantity,
+             o.status AS order_status,
+             osh.created_at AS delivered_at
+      FROM order_items oi
+      JOIN orders o ON oi.order_id = o.id
+      JOIN order_status_history osh ON o.id = osh.order_id AND osh.status = 'DELIVERED'
+      WHERE oi.id = $1 AND o.user_id = $2
+      LIMIT 1
+    `, [order_item_id, userId]);
+        if (itemRes.rows.length === 0) {
+            return res.status(404).json({ message: 'Order item not found or not delivered' });
+        }
+        const item = itemRes.rows[0];
+        if (item.order_status !== 'DELIVERED') {
+            return res.status(403).json({ message: 'Returns can only be initiated for delivered orders' });
+        }
+        // Check 7-day window
+        const deliveredAt = new Date(item.delivered_at);
+        const daysSinceDelivery = (Date.now() - deliveredAt.getTime()) / (1000 * 60 * 60 * 24);
+        if (daysSinceDelivery > 7) {
+            return res.status(403).json({ message: 'Return window has closed. Returns must be initiated within 7 days of delivery.' });
+        }
+        // Check no return exists for this item (any status except CANCELLED blocks another return)
+        const existingRes = await pool.query(`
+      SELECT id FROM product_returns
+      WHERE order_item_id = $1
+        AND status != 'CANCELLED'
+    `, [order_item_id]);
+        if (existingRes.rows.length > 0) {
+            return res.status(409).json({ message: 'A return request already exists for this item.' });
+        }
+        // Also check no active exchange exists for this item
+        const existingExRes = await pool.query(`
+      SELECT id FROM product_exchanges
+      WHERE order_item_id = $1
+        AND status NOT IN ('REJECTED', 'CANCELLED', 'COMPLETED')
+    `, [order_item_id]);
+        if (existingExRes.rows.length > 0) {
+            return res.status(409).json({ message: 'An active exchange request already exists for this item. Cancel it before requesting a return.' });
+        }
+        const refundAmount = parseFloat(item.price) * item.quantity;
+        // Insert return — auto-accepted (status = APPROVED)
+        const insertRes = await pool.query(`
+      INSERT INTO product_returns
+        (user_id, order_id, order_item_id, variant_id, quantity, reason, customer_notes, status, refund_amount)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, 'APPROVED', $8)
+      RETURNING *
+    `, [
+            userId, item.order_id, order_item_id, item.variant_id, item.quantity,
+            cleanReason, customer_notes || null, refundAmount
+        ]);
+        const returnRecord = insertRes.rows[0];
+        // Create notification
+        await pool.query(`INSERT INTO admin_notifications (type, title, message, reference_id, reference_type) VALUES ($1, $2, $3, $4, $5)`, ['NEW_RETURN', 'New Return Request', `A return was submitted for order item ${order_item_id} (₹${refundAmount.toFixed(0)}).`, returnRecord.id.toString(), 'RETURN']).catch(err => console.error('Failed to create notification:', err));
+        res.status(201).json({
+            success: true,
+            message: 'Return request submitted and approved',
+            returnRequest: returnRecord,
+        });
+    }
+    catch (error) {
+        console.error('Return submit error:', error);
+        res.status(500).json({ message: 'Internal server error' });
+    }
+});
+// --- CUSTOMER: List own returns ---
+app.get('/api/returns', authenticateToken, async (req, res) => {
+    const userId = req.user.userId;
+    try {
+        const result = await pool.query(`
+      SELECT pr.id, pr.status, pr.reason, pr.customer_notes, pr.refund_amount,
+             pr.admin_notes, pr.created_at, pr.updated_at,
+             o.order_number,
+             oi.product_name, oi.sku, oi.price, oi.quantity,
+             pv.color, pv.size,
+             (SELECT pi.cloudinary_url FROM product_images pi WHERE pi.product_id = pv.product_id AND pi.is_cover = true LIMIT 1) AS image_url
+      FROM product_returns pr
+      JOIN orders o ON pr.order_id = o.id
+      JOIN order_items oi ON pr.order_item_id = oi.id
+      JOIN product_variants pv ON pr.variant_id = pv.id
+      WHERE pr.user_id = $1
+      ORDER BY pr.created_at DESC
+    `, [userId]);
+        res.status(200).json({ returns: result.rows });
+    }
+    catch (error) {
+        console.error('Customer list returns error:', error);
+        res.status(500).json({ message: 'Internal server error' });
+    }
+});
+// --- ADMIN: List all returns ---
+app.get('/api/admin/returns', verifyAdmin, async (req, res) => {
+    const { status, search } = req.query;
+    try {
+        let queryStr = `
+      SELECT pr.id, pr.user_id, pr.order_id, pr.order_item_id, pr.variant_id,
+             pr.quantity, pr.reason, pr.customer_notes, pr.status,
+             pr.refund_amount, pr.admin_notes, pr.processed_by,
+             pr.created_at, pr.updated_at,
+             u.name AS customer_name, u.email AS customer_email,
+             o.order_number,
+             oi.product_name, oi.sku, oi.price,
+             pv.color, pv.size
+      FROM product_returns pr
+      JOIN users u ON pr.user_id = u.id
+      JOIN orders o ON pr.order_id = o.id
+      JOIN order_items oi ON pr.order_item_id = oi.id
+      JOIN product_variants pv ON pr.variant_id = pv.id
+    `;
+        const params = [];
+        const conditions = [];
+        if (status && status !== 'ALL') {
+            params.push(status);
+            conditions.push(`pr.status = $${params.length}`);
+        }
+        if (search) {
+            params.push(`%${search}%`);
+            const idx = params.length;
+            conditions.push(`(u.name ILIKE $${idx} OR u.email ILIKE $${idx} OR o.order_number ILIKE $${idx} OR oi.product_name ILIKE $${idx})`);
+        }
+        if (conditions.length > 0) {
+            queryStr += ' WHERE ' + conditions.join(' AND ');
+        }
+        queryStr += ' ORDER BY pr.created_at DESC';
+        const result = await pool.query(queryStr, params);
+        const statsRes = await pool.query(`
+      SELECT
+        COUNT(*) AS total,
+        COUNT(*) FILTER (WHERE status = 'APPROVED') AS approved,
+        COUNT(*) FILTER (WHERE status = 'PICKUP_SCHEDULED') AS pickup_scheduled,
+        COUNT(*) FILTER (WHERE status = 'ITEM_RECEIVED') AS item_received,
+        COUNT(*) FILTER (WHERE status = 'REFUND_INITIATED') AS refund_initiated,
+        COUNT(*) FILTER (WHERE status = 'COMPLETED') AS completed,
+        COUNT(*) FILTER (WHERE status = 'CANCELLED') AS cancelled
+      FROM product_returns
+    `);
+        res.status(200).json({ returns: result.rows, stats: statsRes.rows[0] });
+    }
+    catch (error) {
+        console.error('Admin list returns error:', error);
+        res.status(500).json({ message: 'Internal server error' });
+    }
+});
+// --- ADMIN: Update return status ---
+app.patch('/api/admin/returns/:id/status', verifyAdmin, async (req, res) => {
+    const { id } = req.params;
+    const { status, admin_notes } = req.body;
+    const validStatuses = ['PICKUP_SCHEDULED', 'ITEM_RECEIVED', 'REFUND_INITIATED', 'COMPLETED', 'CANCELLED'];
+    if (!validStatuses.includes(status)) {
+        return res.status(400).json({ message: `Invalid status. Must be one of: ${validStatuses.join(', ')}` });
+    }
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const exRes = await client.query('SELECT * FROM product_returns WHERE id = $1 FOR UPDATE', [id]);
+        if (exRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ message: 'Return not found' });
+        }
+        const returnRecord = exRes.rows[0];
+        const allowedNext = RETURN_TRANSITIONS[returnRecord.status] || [];
+        if (!allowedNext.includes(status)) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({
+                message: `Cannot transition from ${returnRecord.status} to ${status}. Allowed: ${allowedNext.join(', ') || 'none'}`
+            });
+        }
+        // On ITEM_RECEIVED, restore stock
+        if (status === 'ITEM_RECEIVED') {
+            await client.query('UPDATE product_variants SET stock = stock + $1 WHERE id = $2', [returnRecord.quantity, returnRecord.variant_id]);
+        }
+        const updateRes = await client.query(`
+      UPDATE product_returns
+      SET status = $1,
+          admin_notes = COALESCE($2, admin_notes),
+          processed_by = $3,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = $4
+      RETURNING *
+    `, [status, admin_notes || null, req.user.userId, id]);
+        await client.query('COMMIT');
+        res.status(200).json({
+            success: true,
+            message: `Return #${id} status updated to ${status}`,
+            returnRequest: updateRes.rows[0],
+        });
+    }
+    catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Admin return status update error:', error);
+        res.status(500).json({ message: error.message || 'Internal server error' });
+    }
+    finally {
+        client.release();
+    }
+});
+// ============================================================
+// --- NOTIFICATIONS ---
+// ============================================================
+app.get('/api/admin/notifications', verifyAdmin, async (req, res) => {
+    try {
+        const result = await pool.query('SELECT * FROM admin_notifications ORDER BY created_at DESC LIMIT 50');
+        res.status(200).json({ notifications: result.rows });
+    }
+    catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Internal server error' });
+    }
+});
+app.put('/api/admin/notifications/:id/read', verifyAdmin, async (req, res) => {
+    const { id } = req.params;
+    try {
+        const result = await pool.query('UPDATE admin_notifications SET is_read = TRUE WHERE id = $1 RETURNING *', [id]);
+        res.status(200).json({ notification: result.rows[0] });
     }
     catch (error) {
         console.error(error);

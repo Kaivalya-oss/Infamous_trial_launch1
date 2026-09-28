@@ -290,6 +290,141 @@ app.post('/api/auth/reset-password', async (req, res) => {
   }
 });
 
+// Change password (authenticated)
+app.post('/api/auth/update-password', authenticateToken, async (req: any, res) => {
+  const userId = req.user.userId;
+  const { currentPassword, newPassword } = req.body;
+
+  if (!currentPassword || !newPassword) {
+    return res.status(400).json({ message: 'Current password and new password are required' });
+  }
+
+  if (typeof newPassword !== 'string' || newPassword.length < 8) {
+    return res.status(400).json({ message: 'Password must be at least 8 characters' });
+  }
+
+  try {
+    const userRes = await pool.query('SELECT password_hash, auth_provider FROM users WHERE id = $1', [userId]);
+    if (userRes.rows.length === 0) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    const user = userRes.rows[0];
+    if (!user.password_hash) {
+      return res.status(400).json({ message: 'Cannot change password for social or phone login account' });
+    }
+
+    const isMatch = await bcrypt.compare(currentPassword, user.password_hash);
+    if (!isMatch) {
+      return res.status(400).json({ message: 'Incorrect current password' });
+    }
+
+    const newHash = await bcrypt.hash(newPassword, 10);
+    await pool.query('UPDATE users SET password_hash = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [newHash, userId]);
+
+    return res.status(200).json({ message: 'Password updated successfully' });
+  } catch (error) {
+    console.error('Update password error:', error);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// Profile endpoints (authenticated)
+app.get('/api/profile', authenticateToken, async (req: any, res) => {
+  const userId = req.user.userId;
+  try {
+    const userRes = await pool.query(
+      'SELECT id, first_name, last_name, name, email, phone_number, role, email_verified, phone_verified FROM users WHERE id = $1',
+      [userId]
+    );
+    if (userRes.rows.length === 0) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    const user = userRes.rows[0];
+
+    const addrRes = await pool.query(
+      'SELECT full_name, phone, address_line1, address_line2, city, state, postal_code, country FROM addresses WHERE user_id = $1 AND is_default = true ORDER BY created_at DESC LIMIT 1',
+      [userId]
+    );
+
+    let addressStr = '';
+    if (addrRes.rows.length > 0) {
+      const addr = addrRes.rows[0];
+      addressStr = [addr.address_line1, addr.address_line2, addr.city, addr.state, addr.postal_code, addr.country].filter(Boolean).join(', ');
+    }
+
+    return res.status(200).json({
+      user: {
+        ...user,
+        address: addressStr
+      }
+    });
+  } catch (error) {
+    console.error('Fetch profile error:', error);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+app.put('/api/profile', authenticateToken, async (req: any, res) => {
+  const userId = req.user.userId;
+  const { first_name, last_name, email, phone_number, address } = req.body;
+
+  if (!email || typeof email !== 'string' || !email.includes('@')) {
+    return res.status(400).json({ message: 'Valid email address is required' });
+  }
+
+  try {
+    // Check if email belongs to another user
+    const existingEmail = await pool.query('SELECT id FROM users WHERE email = $1 AND id != $2', [email, userId]);
+    if (existingEmail.rows.length > 0) {
+      return res.status(400).json({ message: 'Email address is already in use by another account' });
+    }
+
+    const cleanFirstName = (first_name || '').trim();
+    const cleanLastName = (last_name || '').trim();
+    const fullName = `${cleanFirstName} ${cleanLastName}`.trim() || email.split('@')[0];
+
+    const updateRes = await pool.query(
+      `UPDATE users
+       SET first_name = $1, last_name = $2, name = $3, email = $4, phone_number = $5, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $6
+       RETURNING id, first_name, last_name, name, email, phone_number, role, email_verified, phone_verified`,
+      [cleanFirstName, cleanLastName, fullName, email, phone_number || null, userId]
+    );
+
+    const user = updateRes.rows[0];
+
+    // Upsert default shipping address if provided
+    if (address !== undefined && address !== null) {
+      const addrRes = await pool.query('SELECT id FROM addresses WHERE user_id = $1 AND is_default = true LIMIT 1', [userId]);
+      if (addrRes.rows.length > 0) {
+        await pool.query(
+          'UPDATE addresses SET address_line1 = $1, phone = COALESCE($2, phone), full_name = COALESCE($3, full_name) WHERE id = $4',
+          [address, phone_number || '', fullName, addrRes.rows[0].id]
+        );
+      } else if (address.trim().length > 0) {
+        await pool.query(
+          `INSERT INTO addresses (user_id, full_name, phone, address_line1, city, state, postal_code, country, is_default)
+           VALUES ($1, $2, $3, $4, 'Mumbai', 'Maharashtra', '400001', 'India', true)`,
+          [userId, fullName, phone_number || '', address]
+        );
+      }
+    }
+
+    return res.status(200).json({
+      message: 'Profile updated successfully',
+      user: {
+        ...user,
+        address: address || ''
+      }
+    });
+  } catch (error) {
+    console.error('Update profile error:', error);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+
 // --- CART ---
 app.get('/api/cart', authenticateToken, async (req: any, res) => {
   const userId = req.user.userId;
