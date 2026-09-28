@@ -136,25 +136,8 @@ export default function Home() {
     window.addEventListener('scroll', handleScroll, { passive: true });
     handleScroll();
 
-    /* ── Horizontal scroll (product showcase) ── */
-    const ctx = gsap.context(() => {
-      if (horizontalRef.current) {
-        const totalWidth = horizontalRef.current.scrollWidth;
-        const viewportWidth = window.innerWidth;
-        gsap.to(horizontalRef.current, {
-          x: -(totalWidth - viewportWidth),
-          ease: 'none',
-          scrollTrigger: {
-            trigger: '#campaigns',
-            pin: true,
-            scrub: 1,
-            end: () => '+=' + (totalWidth - viewportWidth),
-            invalidateOnRefresh: true,
-          },
-        });
-      }
-
-      /* ── Parallax on featured collection ── */
+    /* ── Parallax on featured collection ── */
+    const parallaxCtx = gsap.context(() => {
       if (parallaxRef.current) {
         gsap.to(parallaxRef.current, {
           yPercent: 25,
@@ -172,9 +155,54 @@ export default function Home() {
     return () => {
       window.removeEventListener('scroll', handleScroll);
       lenis.destroy();
-      ctx.revert();
+      parallaxCtx.revert();
     };
   }, []);
+
+  /* ── Horizontal scroll (product showcase) ─────────────────────────────────
+     Must run AFTER products are fetched and rendered so that
+     horizontalRef.scrollWidth reflects the real card content width.
+     We wait one rAF after React commits the DOM before measuring.
+  ── */
+  useEffect(() => {
+    if (products.length === 0) return; // wait until cards exist in the DOM
+
+    let horizontalCtx: ReturnType<typeof gsap.context> | null = null;
+
+    const rafId = requestAnimationFrame(() => {
+      // Revert any previously-created ScrollTrigger for this section so we
+      // don't stack duplicate triggers on hot-reloads or data refetches.
+      ScrollTrigger.getAll()
+        .filter((st) => st.vars?.id === 'horizontal-products')
+        .forEach((st) => st.kill());
+
+      horizontalCtx = gsap.context(() => {
+        if (!horizontalRef.current) return;
+        const totalWidth = horizontalRef.current.scrollWidth;
+        const viewportWidth = window.innerWidth;
+        const distance = totalWidth - viewportWidth;
+        if (distance <= 0) return; // nothing to scroll
+
+        gsap.to(horizontalRef.current, {
+          x: -distance,
+          ease: 'none',
+          scrollTrigger: {
+            id: 'horizontal-products',
+            trigger: '#campaigns',
+            pin: true,
+            scrub: 1,
+            end: () => '+=' + distance,
+            invalidateOnRefresh: true,
+          },
+        });
+      });
+    });
+
+    return () => {
+      cancelAnimationFrame(rafId);
+      horizontalCtx?.revert();
+    };
+  }, [products]);
 
   return (
     <div className="bg-background min-h-screen text-textPrimary overflow-x-hidden">
