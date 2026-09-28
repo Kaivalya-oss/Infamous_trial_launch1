@@ -153,7 +153,7 @@ export default function QuickViewModal({ product, onClose, zIndex = 999, isTopmo
             </div>
 
             {/* Right Scrollable Content Side */}
-            <div ref={scrollRef} className="w-full md:w-1/2 overflow-y-auto h-[90vh] pb-32 md:pb-12 overscroll-contain relative flex flex-col">
+            <div ref={scrollRef} data-lenis-prevent className="w-full md:w-1/2 overflow-y-auto h-[90vh] pb-32 md:pb-12 overscroll-contain relative flex flex-col">
               <div className="md:hidden w-full h-[400px] shrink-0 bg-secondary relative">
                 <img src={currentImage} alt={product.name} className="w-full h-full object-cover transition-opacity duration-300" />
               </div>
@@ -205,7 +205,7 @@ export default function QuickViewModal({ product, onClose, zIndex = 999, isTopmo
                       Size Guide
                     </button>
                   </div>
-                  <div className="flex gap-3 overflow-x-auto pb-2">
+                  <div data-lenis-prevent className="flex gap-3 overflow-x-auto pb-2">
                     {uniqueSizes.map((size) => {
                       // Check stock for this specific Color + Size combination
                       const specificVariant = product?.variants?.find(v => v.color === selectedColor && v.size === size);
