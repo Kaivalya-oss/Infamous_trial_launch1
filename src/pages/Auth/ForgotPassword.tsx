@@ -74,7 +74,7 @@ export default function ForgotPassword() {
           <div className="mb-12">
             <h1 className="font-serif italic text-[48px] md:text-[64px] leading-none mb-4">Reset Password</h1>
             <p className="text-textSecondary font-light">
-              Enter your email address and we'll send you a link to reset your password.
+              Enter the email address linked to your account.
             </p>
           </div>
 
@@ -98,9 +98,9 @@ export default function ForgotPassword() {
               animate={{ opacity: 1, scale: 1 }}
               className="bg-white/50 p-8 rounded-[24px] border border-black/10 text-center"
             >
-              <h3 className="font-serif text-2xl mb-3 text-textPrimary">Check your email</h3>
+              <h3 className="font-serif text-2xl mb-3 text-textPrimary">Request received</h3>
               <p className="text-textSecondary font-light text-sm mb-6">
-                We've sent password reset instructions to your email address.
+                Online password reset isn't available yet. Please contact our support team and we'll help you regain access to your account.
               </p>
               <Button onClick={() => setIsSubmitted(false)} variant="outline" className="w-full">
                 Try another email

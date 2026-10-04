@@ -109,6 +109,7 @@ export default function QuickViewModal({ product, onClose, zIndex = 999, isTopmo
       size: selectedSize,
       color: selectedColor,
       quantity,
+      stock: selectedVariant?.stock,
       variant_id: selectedVariant?.id || (product.variants && product.variants.length > 0 ? product.variants[0].id : undefined)
     } as any);
     onClose();

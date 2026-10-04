@@ -10,6 +10,8 @@ import { CloudinaryStorage } from 'multer-storage-cloudinary';
 import crypto from 'crypto';
 import Razorpay from 'razorpay';
 import nodemailer from 'nodemailer';
+import { initializeApp, getApps } from 'firebase-admin/app';
+import { getAuth as getFirebaseAdminAuth } from 'firebase-admin/auth';
 
 dotenv.config();
 
@@ -107,6 +109,59 @@ pool.query(`
   ALTER TABLE orders ADD COLUMN IF NOT EXISTS customer_phone VARCHAR(50);
 `).catch((err: any) => console.error('Failed to migrate order contact snapshot columns:', err.message));
 
+// Inline migration: server-side record of each Razorpay checkout (binds payment to user + items + amount)
+pool.query(`
+  CREATE TABLE IF NOT EXISTS checkout_payment_intents (
+    razorpay_order_id VARCHAR(255) PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    items JSONB NOT NULL,
+    amount_paise INTEGER NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'CREATED',
+    order_id INTEGER REFERENCES orders(id) ON DELETE SET NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+  ALTER TABLE checkout_payment_intents ADD COLUMN IF NOT EXISTS razorpay_payment_id VARCHAR(255);
+  ALTER TABLE checkout_payment_intents ADD COLUMN IF NOT EXISTS failure_reason TEXT;
+`).catch((err: any) => console.error('Failed to migrate checkout_payment_intents:', err.message));
+// Separate statement so a failure here can never roll back the table above
+pool.query(`
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_exchanges_razorpay_payment_id
+    ON product_exchanges(razorpay_payment_id) WHERE razorpay_payment_id IS NOT NULL;
+`).catch((err: any) => console.error('Failed to create exchange payment-id index:', err.message));
+
+// Strict positive-integer parser: accepts integer numbers or digit-only strings, nothing else.
+const MAX_LINE_QUANTITY = 100;
+function parsePositiveInt(value: any): number | null {
+  const n = typeof value === 'number' ? value : (typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : NaN);
+  return Number.isSafeInteger(n) && n >= 1 ? n : null;
+}
+
+// Validates checkout items. Returns normalized items sorted by variant_id (stable lock order) or an error.
+function validateCheckoutItems(items: any): { items?: { variant_id: number; quantity: number }[]; error?: string } {
+  if (!Array.isArray(items) || items.length === 0) return { error: 'Cart is empty' };
+  if (items.length > 50) return { error: 'Too many items in cart' };
+  const seen = new Set<number>();
+  const normalized: { variant_id: number; quantity: number }[] = [];
+  for (const item of items) {
+    const variantId = parsePositiveInt(item?.variant_id);
+    const quantity = parsePositiveInt(item?.quantity);
+    if (variantId === null) return { error: 'Invalid product variant in cart' };
+    if (quantity === null || quantity > MAX_LINE_QUANTITY) return { error: 'Invalid quantity in cart' };
+    if (seen.has(variantId)) return { error: 'Duplicate product variant in cart' };
+    seen.add(variantId);
+    normalized.push({ variant_id: variantId, quantity });
+  }
+  normalized.sort((a, b) => a.variant_id - b.variant_id);
+  return { items: normalized };
+}
+
+function isValidRazorpaySignature(orderId: any, paymentId: any, signature: any): boolean {
+  if (typeof orderId !== 'string' || typeof paymentId !== 'string' || typeof signature !== 'string') return false;
+  if (!process.env.RAZORPAY_KEY_SECRET) return false;
+  const expected = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET).update(`${orderId}|${paymentId}`).digest('hex');
+  return expected.length === signature.length && crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
+}
+
 
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -199,7 +254,9 @@ app.post('/api/auth/login', async (req, res) => {
 
 app.post('/api/auth/refresh', async (req, res) => {
   const { refreshToken } = req.body;
-  if (!refreshToken) return res.status(401).json({ message: 'Refresh token required' });
+  if (typeof refreshToken !== 'string' || !refreshToken) return res.status(401).json({ message: 'Refresh token required' });
+  // Password-reset tokens share the sessions table; they must never act as refresh tokens.
+  if (refreshToken.startsWith('reset_')) return res.status(403).json({ message: 'Invalid or expired refresh token' });
   try {
     const sessionRes = await pool.query('SELECT * FROM sessions WHERE token = $1 AND expires_at > CURRENT_TIMESTAMP', [refreshToken]);
     if (sessionRes.rows.length === 0) return res.status(403).json({ message: 'Invalid or expired refresh token' });
@@ -215,11 +272,68 @@ app.post('/api/auth/refresh', async (req, res) => {
   }
 });
 
-app.post('/api/auth/google', async (req, res) => {
-  const { email, firstName, lastName, googleId, profileImage } = req.body;
+// Firebase identity: the ONLY trusted source of Google/phone identity is a verified Firebase ID token.
+// Requires FIREBASE_PROJECT_ID. There is deliberately no fallback when it is missing.
+function getFirebaseAuth() {
+  if (!process.env.FIREBASE_PROJECT_ID) return null;
+  if (getApps().length === 0) initializeApp({ projectId: process.env.FIREBASE_PROJECT_ID });
+  return getFirebaseAdminAuth();
+}
+
+async function verifyFirebaseIdToken(req: any, res: any): Promise<any | null> {
+  const firebaseAuth = getFirebaseAuth();
+  if (!firebaseAuth) {
+    console.error('[AUTH] FIREBASE_PROJECT_ID is not configured; Google/phone login disabled.');
+    res.status(503).json({ message: 'Sign-in is temporarily unavailable.' });
+    return null;
+  }
+  const { idToken } = req.body || {};
+  if (typeof idToken !== 'string' || !idToken) {
+    res.status(401).json({ message: 'Authentication failed' });
+    return null;
+  }
   try {
-    let result = await pool.query('SELECT * FROM users WHERE email = $1 OR google_id = $2', [email, googleId]);
-    let user = result.rows[0];
+    return await firebaseAuth.verifyIdToken(idToken);
+  } catch (err: any) {
+    console.warn('[AUTH] Firebase ID token rejected:', err?.code || 'invalid');
+    res.status(401).json({ message: 'Authentication failed' });
+    return null;
+  }
+}
+
+app.post('/api/auth/google', async (req, res) => {
+  const decoded = await verifyFirebaseIdToken(req, res);
+  if (!decoded) return;
+  // Identity comes only from the verified token; any client-sent email/googleId is ignored.
+  const googleId: string = decoded.uid;
+  const email: string | undefined = decoded.email ? String(decoded.email).toLowerCase() : undefined;
+  if (decoded.firebase?.sign_in_provider !== 'google.com' || !email || decoded.email_verified !== true) {
+    return res.status(401).json({ message: 'Authentication failed' });
+  }
+  const nameParts = String(decoded.name || '').trim().split(/\s+/).filter(Boolean);
+  const firstName = nameParts[0] || 'Google';
+  const lastName = nameParts.slice(1).join(' ') || 'User';
+  const profileImage = decoded.picture || null;
+  try {
+    // Account matching uses ONLY identifiers proven on that account (anti pre-hijack):
+    //  1. the account already bound to this Google identity, else
+    //  2. an account whose email was previously VERIFIED. An email that was merely typed into a
+    //     profile/checkout (email_verified = false) is contact data, never a login credential.
+    let user = (await pool.query('SELECT * FROM users WHERE google_id = $1 LIMIT 1', [googleId])).rows[0];
+    if (!user) {
+      const byEmail = (await pool.query('SELECT id, email_verified, password_hash FROM users WHERE LOWER(email) = $1 ORDER BY id', [email])).rows;
+      const verified = byEmail.find((u: any) => u.email_verified === true);
+      if (verified) {
+        user = (await pool.query('SELECT * FROM users WHERE id = $1', [verified.id])).rows[0];
+      } else if (byEmail.some((u: any) => u.password_hash)) {
+        // The email is the login credential of an unverified password account. Merging would hand
+        // that account (and whoever set its password) to this Google user, so refuse instead.
+        return res.status(409).json({ message: 'An account with this email already exists. Please sign in with your email and password.' });
+      } else if (byEmail.length > 0) {
+        // Unverified contact email on a non-password account: the verified owner takes it over.
+        await pool.query('UPDATE users SET email = NULL, updated_at = CURRENT_TIMESTAMP WHERE LOWER(email) = $1 AND email_verified = false AND password_hash IS NULL', [email]);
+      }
+    }
     if (user) {
       await pool.query('UPDATE users SET google_id = $1, last_login = CURRENT_TIMESTAMP WHERE id = $2', [googleId, user.id]);
     } else {
@@ -241,10 +355,21 @@ app.post('/api/auth/google', async (req, res) => {
 });
 
 app.post('/api/auth/phone', async (req, res) => {
-  const { phoneNumber } = req.body;
+  const decoded = await verifyFirebaseIdToken(req, res);
+  if (!decoded) return;
+  // Phone number comes only from the verified token; any client-sent phoneNumber is ignored.
+  const phoneNumber: string | undefined = decoded.phone_number;
+  if (decoded.firebase?.sign_in_provider !== 'phone' || !phoneNumber) {
+    return res.status(401).json({ message: 'Authentication failed' });
+  }
   try {
-    let result = await pool.query('SELECT * FROM users WHERE phone_number = $1', [phoneNumber]);
-    let user = result.rows[0];
+    // Only an account where this number was VERIFIED (by OTP) may be logged into. A number merely
+    // typed into a profile/checkout is contact data: the verified owner takes it over and gets
+    // their own account; the unverified holder keeps every other credential untouched.
+    let user = (await pool.query('SELECT * FROM users WHERE phone_number = $1 AND phone_verified = true', [phoneNumber])).rows[0];
+    if (!user) {
+      await pool.query('UPDATE users SET phone_number = NULL, updated_at = CURRENT_TIMESTAMP WHERE phone_number = $1 AND phone_verified = false', [phoneNumber]);
+    }
     if (user) {
       await pool.query('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = $1', [user.id]);
     } else {
@@ -264,25 +389,18 @@ app.post('/api/auth/phone', async (req, res) => {
   }
 });
 
-app.post('/api/auth/forgot-password', async (req, res) => {
-  const { email } = req.body;
-  try {
-    const userRes = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
-    if (userRes.rows.length === 0) return res.status(404).json({ message: 'User not found' });
-    const user = userRes.rows[0];
-    const resetToken = crypto.randomBytes(32).toString('hex');
-    const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 mins
-    await pool.query('INSERT INTO sessions (user_id, token, expires_at) VALUES ($1, $2, $3)', [user.id, `reset_${resetToken}`, expiresAt]);
-    // In production, send email here
-    res.status(200).json({ message: 'Reset token generated (email simulated)', token: resetToken });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: 'Internal server error' });
-  }
+// Reset-email delivery is not implemented (no reset link/page exists), so no reset token is
+// issued. The response is identical for every email to avoid account enumeration.
+app.post('/api/auth/forgot-password', (req, res) => {
+  console.log('[AUTH] Password reset requested; reset email delivery is not configured.');
+  res.status(200).json({ message: 'If an account exists for this email, password reset instructions will be sent.' });
 });
 
 app.post('/api/auth/reset-password', async (req, res) => {
   const { token, newPassword } = req.body;
+  if (typeof token !== 'string' || !token || typeof newPassword !== 'string' || newPassword.length < 8) {
+    return res.status(400).json({ message: 'Invalid or expired token' });
+  }
   try {
     const sessionRes = await pool.query('SELECT user_id FROM sessions WHERE token = $1 AND expires_at > CURRENT_TIMESTAMP', [`reset_${token}`]);
     if (sessionRes.rows.length === 0) return res.status(400).json({ message: 'Invalid or expired token' });
@@ -382,7 +500,7 @@ app.put('/api/profile', authenticateToken, async (req: any, res) => {
 
   try {
     // Check if email belongs to another user
-    const existingEmail = await pool.query('SELECT id FROM users WHERE email = $1 AND id != $2', [email, userId]);
+    const existingEmail = await pool.query('SELECT id FROM users WHERE LOWER(email) = LOWER($1) AND id != $2', [email, userId]);
     if (existingEmail.rows.length > 0) {
       return res.status(400).json({ message: 'Email address is already in use by another account' });
     }
@@ -391,9 +509,13 @@ app.put('/api/profile', authenticateToken, async (req: any, res) => {
     const cleanLastName = (last_name || '').trim();
     const fullName = `${cleanFirstName} ${cleanLastName}`.trim() || email.split('@')[0];
 
+    // Profile edits store contact data only: a changed email/phone loses its verified status, so a
+    // typed value can never become a Google/phone login identifier. (SET expressions see old values.)
     const updateRes = await pool.query(
       `UPDATE users
-       SET first_name = $1, last_name = $2, name = $3, email = $4, phone_number = $5, updated_at = CURRENT_TIMESTAMP
+       SET first_name = $1, last_name = $2, name = $3, email = $4::text, phone_number = $5::text, updated_at = CURRENT_TIMESTAMP,
+           email_verified = CASE WHEN LOWER(email) IS NOT DISTINCT FROM LOWER($4::text) THEN email_verified ELSE false END,
+           phone_verified = CASE WHEN phone_number IS NOT DISTINCT FROM $5::text THEN phone_verified ELSE false END
        WHERE id = $6
        RETURNING id, first_name, last_name, name, email, phone_number, role, email_verified, phone_verified`,
       [cleanFirstName, cleanLastName, fullName, email, phone_number || null, userId]
@@ -457,9 +579,9 @@ app.post('/api/cart/items', authenticateToken, async (req: any, res) => {
   const userId = req.user.userId;
   const { variantId, quantity } = req.body;
   try {
-    // Validate quantity is a positive integer
-    const qty = parseInt(quantity, 10);
-    if (isNaN(qty) || qty < 1) {
+    // Validate variant and quantity are strict positive integers
+    const qty = parsePositiveInt(quantity);
+    if (qty === null || parsePositiveInt(variantId) === null) {
       return res.status(400).json({ message: 'Quantity must be a positive integer' });
     }
 
@@ -499,9 +621,9 @@ app.put('/api/cart/items/:variantId', authenticateToken, async (req: any, res) =
   const variantId = req.params.variantId;
   const { quantity } = req.body;
   try {
-    // Validate quantity is a positive integer
-    const qty = parseInt(quantity, 10);
-    if (isNaN(qty) || qty < 1) {
+    // Validate variant and quantity are strict positive integers
+    const qty = parsePositiveInt(quantity);
+    if (qty === null || parsePositiveInt(variantId) === null) {
       return res.status(400).json({ message: 'Quantity must be a positive integer' });
     }
 
@@ -553,20 +675,35 @@ app.post('/api/cart/merge', authenticateToken, async (req: any, res) => {
     } else {
       cartId = cartRes.rows[0].id;
     }
-    for (const incoming of localItems) {
-      if (!incoming.variant_id) continue;
+    // Guest cart lines are added once (on the guest→login transition); an empty list is a pure read.
+    // Invalid lines are skipped and every resulting quantity is capped at current stock.
+    const incomingItems = Array.isArray(localItems) ? localItems.slice(0, 50) : [];
+    const seenVariants = new Set<number>();
+    for (const incoming of incomingItems) {
+      const variantId = parsePositiveInt(incoming?.variant_id);
+      const qty = parsePositiveInt(incoming?.quantity);
+      if (variantId === null || qty === null || seenVariants.has(variantId)) continue;
+      seenVariants.add(variantId);
       try {
         await pool.query(`
-          INSERT INTO cart_items (cart_id, variant_id, quantity) 
-          VALUES ($1, $2, $3)
-          ON CONFLICT (cart_id, variant_id) DO UPDATE SET quantity = cart_items.quantity + EXCLUDED.quantity
-        `, [cartId, incoming.variant_id, incoming.quantity]);
+          INSERT INTO cart_items (cart_id, variant_id, quantity)
+          SELECT $1, v.id, LEAST($3::int, v.stock) FROM product_variants v WHERE v.id = $2 AND v.stock > 0
+          ON CONFLICT (cart_id, variant_id) DO UPDATE SET quantity = LEAST(cart_items.quantity + EXCLUDED.quantity,
+            (SELECT stock FROM product_variants WHERE id = EXCLUDED.variant_id))
+        `, [cartId, variantId, Math.min(qty, MAX_LINE_QUANTITY)]);
       } catch (e: any) {
         // Ignore foreign key violations if a variant was deleted
         if (e.code !== '23503') throw e; 
       }
     }
-    
+
+    // Repair any line already above available stock (e.g. from the historical repeated-merge bug)
+    await pool.query(`
+      UPDATE cart_items ci SET quantity = v.stock
+      FROM product_variants v
+      WHERE ci.variant_id = v.id AND ci.cart_id = $1 AND ci.quantity > v.stock AND v.stock > 0
+    `, [cartId]);
+
     // Now return the merged items back to the client (includes stock for UI max-quantity)
     const mergedItemsRes = await pool.query(`
       SELECT ci.quantity, ci.variant_id, v.color, v.size, v.stock, p.name, v.price, p.id as product_id
@@ -574,6 +711,7 @@ app.post('/api/cart/merge', authenticateToken, async (req: any, res) => {
       JOIN product_variants v ON ci.variant_id = v.id
       JOIN products p ON v.product_id = p.id
       WHERE ci.cart_id = $1
+      ORDER BY ci.id
     `, [cartId]);
     
     // Fetch images for these items
@@ -584,7 +722,7 @@ app.post('/api/cart/merge', authenticateToken, async (req: any, res) => {
       `, [row.product_id, row.variant_id]);
       
       mergedItems.push({
-        id: `${row.name}-${row.size}`,
+        id: String(row.variant_id), // canonical cart line identity
         name: row.name,
         price: row.price,
         img: imgRes.rows.length > 0 ? imgRes.rows[0].cloudinary_url : '',
@@ -622,7 +760,7 @@ app.get('/api/products', async (req, res) => {
         COALESCE(json_agg(DISTINCT jsonb_build_object('id', v.id, 'sku', v.sku, 'color', v.color, 'size', v.size, 'price', v.price, 'stock', v.stock)) FILTER (WHERE v.id IS NOT NULL), '[]') AS variants,
         COALESCE(json_agg(DISTINCT jsonb_build_object('id', m.id, 'cloudinary_url', m.cloudinary_url, 'cloudinary_public_id', m.cloudinary_public_id, 'is_cover', m.is_cover, 'media_type', m.media_type, 'display_order', m.display_order, 'variant_id', m.variant_id)) FILTER (WHERE m.id IS NOT NULL), '[]') AS media
       FROM products p
-      LEFT JOIN product_variants v ON p.id = v.product_id
+      LEFT JOIN product_variants v ON p.id = v.product_id AND v.status IS DISTINCT FROM 'ARCHIVED'
       LEFT JOIN product_images m ON p.id = m.product_id
       WHERE p.status = 'PUBLISHED'
       GROUP BY p.id
@@ -642,7 +780,7 @@ app.get('/api/products/:slug', async (req, res) => {
         COALESCE(json_agg(DISTINCT jsonb_build_object('id', v.id, 'sku', v.sku, 'color', v.color, 'size', v.size, 'price', v.price, 'stock', v.stock)) FILTER (WHERE v.id IS NOT NULL), '[]') AS variants,
         COALESCE(json_agg(DISTINCT jsonb_build_object('id', m.id, 'cloudinary_url', m.cloudinary_url, 'cloudinary_public_id', m.cloudinary_public_id, 'is_cover', m.is_cover, 'media_type', m.media_type, 'display_order', m.display_order, 'variant_id', m.variant_id)) FILTER (WHERE m.id IS NOT NULL), '[]') AS media
       FROM products p
-      LEFT JOIN product_variants v ON p.id = v.product_id
+      LEFT JOIN product_variants v ON p.id = v.product_id AND v.status IS DISTINCT FROM 'ARCHIVED'
       LEFT JOIN product_images m ON p.id = m.product_id
       WHERE p.slug = $1
       GROUP BY p.id
@@ -667,8 +805,14 @@ async function createOrderTransaction(
   paymentStatus: string,
   razorpayData?: {orderId: string, paymentId: string, signature: string},
   idempotencyKey?: string,
-  contactData?: { email?: string; phone?: string; phone_number?: string }
+  contactData?: { email?: string; phone?: string; phone_number?: string },
+  expectedAmountPaise?: number
 ) {
+  // Defensive re-validation: every checkout path must pass integer quantities >= 1, no duplicates
+  const validated = validateCheckoutItems(items);
+  if (validated.error) throw new Error(validated.error);
+  items = validated.items!;
+
   // Idempotency check
   if (idempotencyKey) {
     const existing = await client.query('SELECT id, order_number FROM orders WHERE idempotency_key = $1', [idempotencyKey]);
@@ -700,8 +844,9 @@ async function createOrderTransaction(
     if (uniqRes.rows.length > 0) {
       throw new Error('This email address is already registered to another account.');
     }
-    // Update user profile with missing email (preserving email_verified)
-    await client.query('UPDATE users SET email = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [submittedEmail, userId]);
+    // Update user profile with missing email
+    // Stored as unverified contact data only (never a login identifier)
+    await client.query('UPDATE users SET email = $1, email_verified = false, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [submittedEmail, userId]);
     finalEmail = submittedEmail;
   }
 
@@ -717,8 +862,9 @@ async function createOrderTransaction(
     if (uniqRes.rows.length > 0) {
       throw new Error('This phone number is already registered to another account.');
     }
-    // Update user profile with missing phone (preserving phone_verified)
-    await client.query('UPDATE users SET phone_number = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [submittedPhone, userId]);
+    // Update user profile with missing phone
+    // Stored as unverified contact data only (never a login identifier)
+    await client.query('UPDATE users SET phone_number = $1, phone_verified = false, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [submittedPhone, userId]);
     finalPhone = submittedPhone;
   }
 
@@ -736,6 +882,11 @@ async function createOrderTransaction(
     await client.query('UPDATE product_variants SET stock = stock - $1 WHERE id = $2', [item.quantity, item.variant_id]);
     totalAmount += parseFloat(variant.price) * item.quantity;
     orderItems.push({ variant_id: item.variant_id, product_name: variant.product_name, sku: variant.sku, price: variant.price, quantity: item.quantity, color: variant.color, size: variant.size });
+  }
+
+  // Paid orders: the DB-recomputed total must equal what Razorpay actually charged
+  if (expectedAmountPaise !== undefined && Math.round(totalAmount * 100) !== expectedAmountPaise) {
+    throw new Error('Order total changed after payment was created. Please contact support with your payment ID.');
   }
 
   const orderNumber = `INF-${new Date().getFullYear()}-${crypto.randomInt(10000, 99999)}`;
@@ -772,16 +923,40 @@ async function createOrderTransaction(
   return { duplicate: false, orderId: order.id, orderNumber, totalAmount, order, orderItems, finalEmail, finalPhone };
 }
 
+// Read-only pre-payment check of the same contact rules createOrderTransaction enforces, so a
+// customer is never charged for a checkout that would then be rejected for contact reasons.
+async function precheckCheckoutContact(userId: number, contact: any, address: any): Promise<string | null> {
+  const u = (await pool.query('SELECT email, phone_number FROM users WHERE id = $1', [userId])).rows[0];
+  if (!u) return 'User not found';
+  if (!(u.email || '').trim()) {
+    const email = String(contact?.email || '').trim().toLowerCase();
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return 'A valid email address is required to complete your order.';
+    const dup = await pool.query('SELECT id FROM users WHERE LOWER(email) = LOWER($1) AND id != $2', [email, userId]);
+    if (dup.rows.length > 0) return 'This email address is already registered to another account.';
+  }
+  if (!(u.phone_number || '').trim()) {
+    const phone = String(contact?.phone_number || contact?.phone || address?.phone || '').trim();
+    if (!phone || phone.replace(/\D/g, '').length < 10) return 'A valid 10-digit phone number is required to complete your order.';
+    const dup = await pool.query('SELECT id FROM users WHERE phone_number = $1 AND id != $2', [phone, userId]);
+    if (dup.rows.length > 0) return 'This phone number is already registered to another account.';
+  }
+  return null;
+}
+
 // Step 1: Create Razorpay order (pre-payment)
 app.post('/api/checkout/create-order', authenticateToken, async (req: any, res) => {
   const userId = req.user.userId;
-  const { items } = req.body;
-  if (!items || items.length === 0) return res.status(400).json({ message: 'Cart is empty' });
+  const validated = validateCheckoutItems(req.body.items);
+  if (validated.error) return res.status(400).json({ message: validated.error });
+  const items = validated.items!;
 
   try {
     if (!razorpay) {
       return res.status(500).json({ message: 'Payment gateway is not configured on this server.' });
     }
+
+    const contactError = await precheckCheckoutContact(userId, req.body.contact, req.body.address);
+    if (contactError) return res.status(400).json({ message: contactError });
 
     // Calculate total from DB prices (NEVER trust frontend prices)
     let totalAmount = 0;
@@ -799,6 +974,12 @@ app.post('/api/checkout/create-order', authenticateToken, async (req: any, res) 
       receipt: `rcpt_${crypto.randomInt(100000, 999999)}`,
     });
 
+    // Bind this Razorpay order to the user, the exact items and the amount charged
+    await pool.query(
+      'INSERT INTO checkout_payment_intents (razorpay_order_id, user_id, items, amount_paise) VALUES ($1, $2, $3, $4)',
+      [razorpayOrder.id, userId, JSON.stringify(items), amountInPaise]
+    );
+
     res.status(200).json({
       success: true,
       razorpayOrderId: razorpayOrder.id,
@@ -812,22 +993,56 @@ app.post('/api/checkout/create-order', authenticateToken, async (req: any, res) 
   }
 });
 
+function paymentIssueMessage(paymentId: string, reason?: string) {
+  return `We received your payment (ID ${paymentId}) but could not confirm your order${reason ? `: ${reason}` : '.'} ` +
+    'Our team has been notified and will refund it. Please contact support with this payment ID.';
+}
+
 // Step 2: Verify Razorpay payment + create order
 app.post('/api/checkout/verify-payment', authenticateToken, async (req: any, res) => {
   const userId = req.user.userId;
-  const { razorpay_order_id, razorpay_payment_id, razorpay_signature, items, address, contact, idempotencyKey } = req.body;
+  // Client-supplied items are intentionally ignored: the order is built from the server-side intent.
+  const { razorpay_order_id, razorpay_payment_id, razorpay_signature, address, contact } = req.body;
 
-  // Verify signature
-  const body = razorpay_order_id + '|' + razorpay_payment_id;
-  const expectedSignature = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET || '').update(body).digest('hex');
-  if (expectedSignature !== razorpay_signature) {
+  if (!isValidRazorpaySignature(razorpay_order_id, razorpay_payment_id, razorpay_signature)) {
     return res.status(400).json({ success: false, message: 'Payment verification failed. Invalid signature.' });
   }
 
   const client = await pool.connect();
+  let ownedIntent = false;
   try {
     await client.query('BEGIN');
-    const result = await createOrderTransaction(client, userId, items, address, 'RAZORPAY', 'PAID', { orderId: razorpay_order_id, paymentId: razorpay_payment_id, signature: razorpay_signature }, idempotencyKey, contact);
+    // Lock the intent; it must belong to this user. Serializes concurrent/replayed verifications.
+    const intentRes = await client.query(
+      'SELECT * FROM checkout_payment_intents WHERE razorpay_order_id = $1 AND user_id = $2 FOR UPDATE',
+      [razorpay_order_id, userId]
+    );
+    if (intentRes.rows.length === 0) throw new Error('Payment order not found for this account.');
+    const intent = intentRes.rows[0];
+    if (intent.status === 'FAILED') {
+      // Payment already flagged for manual refund: never create an order afterwards
+      await client.query('ROLLBACK');
+      return res.status(409).json({ success: false, paymentReceived: true, message: paymentIssueMessage(intent.razorpay_payment_id || razorpay_payment_id) });
+    }
+    // A payment id already attached to another order is a replay, not a new payment to refund
+    const usedRes = await client.query('SELECT 1 FROM payments WHERE razorpay_payment_id = $1', [razorpay_payment_id]);
+    if (usedRes.rows.length > 0 && intent.status !== 'COMPLETED') throw new Error('This payment has already been processed.');
+    ownedIntent = true;
+    if (intent.status === 'COMPLETED') {
+      await client.query('ROLLBACK');
+      const existing = await pool.query('SELECT id, order_number FROM orders WHERE id = $1 AND user_id = $2', [intent.order_id, userId]);
+      return res.status(200).json({ success: true, message: 'Order already exists', orderId: existing.rows[0]?.id, orderNumber: existing.rows[0]?.order_number });
+    }
+    const intentItems = typeof intent.items === 'string' ? JSON.parse(intent.items) : intent.items;
+
+    // The locked intent row is the idempotency guarantee here (one order per Razorpay order). The
+    // client idempotency key is deliberately NOT used: matching an unrelated existing order would
+    // mark this paid intent COMPLETED without creating its order.
+    const result = await createOrderTransaction(client, userId, intentItems, address, 'RAZORPAY', 'PAID', { orderId: razorpay_order_id, paymentId: razorpay_payment_id, signature: razorpay_signature }, undefined, contact, intent.amount_paise);
+    await client.query(
+      "UPDATE checkout_payment_intents SET status = 'COMPLETED', order_id = $1 WHERE razorpay_order_id = $2",
+      [result.orderId, razorpay_order_id]
+    );
     await client.query('COMMIT');
 
     if (result.duplicate) {
@@ -847,7 +1062,44 @@ app.post('/api/checkout/verify-payment', authenticateToken, async (req: any, res
   } catch (error: any) {
     await client.query('ROLLBACK');
     console.error('Payment verification transaction failed:', error.message);
-    res.status(400).json({ success: false, message: error.message || 'Order creation failed.' });
+    if (!ownedIntent) {
+      return res.status(400).json({ success: false, message: error.message || 'Order creation failed.' });
+    }
+    // A signature-verified payment for this user's own checkout was taken but the order could not be
+    // created. Record it durably and alert admins so it is refunded; never drop it silently.
+    const reason = String(error.message || 'Order creation failed').slice(0, 500);
+    // This UPDATE waits on any concurrent verification still holding the intent lock, so it sees the
+    // final state. Only the request that actually flips CREATED -> FAILED raises the refund alert.
+    let markedFailed = true;
+    try {
+      const mark = await pool.query(
+        "UPDATE checkout_payment_intents SET status = 'FAILED', razorpay_payment_id = $1, failure_reason = $2 WHERE razorpay_order_id = $3 AND user_id = $4 AND status = 'CREATED'",
+        [razorpay_payment_id, reason, razorpay_order_id, userId]
+      );
+      markedFailed = mark.rowCount === 1;
+    } catch (e: any) {
+      console.error('[PAYMENT] Failed to record payment failure:', e.message); // still alert below: never lose it
+    }
+    if (!markedFailed) {
+      // Another verification of this payment already resolved the intent
+      const current = (await pool.query(
+        'SELECT status, order_id, razorpay_payment_id FROM checkout_payment_intents WHERE razorpay_order_id = $1 AND user_id = $2',
+        [razorpay_order_id, userId]
+      )).rows[0];
+      if (current?.status === 'COMPLETED') {
+        const existing = await pool.query('SELECT id, order_number FROM orders WHERE id = $1 AND user_id = $2', [current.order_id, userId]);
+        return res.status(200).json({ success: true, message: 'Order already exists', orderId: existing.rows[0]?.id, orderNumber: existing.rows[0]?.order_number });
+      }
+      return res.status(409).json({ success: false, paymentReceived: true, message: paymentIssueMessage(current?.razorpay_payment_id || razorpay_payment_id) });
+    }
+    await pool.query(
+      'INSERT INTO admin_notifications (type, title, message, reference_id, reference_type) VALUES ($1, $2, $3, $4, $5)',
+      ['PAYMENT_ISSUE', 'Payment received but order failed - refund required',
+        `Payment ${razorpay_payment_id} (Razorpay order ${razorpay_order_id}) was received but the order failed: ${reason}`,
+        razorpay_order_id, 'PAYMENT']
+    ).catch((e: any) => console.error('[PAYMENT] Failed to create payment-issue notification:', e.message));
+    console.error(`[PAYMENT] REFUND REQUIRED: payment ${razorpay_payment_id} / order ${razorpay_order_id}: ${reason}`);
+    return res.status(409).json({ success: false, paymentReceived: true, message: paymentIssueMessage(razorpay_payment_id, reason) });
   } finally {
     client.release();
   }
@@ -1313,11 +1565,11 @@ app.get('/api/admin/products', verifyAdmin, async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT p.*,
-        COALESCE(json_agg(DISTINCT jsonb_build_object('id', v.id, 'sku', v.sku, 'color', v.color, 'size', v.size, 'price', v.price, 'stock', v.stock)) FILTER (WHERE v.id IS NOT NULL), '[]') AS variants,
+        COALESCE(json_agg(DISTINCT jsonb_build_object('id', v.id, 'sku', v.sku, 'color', v.color, 'size', v.size, 'price', v.price, 'stock', v.stock, 'status', v.status)) FILTER (WHERE v.id IS NOT NULL), '[]') AS variants,
         COALESCE(json_agg(DISTINCT jsonb_build_object('id', m.id, 'cloudinary_url', m.cloudinary_url, 'cloudinary_public_id', m.cloudinary_public_id, 'is_cover', m.is_cover, 'media_type', m.media_type, 'display_order', m.display_order, 'variant_id', m.variant_id)) FILTER (WHERE m.id IS NOT NULL), '[]') AS media,
         c.name as category
       FROM products p
-      LEFT JOIN product_variants v ON p.id = v.product_id
+      LEFT JOIN product_variants v ON p.id = v.product_id AND v.status IS DISTINCT FROM 'ARCHIVED'
       LEFT JOIN product_images m ON p.id = m.product_id
       LEFT JOIN categories c ON p.category_id = c.id
       GROUP BY p.id, c.name
@@ -1335,11 +1587,11 @@ app.get('/api/admin/products/:id', verifyAdmin, async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT p.*,
-        COALESCE(json_agg(DISTINCT jsonb_build_object('id', v.id, 'sku', v.sku, 'color', v.color, 'size', v.size, 'price', v.price, 'stock', v.stock)) FILTER (WHERE v.id IS NOT NULL), '[]') AS variants,
+        COALESCE(json_agg(DISTINCT jsonb_build_object('id', v.id, 'sku', v.sku, 'color', v.color, 'size', v.size, 'price', v.price, 'stock', v.stock, 'status', v.status)) FILTER (WHERE v.id IS NOT NULL), '[]') AS variants,
         COALESCE(json_agg(DISTINCT jsonb_build_object('id', m.id, 'cloudinary_url', m.cloudinary_url, 'cloudinary_public_id', m.cloudinary_public_id, 'is_cover', m.is_cover, 'media_type', m.media_type, 'display_order', m.display_order, 'variant_id', m.variant_id)) FILTER (WHERE m.id IS NOT NULL), '[]') AS media,
         c.name as category
       FROM products p
-      LEFT JOIN product_variants v ON p.id = v.product_id
+      LEFT JOIN product_variants v ON p.id = v.product_id AND v.status IS DISTINCT FROM 'ARCHIVED'
       LEFT JOIN product_images m ON p.id = m.product_id
       LEFT JOIN categories c ON p.category_id = c.id
       WHERE p.id = $1
@@ -1476,24 +1728,73 @@ app.put('/api/admin/products/:id', verifyAdmin, async (req, res) => {
     const existingImages = await client.query('SELECT cloudinary_public_id FROM product_images WHERE product_id = $1 AND cloudinary_public_id IS NOT NULL', [id]);
     const incomingPublicIds = media && Array.isArray(media) ? media.map((m: any) => m.cloudinary_public_id).filter(Boolean) : [];
 
-    // Delete existing variants and images to replace them
-    await client.query('DELETE FROM product_variants WHERE product_id = $1', [id]);
+    // Variants are updated IN PLACE by id so cart lines, order history, returns, exchanges and
+    // reviews keep their references. Only variants the admin removed are deleted; a removed variant
+    // that history still references is archived (hidden, stock 0, SKU freed) instead of deleted.
+    // Images are not referenced elsewhere, so they are still replaced wholesale.
     await client.query('DELETE FROM product_images WHERE product_id = $1', [id]);
 
     const variantMap: Record<string, number> = {};
     if (variants && Array.isArray(variants)) {
+      const existingVariants = await client.query(
+        `SELECT id FROM product_variants WHERE product_id = $1 AND status IS DISTINCT FROM 'ARCHIVED' FOR UPDATE`,
+        [id]
+      );
+      const existingIds = new Set<number>(existingVariants.rows.map((r: any) => r.id));
+      // Only ids that already belong to THIS product are treated as existing; anything else is new
+      const keptIds = new Set<number>(
+        variants.map((v: any) => parsePositiveInt(v?.id)).filter((vid: number | null): vid is number => vid !== null && existingIds.has(vid))
+      );
+
+      // 1. Removals first (frees SKUs before inserts/updates)
+      for (const removedId of existingIds) {
+        if (keptIds.has(removedId)) continue;
+        const refRes = await client.query(`
+          SELECT 1 FROM order_items WHERE variant_id = $1
+          UNION ALL SELECT 1 FROM product_returns WHERE variant_id = $1
+          UNION ALL SELECT 1 FROM product_exchanges WHERE original_variant_id = $1 OR requested_variant_id = $1
+          UNION ALL SELECT 1 FROM inventory_transactions WHERE variant_id = $1
+          LIMIT 1
+        `, [removedId]);
+        await client.query('DELETE FROM cart_items WHERE variant_id = $1', [removedId]);
+        if (refRes.rows.length > 0) {
+          await client.query(
+            `UPDATE product_variants SET status = 'ARCHIVED', stock = 0, sku = sku || '-ARCHIVED-' || id WHERE id = $1`,
+            [removedId]
+          );
+        } else {
+          await client.query('DELETE FROM product_variants WHERE id = $1', [removedId]);
+        }
+      }
+
+      // 2. Update kept variants in place, insert genuinely new ones.
+      //    Kept SKUs are parked on temporary values first so SKU swaps/renames can't hit the unique index.
+      if (keptIds.size > 0) {
+        await client.query(`UPDATE product_variants SET sku = '__tmp_' || id WHERE id = ANY($1::int[])`, [[...keptIds]]);
+      }
       for (const [idx, v] of variants.entries()) {
         const finalSku = v.sku || `${finalSlug}-${v.color}-${v.size}`.replace(/\s+/g, '-').toUpperCase();
-        const vResult = await client.query(
-          `INSERT INTO product_variants (product_id, sku, color, size, price, stock, status)
-           VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-          [id, finalSku, v.color || '', v.size || '', v.price || 0, v.stock || 0, v.status || 'ACTIVE']
-        );
-        const newId = vResult.rows[0].id;
-        variantMap[finalSku] = newId;
-        variantMap[idx.toString()] = newId;
+        const existingId = parsePositiveInt(v.id);
+        let variantId: number;
+        if (existingId !== null && keptIds.has(existingId)) {
+          await client.query(
+            `UPDATE product_variants SET sku = $1, color = $2, size = $3, price = $4, stock = $5, status = $6
+             WHERE id = $7 AND product_id = $8`,
+            [finalSku, v.color || '', v.size || '', v.price || 0, v.stock || 0, v.status || 'ACTIVE', existingId, id]
+          );
+          variantId = existingId;
+        } else {
+          const vResult = await client.query(
+            `INSERT INTO product_variants (product_id, sku, color, size, price, stock, status)
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+            [id, finalSku, v.color || '', v.size || '', v.price || 0, v.stock || 0, v.status || 'ACTIVE']
+          );
+          variantId = vResult.rows[0].id;
+        }
+        variantMap[finalSku] = variantId;
+        variantMap[idx.toString()] = variantId;
         if (v.id) {
-          variantMap[v.id.toString()] = newId;
+          variantMap[v.id.toString()] = variantId;
         }
       }
     }
@@ -1572,7 +1873,7 @@ app.delete('/api/admin/products/:id', verifyAdmin, async (req, res) => {
   }
 });
 
-app.post('/api/admin/upload', upload.single('file'), verifyAdmin, async (req, res) => {
+app.post('/api/admin/upload', verifyAdmin, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message: 'No file provided' });
     const file = req.file as any;
@@ -1709,6 +2010,7 @@ app.get('/api/admin/inventory', verifyAdmin, async (req, res) => {
       SELECT v.id, v.sku, v.color, v.size, v.stock, v.price, p.name as product_name
       FROM product_variants v
       JOIN products p ON v.product_id = p.id
+      WHERE v.status IS DISTINCT FROM 'ARCHIVED'
       ORDER BY p.name, v.color, v.size
     `);
     
@@ -1962,15 +2264,23 @@ app.post('/api/exchanges', authenticateToken, async (req: any, res) => {
   if (!order_item_id || !requested_variant_id || !reason) {
     return res.status(400).json({ message: 'order_item_id, requested_variant_id, and reason are required' });
   }
+  if (parsePositiveInt(order_item_id) === null || parsePositiveInt(requested_variant_id) === null) {
+    return res.status(400).json({ message: 'Invalid order item or variant' });
+  }
 
-  const cleanReason = (reason || '').trim();
+  const cleanReason = (typeof reason === 'string' ? reason : '').trim();
   if (cleanReason.length === 0 || cleanReason.length > 100) {
     return res.status(400).json({ message: 'Reason must be 1-100 characters' });
   }
 
+  // Transaction + row lock on the order item serializes concurrent exchange requests for the same item
+  const client = await pool.connect();
+  let committed = false;
   try {
+    await client.query('BEGIN');
+
     // Verify ownership + order is DELIVERED
-    const itemRes = await pool.query(`
+    const itemRes = await client.query(`
       SELECT oi.id, oi.order_id, oi.variant_id AS original_variant_id, oi.price AS price_original, oi.quantity,
              o.shipping_address, o.status AS order_status,
              osh.created_at AS delivered_at
@@ -1979,6 +2289,7 @@ app.post('/api/exchanges', authenticateToken, async (req: any, res) => {
       JOIN order_status_history osh ON o.id = osh.order_id AND osh.status = 'DELIVERED'
       WHERE oi.id = $1 AND o.user_id = $2
       LIMIT 1
+      FOR UPDATE OF oi
     `, [order_item_id, userId]);
 
     if (itemRes.rows.length === 0) {
@@ -1998,19 +2309,31 @@ app.post('/api/exchanges', authenticateToken, async (req: any, res) => {
       return res.status(403).json({ message: 'Exchange window has closed. Exchanges must be initiated within 7 days of delivery.' });
     }
 
-    // Check no active exchange exists for this item
-    const existingRes = await pool.query(`
-      SELECT id FROM product_exchanges
+    // Block if an active exchange exists, or if this item was already exchanged (COMPLETED)
+    const existingRes = await client.query(`
+      SELECT status FROM product_exchanges
       WHERE order_item_id = $1
-        AND status NOT IN ('REJECTED', 'CANCELLED', 'COMPLETED')
+        AND status NOT IN ('REJECTED', 'CANCELLED')
     `, [order_item_id]);
 
+    if (existingRes.rows.some((r: any) => r.status === 'COMPLETED')) {
+      return res.status(409).json({ message: 'This item has already been exchanged.' });
+    }
     if (existingRes.rows.length > 0) {
       return res.status(409).json({ message: 'An active exchange request already exists for this item.' });
     }
 
+    // Block if a non-cancelled return exists for this item (prevents refund + replacement)
+    const existingReturnRes = await client.query(
+      `SELECT id FROM product_returns WHERE order_item_id = $1 AND status != 'CANCELLED'`,
+      [order_item_id]
+    );
+    if (existingReturnRes.rows.length > 0) {
+      return res.status(409).json({ message: 'A return request already exists for this item.' });
+    }
+
     // Verify requested variant exists, has stock, and is different from original
-    const requestedVariantRes = await pool.query(`
+    const requestedVariantRes = await client.query(`
       SELECT pv.id, pv.price, pv.stock, pv.color, pv.size, pv.product_id, pv.status
       FROM product_variants pv
       WHERE pv.id = $1
@@ -2030,6 +2353,13 @@ app.post('/api/exchanges', authenticateToken, async (req: any, res) => {
       return res.status(400).json({ message: 'Requested variant is the same as the original. Please select a different size.' });
     }
 
+    // Replacement must be a variant of the same product as the original
+    const origVariantRes = await client.query('SELECT product_id FROM product_variants WHERE id = $1', [item.original_variant_id]);
+    const origProductId = origVariantRes.rows[0]?.product_id;
+    if (!origProductId || origProductId !== requestedVariant.product_id) {
+      return res.status(400).json({ message: 'Replacement must be a different size or colour of the same product.' });
+    }
+
     if (requestedVariant.stock < 1) {
       return res.status(400).json({ message: 'Requested variant is out of stock' });
     }
@@ -2043,15 +2373,10 @@ app.post('/api/exchanges', authenticateToken, async (req: any, res) => {
       : item.shipping_address;
     const logisticsFee = getLogisticsFee(address?.pincode || '');
     const totalDue = Math.max(0, priceDifference) + logisticsFee;
-
-    // Determine exchange_type (same product = SIZE_SWAP, different product = PRODUCT_SWAP)
-    // Get original variant's product_id
-    const origVariantRes = await pool.query('SELECT product_id FROM product_variants WHERE id = $1', [item.original_variant_id]);
-    const origProductId = origVariantRes.rows[0]?.product_id;
-    const exchangeType = origProductId === requestedVariant.product_id ? 'SIZE_SWAP' : 'PRODUCT_SWAP';
+    const exchangeType = 'SIZE_SWAP';
 
     // Insert exchange request (always PENDING)
-    const insertRes = await pool.query(`
+    const insertRes = await client.query(`
       INSERT INTO product_exchanges
         (user_id, order_id, order_item_id, original_variant_id, quantity, requested_variant_id,
          exchange_type, reason, customer_notes, price_original, price_replacement, price_difference, logistics_fee)
@@ -2064,6 +2389,8 @@ app.post('/api/exchanges', authenticateToken, async (req: any, res) => {
     ]);
 
     const exchange = insertRes.rows[0];
+    await client.query('COMMIT');
+    committed = true;
 
     await pool.query(
       `INSERT INTO admin_notifications (type, title, message, reference_id, reference_type) VALUES ($1, $2, $3, $4, $5)`,
@@ -2081,6 +2408,9 @@ app.post('/api/exchanges', authenticateToken, async (req: any, res) => {
   } catch (error) {
     console.error('Exchange submit error:', error);
     res.status(500).json({ message: 'Internal server error' });
+  } finally {
+    if (!committed) await client.query('ROLLBACK').catch(() => {});
+    client.release();
   }
 });
 
@@ -2261,36 +2591,56 @@ app.post('/api/exchanges/:id/verify-fee-payment', authenticateToken, async (req:
     return res.status(400).json({ message: 'Missing Razorpay payment data' });
   }
 
-  const body = razorpay_order_id + '|' + razorpay_payment_id;
-  const expectedSig = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET || '').update(body).digest('hex');
-  if (expectedSig !== razorpay_signature) {
+  if (!isValidRazorpaySignature(razorpay_order_id, razorpay_payment_id, razorpay_signature)) {
     return res.status(400).json({ success: false, message: 'Payment verification failed. Invalid signature.' });
   }
 
+  const client = await pool.connect();
+  let committed = false;
   try {
-    const exRes = await pool.query(
-      'SELECT id, status FROM product_exchanges WHERE id = $1 AND user_id = $2',
+    await client.query('BEGIN');
+    // Lock the exchange row so two verifications cannot both confirm it
+    const exRes = await client.query(
+      'SELECT id, status, razorpay_order_id FROM product_exchanges WHERE id = $1 AND user_id = $2 FOR UPDATE',
       [id, userId]
     );
     if (exRes.rows.length === 0) return res.status(404).json({ message: 'Exchange not found' });
-    if (exRes.rows[0].status !== 'AWAITING_PAYMENT') {
+    const exchange = exRes.rows[0];
+    if (exchange.status !== 'AWAITING_PAYMENT') {
       return res.status(400).json({ message: 'Exchange is not awaiting payment.' });
     }
+    // The payment must be for the Razorpay order created for THIS exchange by pay-fee
+    if (!exchange.razorpay_order_id || exchange.razorpay_order_id !== razorpay_order_id) {
+      return res.status(400).json({ success: false, message: 'Payment does not match this exchange.' });
+    }
+    // A payment ID can only ever be used once (exchanges or orders)
+    const reuseRes = await client.query(
+      `SELECT 1 FROM product_exchanges WHERE razorpay_payment_id = $1
+       UNION ALL SELECT 1 FROM payments WHERE razorpay_payment_id = $1`,
+      [razorpay_payment_id]
+    );
+    if (reuseRes.rows.length > 0) {
+      return res.status(409).json({ success: false, message: 'This payment has already been processed.' });
+    }
 
-    await pool.query(`
+    await client.query(`
       UPDATE product_exchanges
       SET status = 'PAYMENT_CONFIRMED',
-          razorpay_order_id = $1,
-          razorpay_payment_id = $2,
-          razorpay_signature = $3,
+          razorpay_payment_id = $1,
+          razorpay_signature = $2,
           updated_at = CURRENT_TIMESTAMP
-      WHERE id = $4
-    `, [razorpay_order_id, razorpay_payment_id, razorpay_signature, id]);
+      WHERE id = $3 AND status = 'AWAITING_PAYMENT'
+    `, [razorpay_payment_id, razorpay_signature, id]);
+    await client.query('COMMIT');
+    committed = true;
 
     res.status(200).json({ success: true, message: 'Payment confirmed. Your exchange is being processed.' });
   } catch (error) {
     console.error('Exchange verify-fee-payment error:', error);
     res.status(500).json({ message: 'Internal server error' });
+  } finally {
+    if (!committed) await client.query('ROLLBACK').catch(() => {});
+    client.release();
   }
 });
 
@@ -2503,9 +2853,14 @@ app.post('/api/returns', authenticateToken, async (req: any, res) => {
     return res.status(400).json({ message: 'Reason must be 1-100 characters' });
   }
 
+  // Transaction + row lock on the order item serializes concurrent return (and exchange) requests
+  const client = await pool.connect();
+  let committed = false;
   try {
+    await client.query('BEGIN');
+
     // Verify ownership + DELIVERED status
-    const itemRes = await pool.query(`
+    const itemRes = await client.query(`
       SELECT oi.id, oi.order_id, oi.variant_id, oi.price, oi.quantity,
              o.status AS order_status,
              osh.created_at AS delivered_at
@@ -2514,6 +2869,7 @@ app.post('/api/returns', authenticateToken, async (req: any, res) => {
       JOIN order_status_history osh ON o.id = osh.order_id AND osh.status = 'DELIVERED'
       WHERE oi.id = $1 AND o.user_id = $2
       LIMIT 1
+      FOR UPDATE OF oi
     `, [order_item_id, userId]);
 
     if (itemRes.rows.length === 0) {
@@ -2534,7 +2890,7 @@ app.post('/api/returns', authenticateToken, async (req: any, res) => {
     }
 
     // Check no return exists for this item (any status except CANCELLED blocks another return)
-    const existingRes = await pool.query(`
+    const existingRes = await client.query(`
       SELECT id FROM product_returns
       WHERE order_item_id = $1
         AND status != 'CANCELLED'
@@ -2545,7 +2901,7 @@ app.post('/api/returns', authenticateToken, async (req: any, res) => {
     }
 
     // Also check no active exchange exists for this item
-    const existingExRes = await pool.query(`
+    const existingExRes = await client.query(`
       SELECT id FROM product_exchanges
       WHERE order_item_id = $1
         AND status NOT IN ('REJECTED', 'CANCELLED', 'COMPLETED')
@@ -2558,7 +2914,7 @@ app.post('/api/returns', authenticateToken, async (req: any, res) => {
     const refundAmount = parseFloat(item.price) * item.quantity;
 
     // Insert return — auto-accepted (status = APPROVED)
-    const insertRes = await pool.query(`
+    const insertRes = await client.query(`
       INSERT INTO product_returns
         (user_id, order_id, order_item_id, variant_id, quantity, reason, customer_notes, status, refund_amount)
       VALUES ($1, $2, $3, $4, $5, $6, $7, 'APPROVED', $8)
@@ -2569,6 +2925,8 @@ app.post('/api/returns', authenticateToken, async (req: any, res) => {
     ]);
 
     const returnRecord = insertRes.rows[0];
+    await client.query('COMMIT');
+    committed = true;
 
     // Create notification
     await pool.query(
@@ -2584,6 +2942,9 @@ app.post('/api/returns', authenticateToken, async (req: any, res) => {
   } catch (error) {
     console.error('Return submit error:', error);
     res.status(500).json({ message: 'Internal server error' });
+  } finally {
+    if (!committed) await client.query('ROLLBACK').catch(() => {});
+    client.release();
   }
 });
 

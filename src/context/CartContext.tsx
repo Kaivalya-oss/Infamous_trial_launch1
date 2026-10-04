@@ -3,11 +3,12 @@ import api from '../lib/axios';
 import { useAuth } from './AuthContext';
 
 export interface CartItem {
-  id: string; // unique combo of product name + size
+  id: string; // canonical line identity: String(variant_id)
   name: string;
   price: string;
   img: string;
   size: string;
+  color?: string;
   quantity: number;
   stock: number;   // variant stock — used for max-quantity UI and server-side guard
   variant_id?: number;
@@ -26,95 +27,134 @@ interface CartContextType {
 
 const CartContext = createContext<CartContextType | undefined>(undefined);
 
+// Cart lifecycle (the server cart is the source of truth while authenticated):
+//  - GUEST_CART_KEY holds ONLY guest lines. It is sent to the additive /api/cart/merge exactly once,
+//    on the real guest → authenticated transition, and cleared immediately after being read.
+//  - USER_CART_KEY is a display cache of the server cart for page reloads. It is never merged.
+//  - A reload while authenticated re-reads the server cart (merge with an empty list = read-only).
+//  - Logout clears both, so nothing stale can be merged into the next login.
+//  - Every authenticated mutation is an explicit SET/DELETE call (never additive).
+const GUEST_CART_KEY = 'infamous_guest_cart';
+const USER_CART_KEY = 'infamous_user_cart';
+const LEGACY_CART_KEY = 'infamous_cart'; // pre-fix key: may hold a copy of a server cart, so it is discarded
+
+const readCart = (key: string): CartItem[] => {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(key) || '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+};
+
+const lineId = (item: { variant_id?: number; name: string; size: string; color?: string }) =>
+  item.variant_id ? String(item.variant_id) : `${item.name}-${item.color || ''}-${item.size}`;
+
+const clampQty = (quantity: number, stock?: number) => {
+  const max = typeof stock === 'number' && stock >= 0 ? stock : Infinity;
+  return Math.max(1, Math.min(Math.floor(quantity), max));
+};
+
 export function CartProvider({ children }: { children: ReactNode }) {
   const { isAuthenticated } = useAuth();
 
-  // Track whether the server-authoritative cart has been loaded for this session.
-  // Prevents stale localStorage quantities from being treated as truth after login.
-  const mergedFromServer = useRef(false);
-
-  // 1. Initialize from localStorage (guest cart or last-known authenticated cart)
   const [items, setItems] = useState<CartItem[]>(() => {
-    const saved = localStorage.getItem('infamous_cart');
-    return saved ? JSON.parse(saved) : [];
+    localStorage.removeItem(LEGACY_CART_KEY);
+    return readCart(isAuthenticated ? USER_CART_KEY : GUEST_CART_KEY);
   });
+  const itemsRef = useRef(items);
+  itemsRef.current = items;
 
   const [isCartOpen, setIsCartOpen] = useState(false);
+  // undefined = first run (mount); afterwards the previous auth state, to detect real transitions
+  const prevAuthRef = useRef<boolean | undefined>(undefined);
 
-  // 2. Persist to localStorage on every items change.
-  //    For authenticated users, sync each item individually using PUT (SET semantics).
-  //    This must NOT call /api/cart/merge — that endpoint is additive and is
-  //    reserved exclusively for the one-time guest→authenticated merge below.
+  // Persist to the key matching the current auth state
   useEffect(() => {
-    localStorage.setItem('infamous_cart', JSON.stringify(items));
-
-    if (isAuthenticated && mergedFromServer.current) {
-      // Sync each item individually via PUT which uses SET quantity = $1 (not additive)
-      const timer = setTimeout(() => {
-        items.forEach((item) => {
-          if (!item.variant_id) return;
-          api.put(`/api/cart/items/${item.variant_id}`, { quantity: item.quantity })
-            .catch(err => console.error(`Failed to sync cart item ${item.variant_id}:`, err));
-        });
-      }, 800); // debounce rapid changes
-      return () => clearTimeout(timer);
-    }
+    localStorage.setItem(isAuthenticated ? USER_CART_KEY : GUEST_CART_KEY, JSON.stringify(items));
   }, [items, isAuthenticated]);
 
-  // 3. One-time guest→authenticated merge — fires ONLY when isAuthenticated flips true.
-  //    Sends the local (guest) cart to the additive merge endpoint exactly once.
-  //    The server returns the unified cart; we overwrite local state with that.
+  const loadServerCart = (localItems: CartItem[]) =>
+    api.post('/api/cart/merge', { localItems })
+      .then(res => {
+        if (Array.isArray(res.data?.mergedItems)) setItems(res.data.mergedItems);
+      })
+      .catch(err => console.error('Failed to load cart:', err));
+
   useEffect(() => {
-    if (isAuthenticated) {
-      // Capture the guest items at the moment of login (before setItems replaces them)
-      const guestItems = items;
-      api.post('/api/cart/merge', { localItems: guestItems })
-        .then(res => {
-          if (res.data.mergedItems) {
-            mergedFromServer.current = true;
-            setItems(res.data.mergedItems);
-            localStorage.setItem('infamous_cart', JSON.stringify(res.data.mergedItems));
-          }
-        })
-        .catch(err => console.error("Failed to merge remote cart:", err));
-    } else {
-      // User logged out — reset the server-merge guard so next login triggers a fresh merge
-      mergedFromServer.current = false;
+    const prev = prevAuthRef.current;
+    prevAuthRef.current = isAuthenticated;
+
+    if (isAuthenticated && prev === false) {
+      // Real login transition: merge the guest cart exactly once, then drop it
+      const guestItems = readCart(GUEST_CART_KEY);
+      localStorage.removeItem(GUEST_CART_KEY);
+      loadServerCart(guestItems);
+    } else if (isAuthenticated) {
+      // Page load while already authenticated: read-only refresh from the server, never a merge
+      loadServerCart([]);
+    } else if (prev === true) {
+      // Logout: discard the authenticated cart so it can never be merged back in
+      localStorage.removeItem(USER_CART_KEY);
+      localStorage.removeItem(GUEST_CART_KEY);
+      setItems([]);
     }
-  }, [isAuthenticated]); // Only triggers when auth state changes
+  }, [isAuthenticated]);
+
+  // Server write for one line; on rejection (e.g. stock changed) resync from the server
+  const syncLine = (request: Promise<unknown>) => {
+    request.catch(err => {
+      console.error('Cart sync failed:', err);
+      loadServerCart([]);
+    });
+  };
 
   const addToCart = (newItem: Omit<CartItem, 'id' | 'quantity'> & { quantity?: number }) => {
-    const quantityToAdd = newItem.quantity || 1;
-    setItems((prev) => {
-      const id = `${newItem.name}-${newItem.size}`;
-      const existing = prev.find(item => item.id === id);
+    const id = lineId(newItem);
+    const existing = itemsRef.current.find(item => item.id === id);
+    const stock = typeof newItem.stock === 'number' ? newItem.stock : existing?.stock;
+    const nextQty = clampQty((existing?.quantity || 0) + (newItem.quantity || 1), stock);
 
-      if (existing) {
-        const newQty = existing.quantity + quantityToAdd;
-        const maxQty = existing.stock ?? Infinity;
-        return prev.map(item =>
-          item.id === id ? { ...item, quantity: Math.min(newQty, maxQty) } : item
-        );
-      }
-      return [...prev, { ...newItem, id, quantity: quantityToAdd }];
-    });
+    const next = existing
+      ? itemsRef.current.map(item => item.id === id ? { ...item, stock: stock ?? item.stock, quantity: nextQty } : item)
+      : [...itemsRef.current, { ...newItem, stock: stock as number, id, quantity: nextQty }];
+    itemsRef.current = next;
+    setItems(next);
     setIsCartOpen(true);
+
+    if (isAuthenticated && newItem.variant_id) {
+      // POST uses SET semantics server-side: send the absolute quantity
+      syncLine(api.post('/api/cart/items', { variantId: newItem.variant_id, quantity: nextQty }));
+    }
   };
 
   const removeFromCart = (id: string) => {
-    setItems((prev) => prev.filter(item => item.id !== id));
+    const target = itemsRef.current.find(item => item.id === id);
+    const next = itemsRef.current.filter(item => item.id !== id);
+    itemsRef.current = next;
+    setItems(next);
+    if (isAuthenticated && target?.variant_id) {
+      syncLine(api.delete(`/api/cart/items/${target.variant_id}`));
+    }
   };
 
   const updateQuantity = (id: string, quantity: number) => {
     if (quantity < 1) return;
-    setItems((prev) => prev.map(item => {
-      if (item.id !== id) return item;
-      const maxQty = item.stock ?? Infinity;
-      return { ...item, quantity: Math.min(quantity, maxQty) };
-    }));
+    const target = itemsRef.current.find(item => item.id === id);
+    if (!target) return;
+    const nextQty = clampQty(quantity, target.stock);
+    if (nextQty === target.quantity) return;
+    const next = itemsRef.current.map(item => item.id === id ? { ...item, quantity: nextQty } : item);
+    itemsRef.current = next;
+    setItems(next);
+    if (isAuthenticated && target.variant_id) {
+      syncLine(api.put(`/api/cart/items/${target.variant_id}`, { quantity: nextQty }));
+    }
   };
 
+  // Local only: the server cart is emptied inside the order transaction at checkout
   const clearCart = () => {
+    itemsRef.current = [];
     setItems([]);
   };
 
@@ -138,4 +178,3 @@ export function useCart() {
   }
   return context;
 }
-

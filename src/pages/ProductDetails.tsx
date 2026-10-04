@@ -74,6 +74,7 @@ export default function ProductDetails() {
       size: selectedSize,
       color: selectedColor,
       quantity,
+      stock: specificVariant?.stock,
       variant_id: specificVariant?.id || (product.variants && product.variants.length > 0 ? product.variants[0].id : undefined)
     } as any);
   };

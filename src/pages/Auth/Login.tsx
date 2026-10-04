@@ -63,15 +63,9 @@ export default function Login() {
     setIsLoading(true);
     try {
       const result = await signInWithPopup(auth, googleProvider);
-      const user = result.user;
-      
-      const response = await api.post('/api/auth/google', {
-        email: user.email,
-        firstName: user.displayName?.split(' ')[0] || 'Google',
-        lastName: user.displayName?.split(' ').slice(1).join(' ') || 'User',
-        googleId: user.uid,
-        profileImage: user.photoURL
-      });
+      // Backend derives identity solely from the verified Firebase ID token
+      const idToken = await result.user.getIdToken();
+      const response = await api.post('/api/auth/google', { idToken });
       
       login(response.data.accessToken, response.data.refreshToken, response.data.user);
       navigate(from, { replace: true });
@@ -140,10 +134,9 @@ export default function Login() {
     try {
       const result = await confirmationResult.confirm(otp);
       
-      // Send verified phone to our backend to get JWT
-      const response = await api.post('/api/auth/phone', {
-        phoneNumber: result.user.phoneNumber
-      });
+      // Backend derives the phone number solely from the verified Firebase ID token
+      const idToken = await result.user.getIdToken();
+      const response = await api.post('/api/auth/phone', { idToken });
       
       login(response.data.accessToken, response.data.refreshToken, response.data.user);
       navigate(from, { replace: true });

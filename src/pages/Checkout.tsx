@@ -49,6 +49,8 @@ export default function Checkout() {
   const [addressData, setAddressData] = useState<CheckoutFormValues | null>(null);
   const [processingMessage, setProcessingMessage] = useState('');
   const isSubmittingRef = useRef(false); // Prevent double-clicks
+  // Set once an order is created so the empty-cart guard below cannot pre-empt the success redirect
+  const orderPlacedRef = useRef(false);
 
   // Contact completion state
   const [contactEmail, setContactEmail] = useState('');
@@ -59,7 +61,7 @@ export default function Checkout() {
   const [contactPhoneError, setContactPhoneError] = useState('');
   
   useEffect(() => {
-    if (items.length === 0 && step < 4) navigate('/');
+    if (items.length === 0 && step < 4 && !orderPlacedRef.current) navigate('/');
     setIsCartOpen(false);
   }, [items, navigate, setIsCartOpen, step]);
 
@@ -174,7 +176,12 @@ export default function Checkout() {
       if (!sdkLoaded) throw new Error('Payment gateway failed to load. Please try again.');
 
       // Step 1: Create Razorpay order from backend
-      const { data } = await api.post('/api/checkout/create-order', { items: checkoutItems });
+      // Contact/address are pre-validated server-side before any payment is taken
+      const { data } = await api.post('/api/checkout/create-order', {
+        items: checkoutItems,
+        address: addressData,
+        contact: { email: contactEmail, phone: contactPhone },
+      });
 
       setProcessingMessage('Opening payment gateway...');
 
@@ -210,8 +217,9 @@ export default function Checkout() {
               });
             }
 
+            orderPlacedRef.current = true;
             clearCart();
-            navigate(`/order-success/${verifyRes.data.orderId}`);
+            navigate(`/order-success/${verifyRes.data.orderId}`, { replace: true });
           } catch (err: any) {
             alert(err.response?.data?.message || 'Payment verification failed.');
             setIsProcessing(false);
@@ -276,8 +284,9 @@ export default function Checkout() {
         });
       }
 
+      orderPlacedRef.current = true;
       clearCart();
-      navigate(`/order-success/${data.orderId}`);
+      navigate(`/order-success/${data.orderId}`, { replace: true });
     } catch (error: any) {
       console.error(error);
       alert(error.response?.data?.message || 'Order placement failed.');
