@@ -1,0 +1,11 @@
+{
+  "name": "infamous-server-tests",
+  "private": true,
+  "description": "Integration tests: real server code against a throwaway embedded Postgres (never the production DB)",
+  "scripts": {
+    "test": "node tests.js"
+  },
+  "devDependencies": {
+    "embedded-postgres": "18.4.0-beta.17"
+  }
+}
