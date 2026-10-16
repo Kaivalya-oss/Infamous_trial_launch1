@@ -12,6 +12,7 @@ import Razorpay from 'razorpay';
 import nodemailer from 'nodemailer';
 import { initializeApp, getApps } from 'firebase-admin/app';
 import { getAuth as getFirebaseAdminAuth } from 'firebase-admin/auth';
+import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 
 dotenv.config();
 
@@ -72,6 +73,22 @@ function logSmsNotification(phone: string, message: string) {
 const app = express();
 const port = process.env.PORT || 5000;
 
+// Don't advertise the framework, and send conservative headers on every API response.
+// (The API only ever returns JSON, so a locked-down CSP and nosniff are always safe here.)
+app.disable('x-powered-by');
+app.use((_req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Content-Security-Policy', "default-src 'none'; frame-ancestors 'none'");
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000');
+  next();
+});
+
+// Number of reverse proxies in front of the app (Render's load balancer, plus Cloudflare in front of it).
+// It decides which X-Forwarded-For entry is treated as the client IP, so it must match the real
+// topology. The per-IP limiter is best-effort; the per-account limiter below is the real control.
+app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS ?? 1));
+
 const allowedOrigins = [
   'http://localhost:5173',
   'http://localhost:3000',
@@ -97,7 +114,12 @@ app.use(cors({
   },
   credentials: true
 }));
-app.use(express.json());
+// Keep the raw body for the Razorpay webhook: its HMAC signature is computed over the exact bytes sent.
+app.use(express.json({
+  verify: (req: any, _res, buf) => {
+    if (req.originalUrl === '/api/webhooks/razorpay') req.rawBody = buf;
+  },
+}));
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -122,6 +144,17 @@ pool.query(`
   );
   ALTER TABLE checkout_payment_intents ADD COLUMN IF NOT EXISTS razorpay_payment_id VARCHAR(255);
   ALTER TABLE checkout_payment_intents ADD COLUMN IF NOT EXISTS failure_reason TEXT;
+  -- Reconciliation: the validated shipping address/contact are kept so an order can be completed from the
+  -- Razorpay webhook/poller even if the customer's browser never returns; refund bookkeeping for failures.
+  ALTER TABLE checkout_payment_intents ADD COLUMN IF NOT EXISTS address JSONB;
+  ALTER TABLE checkout_payment_intents ADD COLUMN IF NOT EXISTS contact JSONB;
+  ALTER TABLE checkout_payment_intents ADD COLUMN IF NOT EXISTS refund_id VARCHAR(255);
+  ALTER TABLE checkout_payment_intents ADD COLUMN IF NOT EXISTS refund_status VARCHAR(20);
+  ALTER TABLE checkout_payment_intents ADD COLUMN IF NOT EXISTS refund_attempts INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE checkout_payment_intents ADD COLUMN IF NOT EXISTS last_checked_at TIMESTAMP;
+  ALTER TABLE checkout_payment_intents ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+  CREATE INDEX IF NOT EXISTS idx_payment_intents_status_created ON checkout_payment_intents(status, created_at);
+  ALTER TABLE payments ADD COLUMN IF NOT EXISTS razorpay_refund_id VARCHAR(255);
 `).catch((err: any) => console.error('Failed to migrate checkout_payment_intents:', err.message));
 // Separate statement so a failure here can never roll back the table above
 pool.query(`
@@ -155,6 +188,61 @@ function validateCheckoutItems(items: any): { items?: { variant_id: number; quan
   return { items: normalized };
 }
 
+// Admin product payload: money and stock must be real, sane numbers; text fields bounded; media URLs https only.
+// Returns the variants with price/stock coerced to numbers (the editor submits them as strings).
+function validateProductPayload(body: any): { error?: string; variants?: any[] } {
+  const { name, slug, status, variants, media } = body || {};
+  if (name != null && (typeof name !== 'string' || name.length > 255)) return { error: 'Product name must be text of at most 255 characters.' };
+  if (slug && (typeof slug !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,254}$/.test(slug))) return { error: 'Slug may only contain letters, numbers, hyphens and underscores.' };
+  if (status !== undefined && !['DRAFT', 'PUBLISHED', 'ARCHIVED'].includes(status)) return { error: 'Invalid product status.' };
+  if (media != null) {
+    if (!Array.isArray(media) || media.length > 100) return { error: 'Invalid media list.' };
+    for (const m of media) {
+      if (m?.cloudinary_url && (typeof m.cloudinary_url !== 'string' || !/^https:\/\//i.test(m.cloudinary_url) || m.cloudinary_url.length > 2000)) return { error: 'Media URLs must be https links.' };
+    }
+  }
+  if (variants === undefined || variants === null) return { variants: undefined };
+  if (!Array.isArray(variants) || variants.length > 200) return { error: 'Invalid variants list.' };
+  const out: any[] = [];
+  for (const [i, v] of variants.entries()) {
+    const label = `Variant ${i + 1}`;
+    const price = v?.price === '' || v?.price == null ? 0 : Number(v.price);
+    const stock = v?.stock === '' || v?.stock == null ? 0 : Number(v.stock);
+    if (!Number.isFinite(price) || price < 0 || price > 1_000_000) return { error: `${label}: price must be a number between 0 and 1,000,000.` };
+    if (status === 'PUBLISHED' && price <= 0) return { error: `${label}: a published product needs a price above 0.` };
+    if (!Number.isInteger(stock) || stock < 0 || stock > 1_000_000) return { error: `${label}: stock must be a whole number of 0 or more.` };
+    for (const [field, max] of [['sku', 100], ['color', 50], ['size', 50]] as const) {
+      if (v?.[field] != null && (typeof v[field] !== 'string' || v[field].length > max)) return { error: `${label}: ${field} must be text of at most ${max} characters.` };
+    }
+    if (v?.status != null && !['ACTIVE', 'INACTIVE'].includes(v.status)) return { error: `${label}: invalid status.` };
+    out.push({ ...v, price: Math.round(price * 100) / 100, stock });
+  }
+  return { variants: out };
+}
+
+// Shipping address: whitelisted keys only, every field validated. This normalized object is what gets stored.
+function validateAddress(raw: any): { address?: { fullName: string; phone: string; address: string; city: string; state: string; pincode: string }; error?: string } {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { error: 'A shipping address is required.' };
+  const text = (v: any) => (typeof v === 'string' ? v.replace(/\s+/g, ' ').trim() : '');
+  const fullName = text(raw.fullName), line = text(raw.address), city = text(raw.city), state = text(raw.state);
+  const phone = text(raw.phone);
+  const pincode = typeof raw.pincode === 'number' ? String(raw.pincode) : text(raw.pincode);
+  if (fullName.length < 2 || fullName.length > 100) return { error: 'Please enter a valid full name.' };
+  if (!/^[0-9+()\-\s]{10,20}$/.test(phone) || phone.replace(/\D/g, '').length < 10 || phone.replace(/\D/g, '').length > 15) return { error: 'Please enter a valid delivery phone number.' };
+  if (line.length < 5 || line.length > 300) return { error: 'Please enter a valid delivery address.' };
+  if (city.length < 2 || city.length > 80) return { error: 'Please enter a valid city.' };
+  if (state.length < 2 || state.length > 80) return { error: 'Please enter a valid state.' };
+  if (!/^\d{6}$/.test(pincode)) return { error: 'Please enter a valid 6-digit pincode.' };
+  if ([fullName, line, city, state].some(v => /[<>]/.test(v))) return { error: 'The address contains invalid characters.' };
+  return { address: { fullName, phone, address: line, city, state, pincode } };
+}
+
+// Messages from our own `throw new Error(...)` are written for customers. Database / driver errors carry a
+// string `code` and must never be echoed back (they expose table and column names).
+function publicErrorMessage(error: any, fallback: string): string {
+  return error && typeof error.code === 'string' ? fallback : (error?.message || fallback);
+}
+
 function isValidRazorpaySignature(orderId: any, paymentId: any, signature: any): boolean {
   if (typeof orderId !== 'string' || typeof paymentId !== 'string' || typeof signature !== 'string') return false;
   if (!process.env.RAZORPAY_KEY_SECRET) return false;
@@ -179,17 +267,71 @@ const storage = new CloudinaryStorage({
     };
   },
 });
-const upload = multer({ storage: storage });
+// Admin media uploads: one file per request, capped (default 50 MB covers the hero videos).
+const MAX_UPLOAD_BYTES = Number(process.env.UPLOAD_MAX_BYTES || 50 * 1024 * 1024);
+const upload = multer({ storage: storage, limits: { fileSize: MAX_UPLOAD_BYTES, files: 1, fields: 5 } });
+const uploadSingleFile = (req: any, res: any, next: any) => {
+  upload.single('file')(req, res, (err: any) => {
+    if (!err) return next();
+    if (err instanceof multer.MulterError) {
+      const tooLarge = err.code === 'LIMIT_FILE_SIZE';
+      return res.status(tooLarge ? 413 : 400).json({ message: tooLarge ? `File is too large (max ${Math.round(MAX_UPLOAD_BYTES / 1024 / 1024)} MB).` : 'Invalid upload.' });
+    }
+    console.error('Upload error:', err?.message);
+    return res.status(502).json({ message: 'Media upload failed.' });
+  });
+};
 
 // MIDDLEWARE
+
+// JWT signing secret. There is deliberately no well-known default: production refuses to start without
+// one, and any other environment gets a random per-process secret (tokens simply don't survive a restart).
+const JWT_SECRET: string = (() => {
+  if (process.env.JWT_ACCESS_SECRET) return process.env.JWT_ACCESS_SECRET;
+  if (process.env.NODE_ENV === 'production') {
+    console.error('FATAL: JWT_ACCESS_SECRET is not set.');
+    process.exit(1);
+  }
+  console.warn('[AUTH] JWT_ACCESS_SECRET not set; using a random per-process secret.');
+  return crypto.randomBytes(32).toString('hex');
+})();
+
+// Account state (status + role) is read from the DB so that suspension and role changes take effect
+// immediately instead of when the (up to 15 minute) access token expires. A short in-memory cache keeps
+// this off the hot path; admin changes invalidate it at once.
+const ACCOUNT_CACHE_TTL_MS = Number(process.env.ACCOUNT_CACHE_TTL_MS ?? 15000);
+const accountCache = new Map<number, { status: string; role: string; expires: number }>();
+const invalidateAccountCache = (userId: number) => { accountCache.delete(userId); };
+async function getAccountState(userId: number) {
+  const hit = accountCache.get(userId);
+  if (hit && hit.expires > Date.now()) return hit;
+  const r = await pool.query('SELECT status, role FROM users WHERE id = $1', [userId]);
+  if (r.rows.length === 0) return null;
+  const state = { status: r.rows[0].status || 'Active', role: r.rows[0].role as string, expires: Date.now() + ACCOUNT_CACHE_TTL_MS };
+  if (ACCOUNT_CACHE_TTL_MS > 0) {
+    if (accountCache.size > 5000) accountCache.clear();
+    accountCache.set(userId, state);
+  }
+  return state;
+}
+const SUSPENDED_RESPONSE = { message: 'This account has been suspended. Please contact support.', code: 'ACCOUNT_SUSPENDED' };
+
 const authenticateToken = (req: any, res: any, next: any) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
   if (!token) return res.status(401).json({ message: 'Unauthorized' });
-  jwt.verify(token, process.env.JWT_ACCESS_SECRET || 'secret', (err: any, user: any) => {
+  jwt.verify(token, JWT_SECRET, async (err: any, user: any) => {
     if (err) return res.status(401).json({ message: 'Unauthorized - Token expired or invalid' });
-    req.user = user;
-    next();
+    try {
+      const state = await getAccountState(Number(user?.userId));
+      if (!state) return res.status(401).json({ message: 'Unauthorized - account not found' });
+      if (state.status === 'Suspended') return res.status(403).json(SUSPENDED_RESPONSE);
+      req.user = { ...user, role: state.role }; // authoritative role from the DB, not the token claim
+      next();
+    } catch (e) {
+      console.error('[AUTH] account lookup failed:', (e as Error).message);
+      res.status(500).json({ message: 'Internal server error' });
+    }
   });
 };
 
@@ -199,30 +341,92 @@ app.get('/api/health', (req, res) => {
 
 // --- AUTHENTICATION ---
 const generateTokens = async (userId: number, email: string, role: string) => {
-  const accessToken = jwt.sign({ userId, email, role }, process.env.JWT_ACCESS_SECRET || 'secret', { expiresIn: '15m' });
+  const accessToken = jwt.sign({ userId, email, role }, JWT_SECRET, { expiresIn: '15m' });
   const refreshToken = crypto.randomBytes(40).toString('hex');
   const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
   await pool.query('INSERT INTO sessions (user_id, token, expires_at) VALUES ($1, $2, $3)', [userId, refreshToken, expiresAt]);
   return { accessToken, refreshToken };
 };
 
-app.post('/api/auth/register', async (req, res) => {
-  const { name, email, password } = req.body;
-  if (!name || !email || !password) return res.status(400).json({ message: 'Missing fields' });
+// ---- Authentication abuse controls -------------------------------------------------------------
+// In-memory counters (single Render instance). They reset on restart and are per-instance; move to a shared
+// store (e.g. Redis) before running more than one instance.
+const WINDOW_15_MIN = 15 * 60 * 1000;
+const tooManyAttempts = (message: string) => (_req: any, res: any) => res.status(429).json({ message });
+const authIpLimiter = rateLimit({            // every credential endpoint, per client IP (best effort, see trust proxy)
+  windowMs: WINDOW_15_MIN, limit: Number(process.env.AUTH_IP_RATE_LIMIT || 300),
+  standardHeaders: 'draft-7', legacyHeaders: false, handler: tooManyAttempts('Too many requests. Please try again in a few minutes.'),
+});
+const refreshLimiter = rateLimit({           // automatic token refreshes: generous, but still bounded
+  windowMs: WINDOW_15_MIN, limit: Number(process.env.REFRESH_RATE_LIMIT || 600),
+  standardHeaders: 'draft-7', legacyHeaders: false, handler: tooManyAttempts('Too many requests. Please try again in a few minutes.'),
+});
+const registerLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, limit: Number(process.env.REGISTER_RATE_LIMIT || 10),
+  standardHeaders: 'draft-7', legacyHeaders: false, handler: tooManyAttempts('Too many sign-ups from this network. Please try again later.'),
+});
+// Failed logins only (successes are not counted). Two layers so a single attacker cannot lock a victim out
+// cheaply, while a distributed attack on one account is still stopped:
+const loginEmailKey = (req: any) => (typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase().slice(0, 254) : '');
+const loginPairLimiter = rateLimit({         // one IP guessing one account
+  windowMs: WINDOW_15_MIN, limit: Number(process.env.LOGIN_FAIL_LIMIT || 10), skipSuccessfulRequests: true,
+  keyGenerator: (req: any) => `${ipKeyGenerator(req.ip || '')}|${loginEmailKey(req)}`,
+  standardHeaders: 'draft-7', legacyHeaders: false, handler: tooManyAttempts('Too many failed sign-in attempts. Please try again in 15 minutes.'),
+});
+const loginAccountLimiter = rateLimit({      // many IPs guessing one account
+  windowMs: WINDOW_15_MIN, limit: Number(process.env.LOGIN_ACCOUNT_FAIL_LIMIT || 50), skipSuccessfulRequests: true,
+  keyGenerator: (req: any) => `acct|${loginEmailKey(req)}`,
+  standardHeaders: 'draft-7', legacyHeaders: false, handler: tooManyAttempts('Too many failed sign-in attempts. Please try again in 15 minutes.'),
+});
+const passwordChangeLimiter = rateLimit({    // guessing the current password with a stolen access token
+  windowMs: WINDOW_15_MIN, limit: Number(process.env.LOGIN_FAIL_LIMIT || 10), skipSuccessfulRequests: true,
+  keyGenerator: (req: any) => `pw|${req.user?.userId}`,
+  standardHeaders: 'draft-7', legacyHeaders: false, handler: tooManyAttempts('Too many failed attempts. Please try again in 15 minutes.'),
+});
+
+// ---- Credential validation ---------------------------------------------------------------------
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+function normalizeEmail(v: any): string { return typeof v === 'string' ? v.trim().toLowerCase() : ''; }
+function validateEmail(v: any): string | null {
+  const e = normalizeEmail(v);
+  if (!e) return 'Email is required';
+  if (e.length > 254 || !EMAIL_RE.test(e)) return 'Please enter a valid email address';
+  return null;
+}
+// bcrypt only uses the first 72 bytes, so longer passwords would be silently truncated.
+function validatePassword(pw: any): string | null {
+  if (typeof pw !== 'string' || !pw) return 'Password is required';
+  if (pw.length < 8) return 'Password must be at least 8 characters';
+  if (Buffer.byteLength(pw, 'utf8') > 72) return 'Password is too long (maximum 72 characters)';
+  if (!/[A-Za-z]/.test(pw) || !/\d/.test(pw)) return 'Password must include at least one letter and one number';
+  return null;
+}
+// Compared against when no real hash exists, so unknown / password-less accounts cost the same time as real ones.
+const DUMMY_PASSWORD_HASH = bcrypt.hashSync(crypto.randomBytes(16).toString('hex'), 10);
+
+app.post('/api/auth/register', authIpLimiter, registerLimiter, async (req, res) => {
+  const { name, password } = req.body;
+  const emailError = validateEmail(req.body.email);
+  const passwordError = validatePassword(password);
+  const cleanName = typeof name === 'string' ? name.trim() : '';
+  if (!cleanName || cleanName.length < 2 || cleanName.length > 100) return res.status(400).json({ message: 'Name must be between 2 and 100 characters' });
+  if (emailError) return res.status(400).json({ message: emailError });
+  if (passwordError) return res.status(400).json({ message: passwordError });
+  const email = normalizeEmail(req.body.email);
   try {
-    const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+    const existing = await pool.query('SELECT id FROM users WHERE LOWER(email) = $1', [email]);
     if (existing.rows.length > 0) return res.status(400).json({ message: 'User already exists' });
     const hash = await bcrypt.hash(password, 10);
     const result = await pool.query(
       'INSERT INTO users (name, email, password_hash) VALUES ($1, $2, $3) RETURNING id, name, email, role',
-      [name, email, hash]
+      [cleanName, email, hash]
     );
     const user = result.rows[0];
     await pool.query('INSERT INTO cart (user_id) VALUES ($1)', [user.id]);
 
     await pool.query(
       `INSERT INTO admin_notifications (type, title, message, reference_id, reference_type) VALUES ($1, $2, $3, $4, $5)`,
-      ['NEW_CUSTOMER', 'New Customer Registered', `New customer ${name} (${email}) signed up.`, user.id.toString(), 'USER']
+      ['NEW_CUSTOMER', 'New Customer Registered', `New customer ${cleanName} (${email}) signed up.`, user.id.toString(), 'USER']
     ).catch((err: any) => console.error('Failed to create notification:', err));
 
     const tokens = await generateTokens(user.id, user.email, user.role);
@@ -233,13 +437,19 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', authIpLimiter, loginPairLimiter, loginAccountLimiter, async (req, res) => {
   const { email, password } = req.body;
-  if (!email || !password) return res.status(400).json({ message: 'Missing fields' });
+  if (typeof email !== 'string' || typeof password !== 'string' || !email || !password || password.length > 1000) {
+    return res.status(400).json({ message: 'Missing fields' });
+  }
   try {
-    const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+    const result = await pool.query('SELECT * FROM users WHERE LOWER(email) = $1 ORDER BY id LIMIT 1', [normalizeEmail(email)]);
     const user = result.rows[0];
-    if (user && await bcrypt.compare(password, user.password_hash)) {
+    // Always run one bcrypt comparison (against a dummy hash if the account has no password, e.g. Google/phone-only)
+    // so the response and timing do not reveal which emails exist or how they sign in.
+    const passwordOk = await bcrypt.compare(password, user?.password_hash || DUMMY_PASSWORD_HASH);
+    if (user && user.password_hash && passwordOk) {
+      if (user.status === 'Suspended') return res.status(403).json(SUSPENDED_RESPONSE);
       await pool.query('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = $1', [user.id]);
       const tokens = await generateTokens(user.id, user.email, user.role);
       delete user.password_hash;
@@ -252,7 +462,7 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-app.post('/api/auth/refresh', async (req, res) => {
+app.post('/api/auth/refresh', refreshLimiter, async (req, res) => {
   const { refreshToken } = req.body;
   if (typeof refreshToken !== 'string' || !refreshToken) return res.status(401).json({ message: 'Refresh token required' });
   // Password-reset tokens share the sessions table; they must never act as refresh tokens.
@@ -261,10 +471,11 @@ app.post('/api/auth/refresh', async (req, res) => {
     const sessionRes = await pool.query('SELECT * FROM sessions WHERE token = $1 AND expires_at > CURRENT_TIMESTAMP', [refreshToken]);
     if (sessionRes.rows.length === 0) return res.status(403).json({ message: 'Invalid or expired refresh token' });
     const session = sessionRes.rows[0];
-    const userRes = await pool.query('SELECT email, role FROM users WHERE id = $1', [session.user_id]);
+    const userRes = await pool.query('SELECT email, role, status FROM users WHERE id = $1', [session.user_id]);
     const user = userRes.rows[0];
     if (!user) return res.status(403).json({ message: 'User not found' });
-    const accessToken = jwt.sign({ userId: session.user_id, email: user.email, role: user.role }, process.env.JWT_ACCESS_SECRET || 'secret', { expiresIn: '15m' });
+    if (user.status === 'Suspended') return res.status(403).json(SUSPENDED_RESPONSE);
+    const accessToken = jwt.sign({ userId: session.user_id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '15m' });
     res.status(200).json({ accessToken });
   } catch (error) {
     console.error(error);
@@ -301,7 +512,7 @@ async function verifyFirebaseIdToken(req: any, res: any): Promise<any | null> {
   }
 }
 
-app.post('/api/auth/google', async (req, res) => {
+app.post('/api/auth/google', authIpLimiter, async (req, res) => {
   const decoded = await verifyFirebaseIdToken(req, res);
   if (!decoded) return;
   // Identity comes only from the verified token; any client-sent email/googleId is ignored.
@@ -345,6 +556,7 @@ app.post('/api/auth/google', async (req, res) => {
       user = insertRes.rows[0];
       await pool.query('INSERT INTO cart (user_id) VALUES ($1)', [user.id]);
     }
+    if (user.status === 'Suspended') return res.status(403).json(SUSPENDED_RESPONSE);
     const tokens = await generateTokens(user.id, user.email, user.role);
     delete user.password_hash;
     res.status(200).json({ ...tokens, user });
@@ -354,7 +566,7 @@ app.post('/api/auth/google', async (req, res) => {
   }
 });
 
-app.post('/api/auth/phone', async (req, res) => {
+app.post('/api/auth/phone', authIpLimiter, async (req, res) => {
   const decoded = await verifyFirebaseIdToken(req, res);
   if (!decoded) return;
   // Phone number comes only from the verified token; any client-sent phoneNumber is ignored.
@@ -380,6 +592,7 @@ app.post('/api/auth/phone', async (req, res) => {
       user = insertRes.rows[0];
       await pool.query('INSERT INTO cart (user_id) VALUES ($1)', [user.id]);
     }
+    if (user.status === 'Suspended') return res.status(403).json(SUSPENDED_RESPONSE);
     const tokens = await generateTokens(user.id, user.email || '', user.role);
     delete user.password_hash;
     res.status(200).json({ ...tokens, user });
@@ -391,14 +604,14 @@ app.post('/api/auth/phone', async (req, res) => {
 
 // Reset-email delivery is not implemented (no reset link/page exists), so no reset token is
 // issued. The response is identical for every email to avoid account enumeration.
-app.post('/api/auth/forgot-password', (req, res) => {
+app.post('/api/auth/forgot-password', authIpLimiter, (req, res) => {
   console.log('[AUTH] Password reset requested; reset email delivery is not configured.');
   res.status(200).json({ message: 'If an account exists for this email, password reset instructions will be sent.' });
 });
 
-app.post('/api/auth/reset-password', async (req, res) => {
+app.post('/api/auth/reset-password', authIpLimiter, async (req, res) => {
   const { token, newPassword } = req.body;
-  if (typeof token !== 'string' || !token || typeof newPassword !== 'string' || newPassword.length < 8) {
+  if (typeof token !== 'string' || !token || validatePassword(newPassword)) {
     return res.status(400).json({ message: 'Invalid or expired token' });
   }
   try {
@@ -416,17 +629,16 @@ app.post('/api/auth/reset-password', async (req, res) => {
 });
 
 // Change password (authenticated)
-app.post('/api/auth/update-password', authenticateToken, async (req: any, res) => {
+app.post('/api/auth/update-password', authenticateToken, passwordChangeLimiter, async (req: any, res) => {
   const userId = req.user.userId;
   const { currentPassword, newPassword } = req.body;
 
-  if (!currentPassword || !newPassword) {
+  if (typeof currentPassword !== 'string' || !currentPassword || typeof newPassword !== 'string' || !newPassword) {
     return res.status(400).json({ message: 'Current password and new password are required' });
   }
 
-  if (typeof newPassword !== 'string' || newPassword.length < 8) {
-    return res.status(400).json({ message: 'Password must be at least 8 characters' });
-  }
+  const passwordError = validatePassword(newPassword);
+  if (passwordError) return res.status(400).json({ message: passwordError });
 
   try {
     const userRes = await pool.query('SELECT password_hash, auth_provider FROM users WHERE id = $1', [userId]);
@@ -803,7 +1015,7 @@ async function createOrderTransaction(
   address: any,
   paymentMethod: string,
   paymentStatus: string,
-  razorpayData?: {orderId: string, paymentId: string, signature: string},
+  razorpayData?: {orderId: string, paymentId: string, signature: string | null},
   idempotencyKey?: string,
   contactData?: { email?: string; phone?: string; phone_number?: string },
   expectedAmountPaise?: number
@@ -812,10 +1024,15 @@ async function createOrderTransaction(
   const validated = validateCheckoutItems(items);
   if (validated.error) throw new Error(validated.error);
   items = validated.items!;
+  const validatedAddress = validateAddress(address);
+  if (validatedAddress.error) throw new Error(validatedAddress.error);
+  address = validatedAddress.address;
+  // Keys are namespaced by customer, so one customer's key can never match (or collide with) another's order.
+  idempotencyKey = typeof idempotencyKey === 'string' && idempotencyKey.length > 0 && idempotencyKey.length <= 200 ? `${userId}:${idempotencyKey}` : undefined;
 
   // Idempotency check
   if (idempotencyKey) {
-    const existing = await client.query('SELECT id, order_number FROM orders WHERE idempotency_key = $1', [idempotencyKey]);
+        const existing = await client.query('SELECT id, order_number FROM orders WHERE idempotency_key = $1', [idempotencyKey]);
     if (existing.rows.length > 0) return { duplicate: true, orderId: existing.rows[0].id, orderNumber: existing.rows[0].order_number };
   }
   // Razorpay payment_id uniqueness check
@@ -955,7 +1172,16 @@ app.post('/api/checkout/create-order', authenticateToken, async (req: any, res) 
       return res.status(500).json({ message: 'Payment gateway is not configured on this server.' });
     }
 
-    const contactError = await precheckCheckoutContact(userId, req.body.contact, req.body.address);
+    // Validate the shipping address and contact BEFORE any money moves, and keep the validated copies on the
+    // intent so the order can still be completed from the webhook/poller if the browser never comes back.
+    const validatedAddress = validateAddress(req.body.address);
+    if (validatedAddress.error) return res.status(400).json({ message: validatedAddress.error });
+    const rawContact = req.body.contact && typeof req.body.contact === 'object' ? req.body.contact : {};
+    const contact = {
+      email: typeof rawContact.email === 'string' ? rawContact.email.trim().slice(0, 254) : '',
+      phone: typeof (rawContact.phone_number ?? rawContact.phone) === 'string' ? String(rawContact.phone_number ?? rawContact.phone).trim().slice(0, 30) : '',
+    };
+    const contactError = await precheckCheckoutContact(userId, contact, validatedAddress.address);
     if (contactError) return res.status(400).json({ message: contactError });
 
     // Calculate total from DB prices (NEVER trust frontend prices)
@@ -976,8 +1202,8 @@ app.post('/api/checkout/create-order', authenticateToken, async (req: any, res) 
 
     // Bind this Razorpay order to the user, the exact items and the amount charged
     await pool.query(
-      'INSERT INTO checkout_payment_intents (razorpay_order_id, user_id, items, amount_paise) VALUES ($1, $2, $3, $4)',
-      [razorpayOrder.id, userId, JSON.stringify(items), amountInPaise]
+      'INSERT INTO checkout_payment_intents (razorpay_order_id, user_id, items, amount_paise, address, contact) VALUES ($1, $2, $3, $4, $5, $6)',
+      [razorpayOrder.id, userId, JSON.stringify(items), amountInPaise, JSON.stringify(validatedAddress.address), JSON.stringify(contact)]
     );
 
     res.status(200).json({
@@ -989,13 +1215,167 @@ app.post('/api/checkout/create-order', authenticateToken, async (req: any, res) 
     });
   } catch (error: any) {
     console.error('Razorpay order creation failed:', error);
-    res.status(500).json({ message: error.message || 'Failed to create payment order' });
+    res.status(500).json({ message: 'Failed to create payment order. Please try again.' });
   }
 });
 
-function paymentIssueMessage(paymentId: string, reason?: string) {
-  return `We received your payment (ID ${paymentId}) but could not confirm your order${reason ? `: ${reason}` : '.'} ` +
-    'Our team has been notified and will refund it. Please contact support with this payment ID.';
+// ---------------------------------------------------------------------------------------------------
+// PAYMENT RECONCILIATION
+//
+// A Razorpay payment can be captured while our order creation never happens or fails (browser closed,
+// network drop, stock sold out, price changed). Three independent paths therefore finish a payment, and all
+// of them go through finalizePaidIntent(), which serializes on the locked checkout_payment_intents row:
+//   1. the customer's browser calling /api/checkout/verify-payment (signature verified),
+//   2. Razorpay's server-to-server webhook (payment.captured / order.paid, HMAC-verified),
+//   3. a poller that asks Razorpay about intents that stayed CREATED (covers a missed/misconfigured webhook).
+// If a genuine payment can never become an order, it is flagged FAILED, admins are alerted once, and the
+// money is refunded automatically (retried by the poller; manual refund is the last resort).
+// ---------------------------------------------------------------------------------------------------
+const MAX_REFUND_ATTEMPTS = 5;
+
+function paymentIssueMessage(paymentId: string, reason?: string, refund: 'REFUNDED' | 'PENDING' | 'NONE' = 'PENDING') {
+  const refundText = refund === 'REFUNDED'
+    ? 'A full refund has been issued to your original payment method.'
+    : 'A full refund is being processed automatically; if you do not see it within a few days, contact support with this payment ID.';
+  return `We received your payment (ID ${paymentId}) but could not confirm your order${reason ? `: ${reason}` : '.'} ${refundText}`;
+}
+
+async function notifyAdmins(type: string, title: string, message: string, referenceId: string, referenceType: string) {
+  await pool.query(
+    'INSERT INTO admin_notifications (type, title, message, reference_id, reference_type) VALUES ($1, $2, $3, $4, $5)',
+    [type, title, message, referenceId, referenceType]
+  ).catch((e: any) => console.error('[PAYMENT] Failed to create admin notification:', e.message));
+}
+
+// CREATED -> FAILED, exactly once. Only the caller that flips the state raises the alert.
+async function flagPaymentFailure(razorpayOrderId: string, paymentId: string, reason: string): Promise<boolean> {
+  const mark = await pool.query(
+    "UPDATE checkout_payment_intents SET status = 'FAILED', razorpay_payment_id = $1, failure_reason = $2, updated_at = CURRENT_TIMESTAMP WHERE razorpay_order_id = $3 AND status = 'CREATED'",
+    [paymentId, reason, razorpayOrderId]
+  );
+  if (mark.rowCount !== 1) return false;
+  await notifyAdmins('PAYMENT_ISSUE', 'Payment received but order failed',
+    `Payment ${paymentId} (Razorpay order ${razorpayOrderId}) was received but the order could not be created: ${reason}. An automatic refund is being attempted.`,
+    razorpayOrderId, 'PAYMENT');
+  console.error(`[PAYMENT] ORDER FAILED AFTER PAYMENT: payment ${paymentId} / order ${razorpayOrderId}: ${reason}`);
+  return true;
+}
+
+async function refundFailedIntent(razorpayOrderId: string): Promise<'REFUNDED' | 'PENDING' | 'NONE'> {
+  if (!razorpay) return 'NONE';
+  // Claim the refund so two workers never refund the same payment (a stale claim from a crash can be retaken).
+  const claim = await pool.query(
+    `UPDATE checkout_payment_intents SET refund_status = 'PENDING', refund_attempts = refund_attempts + 1, updated_at = CURRENT_TIMESTAMP
+     WHERE razorpay_order_id = $1 AND status = 'FAILED' AND refund_id IS NULL AND refund_attempts < $2
+       AND (refund_status IS DISTINCT FROM 'PENDING' OR updated_at < CURRENT_TIMESTAMP - INTERVAL '10 minutes')
+     RETURNING razorpay_payment_id, amount_paise, refund_attempts`,
+    [razorpayOrderId, MAX_REFUND_ATTEMPTS]
+  );
+  if (claim.rows.length === 0) return 'NONE';
+  const { razorpay_payment_id: paymentId, amount_paise: amountPaise, refund_attempts: attempt } = claim.rows[0];
+  try {
+    const refund = await razorpay.payments.refund(paymentId, {
+      amount: amountPaise, speed: 'normal',
+      notes: { reason: 'Order could not be created after payment', razorpay_order_id: razorpayOrderId },
+    });
+    await pool.query(
+      "UPDATE checkout_payment_intents SET status = 'REFUNDED', refund_status = 'DONE', refund_id = $1, updated_at = CURRENT_TIMESTAMP WHERE razorpay_order_id = $2",
+      [refund.id, razorpayOrderId]
+    );
+    await notifyAdmins('PAYMENT_ISSUE', 'Automatic refund issued',
+      `Payment ${paymentId} (Razorpay order ${razorpayOrderId}) was refunded in full (${refund.id}) because its order could not be created.`, razorpayOrderId, 'PAYMENT');
+    return 'REFUNDED';
+  } catch (e: any) {
+    const detail = String(e?.error?.description || e?.message || 'unknown error').slice(0, 300);
+    await pool.query("UPDATE checkout_payment_intents SET refund_status = 'ERROR', updated_at = CURRENT_TIMESTAMP WHERE razorpay_order_id = $1", [razorpayOrderId]);
+    console.error(`[PAYMENT] Auto-refund attempt ${attempt} failed for ${paymentId}: ${detail}`);
+    if (attempt === 1 || attempt >= MAX_REFUND_ATTEMPTS) {
+      await notifyAdmins('PAYMENT_ISSUE', attempt >= MAX_REFUND_ATTEMPTS ? 'MANUAL REFUND REQUIRED' : 'Automatic refund failed - will retry',
+        `Payment ${paymentId} (Razorpay order ${razorpayOrderId}) could not be refunded automatically (attempt ${attempt}): ${detail}${attempt >= MAX_REFUND_ATTEMPTS ? '. Refund it manually in the Razorpay dashboard.' : ''}`,
+        razorpayOrderId, 'PAYMENT');
+    }
+    return 'PENDING';
+  }
+}
+
+type FinalizeOutcome =
+  | { kind: 'created'; result: any }
+  | { kind: 'existing'; orderId: number | null; orderNumber: string | null }
+  | { kind: 'failed'; reason: string; refund: 'REFUNDED' | 'PENDING' | 'NONE' }
+  | { kind: 'not_found' }
+  | { kind: 'rejected'; message: string };
+
+async function existingOrderOutcome(orderId: number | null, userId: number): Promise<FinalizeOutcome> {
+  const existing = orderId ? (await pool.query('SELECT id, order_number FROM orders WHERE id = $1 AND user_id = $2', [orderId, userId])).rows[0] : undefined;
+  return { kind: 'existing', orderId: existing?.id ?? null, orderNumber: existing?.order_number ?? null };
+}
+
+// Completes (or fails) the order for one Razorpay order. Safe to call any number of times, concurrently,
+// from any of the three paths. `userId` is only passed by the customer-facing path (ownership check).
+async function finalizePaidIntent(p: { razorpayOrderId: string; paymentId: string; signature: string | null; userId?: number; clientAddress?: any; clientContact?: any }): Promise<FinalizeOutcome> {
+  const client = await pool.connect();
+  let counted = false;      // true once this is a verified, owned, not-yet-used payment for a CREATED intent
+  let intentUserId = 0;
+  try {
+    await client.query('BEGIN');
+    const intentRes = p.userId !== undefined
+      ? await client.query('SELECT * FROM checkout_payment_intents WHERE razorpay_order_id = $1 AND user_id = $2 FOR UPDATE', [p.razorpayOrderId, p.userId])
+      : await client.query('SELECT * FROM checkout_payment_intents WHERE razorpay_order_id = $1 FOR UPDATE', [p.razorpayOrderId]);
+    if (intentRes.rows.length === 0) { await client.query('ROLLBACK'); return { kind: 'not_found' }; }
+    const intent = intentRes.rows[0];
+    intentUserId = intent.user_id;
+
+    if (intent.status === 'COMPLETED') { await client.query('ROLLBACK'); return existingOrderOutcome(intent.order_id, intent.user_id); }
+    if (intent.status === 'FAILED' || intent.status === 'REFUNDED') {
+      await client.query('ROLLBACK');
+      // A flagged payment never becomes an order afterwards (it is being / has been refunded).
+      return { kind: 'failed', reason: intent.failure_reason || 'Order could not be confirmed', refund: intent.status === 'REFUNDED' ? 'REFUNDED' : 'PENDING' };
+    }
+    // A payment id already attached to an order is a replay, not a new payment to refund.
+    const used = await client.query('SELECT 1 FROM payments WHERE razorpay_payment_id = $1', [p.paymentId]);
+    if (used.rows.length > 0) { await client.query('ROLLBACK'); return { kind: 'rejected', message: 'This payment has already been processed.' }; }
+
+    counted = true;
+    const items = typeof intent.items === 'string' ? JSON.parse(intent.items) : intent.items;
+    // Prefer what was validated and stored when the payment was created; fall back to the browser's copy only
+    // for intents created before addresses were stored.
+    const address = intent.address ?? p.clientAddress;
+    const contact = intent.contact ?? p.clientContact;
+    const result = await createOrderTransaction(client, intent.user_id, items, address, 'RAZORPAY', 'PAID',
+      { orderId: p.razorpayOrderId, paymentId: p.paymentId, signature: p.signature }, undefined, contact, intent.amount_paise);
+    await client.query(
+      "UPDATE checkout_payment_intents SET status = 'COMPLETED', order_id = $1, razorpay_payment_id = $2, updated_at = CURRENT_TIMESTAMP WHERE razorpay_order_id = $3",
+      [result.orderId, p.paymentId, p.razorpayOrderId]
+    );
+    await client.query('COMMIT');
+
+    // Fire-and-forget notifications (outside the transaction)
+    const customer = (await pool.query('SELECT name, email, phone_number FROM users WHERE id = $1', [intent.user_id])).rows[0];
+    if (customer) {
+      sendOrderConfirmationEmail({ ...result.order, payment_method: 'RAZORPAY' }, customer, result.orderItems!);
+      sendAdminOrderNotification({ ...result.order, payment_method: 'RAZORPAY' }, customer);
+      if (customer.phone_number) logSmsNotification(customer.phone_number, `INFAMOUS: Your order #${result.orderNumber} has been placed. Total: ₹${result.totalAmount}. We'll keep you updated!`);
+    }
+    return { kind: 'created', result };
+  } catch (error: any) {
+    await client.query('ROLLBACK').catch(() => {});
+    // Not a refund-worthy situation: unknown payment state, or a transient database/driver error. Surface it so
+    // the caller can retry (Razorpay redelivers webhooks; the poller and the customer can retry too).
+    if (!counted || (error && typeof error.code === 'string')) throw error;
+    // Business failure for a genuine paid intent (stock sold out, price changed, contact conflict, invalid address...)
+    const reason = publicErrorMessage(error, 'Order could not be created').slice(0, 500);
+    const flipped = await flagPaymentFailure(p.razorpayOrderId, p.paymentId, reason);
+    if (!flipped) {
+      // Another worker resolved this intent while we were failing: report its result instead of ours.
+      const current = (await pool.query('SELECT status, order_id, failure_reason FROM checkout_payment_intents WHERE razorpay_order_id = $1', [p.razorpayOrderId])).rows[0];
+      if (current?.status === 'COMPLETED') return existingOrderOutcome(current.order_id, intentUserId);
+      return { kind: 'failed', reason: current?.failure_reason || reason, refund: current?.status === 'REFUNDED' ? 'REFUNDED' : 'PENDING' };
+    }
+    const refund = await refundFailedIntent(p.razorpayOrderId).catch((e: any) => { console.error('[PAYMENT] refund error:', e.message); return 'PENDING' as const; });
+    return { kind: 'failed', reason, refund: refund === 'NONE' ? 'PENDING' : refund };
+  } finally {
+    client.release();
+  }
 }
 
 // Step 2: Verify Razorpay payment + create order
@@ -1008,102 +1388,171 @@ app.post('/api/checkout/verify-payment', authenticateToken, async (req: any, res
     return res.status(400).json({ success: false, message: 'Payment verification failed. Invalid signature.' });
   }
 
+  try {
+    const outcome = await finalizePaidIntent({ razorpayOrderId: razorpay_order_id, paymentId: razorpay_payment_id, signature: razorpay_signature, userId, clientAddress: address, clientContact: contact });
+    switch (outcome.kind) {
+      case 'created': {
+        const r = outcome.result;
+        return res.status(200).json({ success: true, message: 'Payment verified & order created', orderId: r.orderId, orderNumber: r.orderNumber, totalAmount: r.totalAmount, finalEmail: r.finalEmail, finalPhone: r.finalPhone });
+      }
+      case 'existing':
+        return res.status(200).json({ success: true, message: 'Order already exists', orderId: outcome.orderId, orderNumber: outcome.orderNumber });
+      case 'failed':
+        return res.status(409).json({ success: false, paymentReceived: true, refund: outcome.refund, message: paymentIssueMessage(razorpay_payment_id, outcome.reason, outcome.refund) });
+      case 'rejected':
+        return res.status(400).json({ success: false, message: outcome.message });
+      default:
+        return res.status(400).json({ success: false, message: 'Payment order not found for this account.' });
+    }
+  } catch (error: any) {
+    console.error('Payment verification failed:', error.message);
+    // Transient failure: nothing was recorded as failed, the same call (or the webhook/poller) can complete it.
+    return res.status(500).json({ success: false, message: 'We could not confirm your order just now. Your payment is safe; please retry in a moment or check your orders.' });
+  }
+});
+
+// Exchange logistics/price-difference fee paid but the browser never called verify-fee-payment.
+async function reconcileExchangeFeePayment(razorpayOrderId: string, paymentId: string, amountPaise: number): Promise<boolean> {
   const client = await pool.connect();
-  let ownedIntent = false;
   try {
     await client.query('BEGIN');
-    // Lock the intent; it must belong to this user. Serializes concurrent/replayed verifications.
-    const intentRes = await client.query(
-      'SELECT * FROM checkout_payment_intents WHERE razorpay_order_id = $1 AND user_id = $2 FOR UPDATE',
-      [razorpay_order_id, userId]
-    );
-    if (intentRes.rows.length === 0) throw new Error('Payment order not found for this account.');
-    const intent = intentRes.rows[0];
-    if (intent.status === 'FAILED') {
-      // Payment already flagged for manual refund: never create an order afterwards
+    const exRes = await client.query('SELECT id, status, price_difference, logistics_fee FROM product_exchanges WHERE razorpay_order_id = $1 FOR UPDATE', [razorpayOrderId]);
+    if (exRes.rows.length === 0) { await client.query('ROLLBACK'); return false; }
+    const ex = exRes.rows[0];
+    if (ex.status !== 'AWAITING_PAYMENT') { await client.query('ROLLBACK'); return true; }   // already handled
+    const duePaise = Math.round((Math.max(0, parseFloat(ex.price_difference)) + parseFloat(ex.logistics_fee)) * 100);
+    const reused = await client.query('SELECT 1 FROM product_exchanges WHERE razorpay_payment_id = $1 UNION ALL SELECT 1 FROM payments WHERE razorpay_payment_id = $1', [paymentId]);
+    if (amountPaise !== duePaise || reused.rows.length > 0) {
       await client.query('ROLLBACK');
-      return res.status(409).json({ success: false, paymentReceived: true, message: paymentIssueMessage(intent.razorpay_payment_id || razorpay_payment_id) });
+      await notifyAdmins('PAYMENT_ISSUE', 'Exchange fee payment needs review',
+        `Payment ${paymentId} for exchange #${ex.id} could not be applied automatically (amount ${amountPaise} paise vs due ${duePaise}, or payment id reused).`, String(ex.id), 'EXCHANGE');
+      return true;
     }
-    // A payment id already attached to another order is a replay, not a new payment to refund
-    const usedRes = await client.query('SELECT 1 FROM payments WHERE razorpay_payment_id = $1', [razorpay_payment_id]);
-    if (usedRes.rows.length > 0 && intent.status !== 'COMPLETED') throw new Error('This payment has already been processed.');
-    ownedIntent = true;
-    if (intent.status === 'COMPLETED') {
-      await client.query('ROLLBACK');
-      const existing = await pool.query('SELECT id, order_number FROM orders WHERE id = $1 AND user_id = $2', [intent.order_id, userId]);
-      return res.status(200).json({ success: true, message: 'Order already exists', orderId: existing.rows[0]?.id, orderNumber: existing.rows[0]?.order_number });
-    }
-    const intentItems = typeof intent.items === 'string' ? JSON.parse(intent.items) : intent.items;
-
-    // The locked intent row is the idempotency guarantee here (one order per Razorpay order). The
-    // client idempotency key is deliberately NOT used: matching an unrelated existing order would
-    // mark this paid intent COMPLETED without creating its order.
-    const result = await createOrderTransaction(client, userId, intentItems, address, 'RAZORPAY', 'PAID', { orderId: razorpay_order_id, paymentId: razorpay_payment_id, signature: razorpay_signature }, undefined, contact, intent.amount_paise);
-    await client.query(
-      "UPDATE checkout_payment_intents SET status = 'COMPLETED', order_id = $1 WHERE razorpay_order_id = $2",
-      [result.orderId, razorpay_order_id]
-    );
+    await client.query("UPDATE product_exchanges SET status = 'PAYMENT_CONFIRMED', razorpay_payment_id = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 AND status = 'AWAITING_PAYMENT'", [paymentId, ex.id]);
     await client.query('COMMIT');
-
-    if (result.duplicate) {
-      return res.status(200).json({ success: true, message: 'Order already exists', orderId: result.orderId, orderNumber: result.orderNumber });
-    }
-
-    // Fire-and-forget notifications (outside transaction)
-    const customerRes = await pool.query('SELECT name, email, phone_number FROM users WHERE id = $1', [userId]);
-    const customer = customerRes.rows[0];
-    if (customer) {
-      sendOrderConfirmationEmail({ ...result.order, payment_method: 'RAZORPAY' }, customer, result.orderItems!);
-      sendAdminOrderNotification({ ...result.order, payment_method: 'RAZORPAY' }, customer);
-      if (customer.phone_number) logSmsNotification(customer.phone_number, `INFAMOUS: Your order #${result.orderNumber} has been placed. Total: ₹${result.totalAmount}. We'll keep you updated!`);
-    }
-
-    res.status(200).json({ success: true, message: 'Payment verified & order created', orderId: result.orderId, orderNumber: result.orderNumber, totalAmount: result.totalAmount, finalEmail: result.finalEmail, finalPhone: result.finalPhone });
-  } catch (error: any) {
-    await client.query('ROLLBACK');
-    console.error('Payment verification transaction failed:', error.message);
-    if (!ownedIntent) {
-      return res.status(400).json({ success: false, message: error.message || 'Order creation failed.' });
-    }
-    // A signature-verified payment for this user's own checkout was taken but the order could not be
-    // created. Record it durably and alert admins so it is refunded; never drop it silently.
-    const reason = String(error.message || 'Order creation failed').slice(0, 500);
-    // This UPDATE waits on any concurrent verification still holding the intent lock, so it sees the
-    // final state. Only the request that actually flips CREATED -> FAILED raises the refund alert.
-    let markedFailed = true;
-    try {
-      const mark = await pool.query(
-        "UPDATE checkout_payment_intents SET status = 'FAILED', razorpay_payment_id = $1, failure_reason = $2 WHERE razorpay_order_id = $3 AND user_id = $4 AND status = 'CREATED'",
-        [razorpay_payment_id, reason, razorpay_order_id, userId]
-      );
-      markedFailed = mark.rowCount === 1;
-    } catch (e: any) {
-      console.error('[PAYMENT] Failed to record payment failure:', e.message); // still alert below: never lose it
-    }
-    if (!markedFailed) {
-      // Another verification of this payment already resolved the intent
-      const current = (await pool.query(
-        'SELECT status, order_id, razorpay_payment_id FROM checkout_payment_intents WHERE razorpay_order_id = $1 AND user_id = $2',
-        [razorpay_order_id, userId]
-      )).rows[0];
-      if (current?.status === 'COMPLETED') {
-        const existing = await pool.query('SELECT id, order_number FROM orders WHERE id = $1 AND user_id = $2', [current.order_id, userId]);
-        return res.status(200).json({ success: true, message: 'Order already exists', orderId: existing.rows[0]?.id, orderNumber: existing.rows[0]?.order_number });
-      }
-      return res.status(409).json({ success: false, paymentReceived: true, message: paymentIssueMessage(current?.razorpay_payment_id || razorpay_payment_id) });
-    }
-    await pool.query(
-      'INSERT INTO admin_notifications (type, title, message, reference_id, reference_type) VALUES ($1, $2, $3, $4, $5)',
-      ['PAYMENT_ISSUE', 'Payment received but order failed - refund required',
-        `Payment ${razorpay_payment_id} (Razorpay order ${razorpay_order_id}) was received but the order failed: ${reason}`,
-        razorpay_order_id, 'PAYMENT']
-    ).catch((e: any) => console.error('[PAYMENT] Failed to create payment-issue notification:', e.message));
-    console.error(`[PAYMENT] REFUND REQUIRED: payment ${razorpay_payment_id} / order ${razorpay_order_id}: ${reason}`);
-    return res.status(409).json({ success: false, paymentReceived: true, message: paymentIssueMessage(razorpay_payment_id, reason) });
+    return true;
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw e;
   } finally {
     client.release();
   }
+}
+
+// Razorpay -> server webhook. Configure in the Razorpay dashboard (Settings > Webhooks) with events
+// payment.captured and order.paid, and set RAZORPAY_WEBHOOK_SECRET to the secret chosen there.
+app.post('/api/webhooks/razorpay', async (req: any, res) => {
+  const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
+  if (!secret) {
+    console.error('[WEBHOOK] RAZORPAY_WEBHOOK_SECRET is not configured; refusing webhook.');
+    return res.status(503).json({ message: 'Webhook not configured' });
+  }
+  const signature = req.headers['x-razorpay-signature'];
+  const raw: Buffer | undefined = req.rawBody;
+  if (typeof signature !== 'string' || !raw) return res.status(400).json({ message: 'Invalid webhook request' });
+  const expected = crypto.createHmac('sha256', secret).update(raw).digest('hex');
+  if (expected.length !== signature.length || !crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature))) {
+    return res.status(400).json({ message: 'Invalid signature' });
+  }
+
+  const event = req.body?.event;
+  const payment = req.body?.payload?.payment?.entity;
+  if (!['payment.captured', 'order.paid'].includes(event) || !payment?.id || !payment?.order_id || payment.status !== 'captured') {
+    return res.status(200).json({ ignored: true });
+  }
+  try {
+    const intent = (await pool.query('SELECT amount_paise FROM checkout_payment_intents WHERE razorpay_order_id = $1', [payment.order_id])).rows[0];
+    if (intent) {
+      if (Number(payment.amount) !== Number(intent.amount_paise)) {
+        // Never build an order from a payment that does not match what we asked Razorpay to charge.
+        await notifyAdmins('PAYMENT_ISSUE', 'Payment amount mismatch',
+          `Payment ${payment.id} (Razorpay order ${payment.order_id}) captured ${payment.amount} paise but ${intent.amount_paise} were expected. No order was created; review in the Razorpay dashboard.`, payment.order_id, 'PAYMENT');
+        return res.status(200).json({ status: 'amount_mismatch' });
+      }
+      const outcome = await finalizePaidIntent({ razorpayOrderId: payment.order_id, paymentId: payment.id, signature: null });
+      console.log(`[WEBHOOK] ${event} ${payment.id}: ${outcome.kind}`);
+      return res.status(200).json({ status: outcome.kind });
+    }
+    const handled = await reconcileExchangeFeePayment(payment.order_id, payment.id, Number(payment.amount));
+    return res.status(200).json({ status: handled ? 'exchange_fee' : 'unknown_order' });
+  } catch (e: any) {
+    console.error('[WEBHOOK] processing failed (Razorpay will retry):', e.message);
+    return res.status(500).json({ message: 'Processing failed' });
+  }
 });
+
+// Cancelled orders whose payment still has to be refunded (set by the admin cancellation flow below).
+async function refundOrderPayment(orderId: number): Promise<'REFUNDED' | 'PENDING' | 'NONE'> {
+  if (!razorpay) return 'NONE';
+  const claim = await pool.query(
+    `UPDATE payments SET status = 'REFUND_PROCESSING', updated_at = CURRENT_TIMESTAMP
+     WHERE order_id = $1 AND razorpay_payment_id IS NOT NULL AND razorpay_refund_id IS NULL
+       AND (status = 'REFUND_PENDING' OR (status = 'REFUND_PROCESSING' AND updated_at < CURRENT_TIMESTAMP - INTERVAL '10 minutes'))
+     RETURNING razorpay_payment_id, amount`,
+    [orderId]
+  );
+  if (claim.rows.length === 0) return 'NONE';
+  const { razorpay_payment_id: paymentId, amount } = claim.rows[0];
+  try {
+    const refund = await razorpay.payments.refund(paymentId, {
+      amount: Math.round(parseFloat(amount) * 100), speed: 'normal', notes: { reason: 'Order cancelled', order_id: String(orderId) },
+    });
+    await pool.query("UPDATE payments SET status = 'REFUNDED', razorpay_refund_id = $1, updated_at = CURRENT_TIMESTAMP WHERE order_id = $2", [refund.id, orderId]);
+    return 'REFUNDED';
+  } catch (e: any) {
+    const detail = String(e?.error?.description || e?.message || 'unknown error').slice(0, 300);
+    await pool.query("UPDATE payments SET status = 'REFUND_PENDING', updated_at = CURRENT_TIMESTAMP WHERE order_id = $1 AND status = 'REFUND_PROCESSING'", [orderId]);
+    console.error(`[PAYMENT] Refund for cancelled order ${orderId} failed: ${detail}`);
+    await notifyAdmins('PAYMENT_ISSUE', 'Refund for cancelled order failed',
+      `Order #${orderId}: the Razorpay refund for payment ${paymentId} failed (${detail}). It will be retried automatically; if it keeps failing, refund it in the Razorpay dashboard.`, String(orderId), 'ORDER');
+    return 'PENDING';
+  }
+}
+
+let paymentReconcilerRunning = false;
+async function reconcilePayments(): Promise<{ checked: number; completed: number; failed: number; refunds: number }> {
+  const summary = { checked: 0, completed: 0, failed: 0, refunds: 0 };
+  if (!razorpay || paymentReconcilerRunning) return summary;
+  paymentReconcilerRunning = true;
+  try {
+    // 1. Paid but never confirmed: intents still CREATED a few minutes after creation.
+    const pending = await pool.query(
+      `SELECT razorpay_order_id, amount_paise FROM checkout_payment_intents
+       WHERE status = 'CREATED' AND created_at < CURRENT_TIMESTAMP - INTERVAL '3 minutes' AND created_at > CURRENT_TIMESTAMP - INTERVAL '3 days'
+         AND (last_checked_at IS NULL OR last_checked_at < CURRENT_TIMESTAMP - INTERVAL '10 minutes')
+       ORDER BY created_at LIMIT 25`
+    );
+    for (const row of pending.rows) {
+      await pool.query('UPDATE checkout_payment_intents SET last_checked_at = CURRENT_TIMESTAMP WHERE razorpay_order_id = $1', [row.razorpay_order_id]);
+      summary.checked++;
+      try {
+        const list = await razorpay.orders.fetchPayments(row.razorpay_order_id);
+        const captured = (list?.items || []).find((pay: any) => pay.status === 'captured' && Number(pay.amount) === Number(row.amount_paise));
+        if (!captured) continue;
+        const outcome = await finalizePaidIntent({ razorpayOrderId: row.razorpay_order_id, paymentId: captured.id, signature: null });
+        if (outcome.kind === 'created') summary.completed++;
+        else if (outcome.kind === 'failed') summary.failed++;
+      } catch (e: any) {
+        console.error(`[RECONCILE] ${row.razorpay_order_id}: ${e.message}`);
+      }
+    }
+    // 2. Refunds that did not go through the first time.
+    const failedIntents = await pool.query(
+      `SELECT razorpay_order_id FROM checkout_payment_intents
+       WHERE status = 'FAILED' AND refund_id IS NULL AND refund_attempts < $1
+         AND (refund_status IS NULL OR refund_status = 'ERROR' OR updated_at < CURRENT_TIMESTAMP - INTERVAL '10 minutes')
+         AND updated_at < CURRENT_TIMESTAMP - INTERVAL '2 minutes' LIMIT 25`, [MAX_REFUND_ATTEMPTS]);
+    for (const row of failedIntents.rows) if ((await refundFailedIntent(row.razorpay_order_id).catch(() => 'PENDING')) === 'REFUNDED') summary.refunds++;
+    const cancelled = await pool.query("SELECT order_id FROM payments WHERE status IN ('REFUND_PENDING', 'REFUND_PROCESSING') AND updated_at < CURRENT_TIMESTAMP - INTERVAL '2 minutes' LIMIT 25");
+    for (const row of cancelled.rows) if ((await refundOrderPayment(row.order_id).catch(() => 'PENDING')) === 'REFUNDED') summary.refunds++;
+  } finally {
+    paymentReconcilerRunning = false;
+  }
+  return summary;
+}
+if (process.env.VERCEL !== '1' && process.env.DISABLE_PAYMENT_RECONCILER !== '1') {
+  setInterval(() => { reconcilePayments().catch((e: any) => console.error('[RECONCILE] run failed:', e.message)); }, 5 * 60 * 1000).unref();
+}
 
 // COD checkout
 app.post('/api/checkout/cod', authenticateToken, async (req: any, res) => {
@@ -1133,7 +1582,8 @@ app.post('/api/checkout/cod', authenticateToken, async (req: any, res) => {
   } catch (error: any) {
     await client.query('ROLLBACK');
     console.error('COD checkout failed:', error.message);
-    res.status(400).json({ success: false, message: error.message || 'Checkout failed.' });
+    // Our own validation messages are shown as-is; database errors are replaced with a generic message.
+    res.status(error && typeof error.code === 'string' ? 500 : 400).json({ success: false, message: publicErrorMessage(error, 'We could not place your order. Please try again.') });
   } finally {
     client.release();
   }
@@ -1190,16 +1640,7 @@ const verifyAdmin = (req: any, res: any, next: any) => {
   authenticateToken(req, res, () => {
     if (req.user.role !== 'ADMIN' && req.user.role !== 'SUPER_ADMIN') {
       console.warn(`[AUTH] Admin access denied for user ${req.user.userId}. Role '${req.user.role}' is not ADMIN or SUPER_ADMIN.`);
-      return res.status(403).json({ 
-        message: 'Admin access required',
-        debug: {
-          reason: 'role_mismatch',
-          userId: req.user.userId,
-          email: req.user.email,
-          role: req.user.role,
-          expectedRoles: ['ADMIN', 'SUPER_ADMIN']
-        }
-      });
+      return res.status(403).json({ message: 'Admin access required' });
     }
     next();
   });
@@ -1607,7 +2048,10 @@ app.get('/api/admin/products/:id', verifyAdmin, async (req, res) => {
 
 app.post('/api/admin/products', verifyAdmin, async (req, res) => {
   console.log('[ADMIN_PRODUCT_CREATE] START');
-  const { name, slug, short_description, description, category_id, brand, status, seo_title, seo_description, variants, media } = req.body;
+  const { name, slug, short_description, description, category_id, brand, status, seo_title, seo_description, media } = req.body;
+  const validation = validateProductPayload(req.body);
+  if (validation.error) return res.status(400).json({ message: validation.error });
+  const variants = validation.variants;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -1687,15 +2131,9 @@ app.post('/api/admin/products', verifyAdmin, async (req, res) => {
       return res.status(400).json({ message: 'Invalid category selected.' });
     }
 
-    res.status(500).json({ 
-      message: 'Internal server error',
-      debug: {
-        errorMsg: error.message,
-        code: error.code,
-        detail: error.detail,
-        constraint: error.constraint
-      }
-    });
+    // Details stay in the server log above; the response never carries database internals.
+    if (error.code === '23505') return res.status(409).json({ message: 'A product or SKU with the same slug/SKU already exists.' });
+    res.status(500).json({ message: 'Internal server error' });
   } finally {
     client.release();
   }
@@ -1703,7 +2141,11 @@ app.post('/api/admin/products', verifyAdmin, async (req, res) => {
 
 app.put('/api/admin/products/:id', verifyAdmin, async (req, res) => {
   const { id } = req.params;
-  const { name, slug, short_description, description, category_id, brand, status, seo_title, seo_description, variants, media } = req.body;
+  if (parsePositiveInt(id) === null) return res.status(400).json({ message: 'Invalid product id' });
+  const { name, slug, short_description, description, category_id, brand, status, seo_title, seo_description, media } = req.body;
+  const validation = validateProductPayload(req.body);
+  if (validation.error) return res.status(400).json({ message: validation.error });
+  const variants = validation.variants;
   const client = await pool.connect();
   
   try {
@@ -1873,7 +2315,7 @@ app.delete('/api/admin/products/:id', verifyAdmin, async (req, res) => {
   }
 });
 
-app.post('/api/admin/upload', verifyAdmin, upload.single('file'), async (req, res) => {
+app.post('/api/admin/upload', verifyAdmin, uploadSingleFile, async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message: 'No file provided' });
     const file = req.file as any;
@@ -1956,9 +2398,15 @@ app.put('/api/admin/customers/:id/status', verifyAdmin, async (req, res) => {
   if (!['Active', 'Suspended'].includes(status)) {
     return res.status(400).json({ message: 'Invalid status' });
   }
+  const customerId = parsePositiveInt(id);
+  if (customerId === null) return res.status(400).json({ message: 'Invalid customer id' });
   try {
-    const result = await pool.query('UPDATE users SET status = $1 WHERE id = $2 RETURNING id, status', [status, id]);
+    // Customers only: this endpoint must never be able to lock an admin out.
+    const result = await pool.query("UPDATE users SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 AND role = 'USER' RETURNING id, status", [status, customerId]);
     if (result.rowCount === 0) return res.status(404).json({ message: 'Customer not found' });
+    // Take effect immediately: drop the cached state and revoke every refresh session.
+    invalidateAccountCache(customerId);
+    if (status === 'Suspended') await pool.query('DELETE FROM sessions WHERE user_id = $1', [customerId]);
     res.status(200).json({ message: 'Status updated', customer: result.rows[0] });
   } catch (error) {
     console.error(error);
@@ -2108,19 +2556,97 @@ app.get('/api/admin/orders/:id', verifyAdmin, async (req, res) => {
   }
 });
 
-app.put('/api/admin/orders/:id/status', verifyAdmin, async (req, res) => {
-  const { id } = req.params;
-  const { status, trackingNumber, deliveryNotes } = req.body;
+// Order lifecycle. Forward-only (an order cannot be moved back, e.g. out of DELIVERED); CANCELLED is only
+// possible before the order ships, and it restocks the items and refunds an online payment (see below).
+const ORDER_FLOW = ['PENDING', 'CONFIRMED', 'PACKED', 'SHIPPED', 'OUT_FOR_DELIVERY', 'DELIVERED'];
+const CANCELLABLE_ORDER_STATUSES = ['PENDING', 'CONFIRMED', 'PACKED'];
+
+app.put('/api/admin/orders/:id/status', verifyAdmin, async (req: any, res) => {
+  const orderId = parsePositiveInt(req.params.id);
+  if (orderId === null) return res.status(400).json({ message: 'Invalid order id' });
+  const { status, trackingNumber, deliveryNotes } = req.body || {};
+  if (typeof status !== 'string' || ![...ORDER_FLOW, 'CANCELLED'].includes(status)) {
+    return res.status(400).json({ message: `Invalid status. Must be one of: ${[...ORDER_FLOW, 'CANCELLED'].join(', ')}` });
+  }
+  if (trackingNumber != null && (typeof trackingNumber !== 'string' || trackingNumber.length > 100)) return res.status(400).json({ message: 'Tracking number must be text of at most 100 characters' });
+  if (deliveryNotes != null && (typeof deliveryNotes !== 'string' || deliveryNotes.length > 1000)) return res.status(400).json({ message: 'Notes must be text of at most 1000 characters' });
+  const tracking = typeof trackingNumber === 'string' ? trackingNumber.trim() || null : null;
+  const notes = typeof deliveryNotes === 'string' ? deliveryNotes.trim() || null : null;
+
+  const client = await pool.connect();
+  let refundNeeded = false;
   try {
-    const result = await pool.query(
+    await client.query('BEGIN');
+    // Lock the order so concurrent updates/cancellations are serialized (stock is restored exactly once).
+    const orderRes = await client.query('SELECT id, status FROM orders WHERE id = $1 FOR UPDATE', [orderId]);
+    if (orderRes.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Order not found' }); }
+    const current: string = orderRes.rows[0].status;
+
+    if (current === status) { await client.query('ROLLBACK'); return res.status(400).json({ message: `Order is already ${status}` }); }
+    if (current === 'CANCELLED') { await client.query('ROLLBACK'); return res.status(409).json({ message: 'A cancelled order cannot be changed.' }); }
+    if (status === 'CANCELLED') {
+      if (!CANCELLABLE_ORDER_STATUSES.includes(current)) { await client.query('ROLLBACK'); return res.status(409).json({ message: `An order that is ${current} can no longer be cancelled. Use a return instead.` }); }
+    } else if (ORDER_FLOW.indexOf(status) <= ORDER_FLOW.indexOf(current)) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ message: `Cannot move an order from ${current} back to ${status}.` });
+    }
+
+    if (status === 'CANCELLED') {
+      // Put the stock back, once, in a stable lock order.
+      const items = await client.query('SELECT variant_id, quantity FROM order_items WHERE order_id = $1 AND variant_id IS NOT NULL ORDER BY variant_id', [orderId]);
+      for (const it of items.rows) {
+        await client.query('UPDATE product_variants SET stock = stock + $1 WHERE id = $2', [it.quantity, it.variant_id]);
+        await client.query('INSERT INTO inventory_transactions (variant_id, quantity_change, reason) VALUES ($1, $2, $3)', [it.variant_id, it.quantity, `Order #${orderId} cancelled`]);
+      }
+      // Online payments are queued for refund; an unpaid COD order simply has its payment cancelled.
+      const paid = await client.query("UPDATE payments SET status = 'REFUND_PENDING', updated_at = CURRENT_TIMESTAMP WHERE order_id = $1 AND payment_method = 'RAZORPAY' AND status = 'PAID' RETURNING id", [orderId]);
+      refundNeeded = paid.rows.length > 0;
+      await client.query("UPDATE payments SET status = 'CANCELLED', updated_at = CURRENT_TIMESTAMP WHERE order_id = $1 AND payment_method = 'COD' AND status = 'PENDING'", [orderId]);
+    }
+
+    const updated = await client.query(
       'UPDATE orders SET status = $1, tracking_number = COALESCE($2, tracking_number), delivery_notes = COALESCE($3, delivery_notes), updated_at = CURRENT_TIMESTAMP WHERE id = $4 RETURNING *',
-      [status, trackingNumber, deliveryNotes, id]
+      [status, tracking, notes, orderId]
     );
-    await pool.query('INSERT INTO order_status_history (order_id, status, notes) VALUES ($1, $2, $3)', [id, status, deliveryNotes || 'Status updated by Admin']);
-    res.status(200).json({ message: 'Order updated successfully', order: result.rows[0] });
+    await client.query('INSERT INTO order_status_history (order_id, status, notes) VALUES ($1, $2, $3)', [orderId, status, notes || (status === 'CANCELLED' ? 'Order cancelled by admin' : 'Status updated by Admin')]);
+    await client.query('COMMIT');
+
+    // The refund is an external call, so it runs after the commit; if it fails it stays REFUND_PENDING and the poller retries.
+    const refund = refundNeeded ? await refundOrderPayment(orderId).catch(() => 'PENDING' as const) : 'NONE';
+    res.status(200).json({ message: 'Order updated successfully', order: updated.rows[0], refund });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('Admin order status update failed:', (error as Error).message);
+    res.status(500).json({ message: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+});
+
+// Payments needing attention (orders that failed after payment, refunds in flight) and a manual reconcile trigger.
+app.get('/api/admin/payments/issues', verifyAdmin, async (_req, res) => {
+  try {
+    const intents = await pool.query(
+      `SELECT i.razorpay_order_id, i.razorpay_payment_id, i.amount_paise, i.status, i.failure_reason, i.refund_status, i.refund_id, i.refund_attempts,
+              i.created_at, i.updated_at, u.email AS customer_email
+       FROM checkout_payment_intents i LEFT JOIN users u ON u.id = i.user_id
+       WHERE i.status IN ('FAILED', 'REFUNDED') AND i.updated_at > CURRENT_TIMESTAMP - INTERVAL '90 days' ORDER BY i.updated_at DESC LIMIT 200`);
+    const orders = await pool.query(
+      `SELECT o.id AS order_id, o.order_number, p.razorpay_payment_id, p.amount, p.status AS payment_status, p.razorpay_refund_id
+       FROM payments p JOIN orders o ON o.id = p.order_id WHERE p.status IN ('REFUND_PENDING', 'REFUND_PROCESSING') ORDER BY p.updated_at DESC LIMIT 200`);
+    res.status(200).json({ failedPayments: intents.rows, pendingOrderRefunds: orders.rows });
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+app.post('/api/admin/payments/reconcile', verifyAdmin, async (_req, res) => {
+  try {
+    res.status(200).json({ success: true, ...(await reconcilePayments()) });
+  } catch (error) {
+    console.error('Manual reconcile failed:', (error as Error).message);
+    res.status(500).json({ message: 'Reconciliation failed' });
   }
 });
 

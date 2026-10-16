@@ -13,8 +13,15 @@ Object.assign(process.env, {
   VERCEL: '1', DATABASE_URL: DB_URL, JWT_ACCESS_SECRET: 'test-secret',
   RAZORPAY_KEY_ID: 'rzp_test_local', RAZORPAY_KEY_SECRET: 'local_test_secret',
   FIREBASE_PROJECT_ID: 'test-project', CLOUDINARY_CLOUD_NAME: 'x', CLOUDINARY_API_KEY: 'x', CLOUDINARY_API_SECRET: 'x',
+  RAZORPAY_WEBHOOK_SECRET: 'whsec_test_local',
+  ACCOUNT_CACHE_TTL_MS: '0',          // always read suspension/role from the DB in tests
+  AUTH_IP_RATE_LIMIT: '600',           // generous so the suite itself is never throttled; the limiter is exercised at the end
+  UPLOAD_MAX_BYTES: '2048',            // tiny cap so the upload size limit can be tested
+  DISABLE_PAYMENT_RECONCILER: '1',     // the poller is triggered explicitly via the admin endpoint
 });
-delete process.env.SMTP_HOST;
+// Blank rather than delete: dotenv never overrides an existing variable, so notifications stay disabled even if the
+// suite is run from a folder that contains a real .env with SMTP / admin-notification settings.
+Object.assign(process.env, { SMTP_HOST: '', SMTP_USER: '', SMTP_PASS: '', ADMIN_NOTIFICATION_EMAIL: '', SMS_PROVIDER_API_KEY: '' });
 
 const sResolve = (m) => require.resolve(m, { paths: [SERVER] });
 function stubModule(name, exports) {
@@ -38,8 +45,22 @@ stubModule('firebase-admin/auth', {
 
 // Razorpay mock: orders.create returns a deterministic test order id with the requested amount
 const razorpayOrders = [];
+const razorpayRefunds = [];
+// Test controls: make refunds fail, and decide which payments Razorpay "reports" for an order (poller).
+const razorpayControl = { refundFails: false, refundCalls: 0, paymentsByOrder: {} };
 function FakeRazorpay() {
-  this.orders = { create: async ({ amount }) => { const o = { id: `order_test_${razorpayOrders.length + 1}`, amount }; razorpayOrders.push(o); return o; } };
+  this.orders = {
+    create: async ({ amount }) => { const o = { id: `order_test_${razorpayOrders.length + 1}`, amount }; razorpayOrders.push(o); return o; },
+    fetchPayments: async (orderId) => ({ items: razorpayControl.paymentsByOrder[orderId] || [] }),
+  };
+  this.payments = {
+    refund: async (paymentId, opts) => {
+      razorpayControl.refundCalls++;
+      if (razorpayControl.refundFails) { const e = new Error('refund failed'); e.error = { description: 'The payment has not been captured yet' }; throw e; }
+      const r = { id: `rfnd_test_${razorpayRefunds.length + 1}`, payment_id: paymentId, amount: opts.amount, notes: opts.notes };
+      razorpayRefunds.push(r); return r;
+    },
+  };
 }
 stubModule('razorpay', FakeRazorpay);
 
@@ -79,6 +100,8 @@ let app, httpServer, base;
 async function startApp(port = 0) {
   require(sResolve('ts-node')).register({ transpileOnly: true, project: path.join(SERVER, 'tsconfig.json') });
   app = require(path.join(SERVER, 'src/index.ts')).default;
+  // Safety net: these tests must only ever talk to the throwaway local database.
+  if (process.env.DATABASE_URL !== DB_URL) throw new Error('Refusing to run: DATABASE_URL is not the local test database.');
   await new Promise(r => { httpServer = app.listen(port, r); });
   base = `http://127.0.0.1:${httpServer.address().port}`;
   // wait for the server's inline startup migrations
@@ -103,4 +126,4 @@ async function call(method, url, body, token, extraHeaders = {}) {
 
 async function stop() { httpServer && httpServer.close(); pool && await pool.end(); pgServer && await pgServer.stop(); }
 
-module.exports = { SERVER, startDb, startApp, call, stop, db: () => pool, firebaseTokens, firebaseCalls, razorpayOrders, cloudinaryUploads, base: () => base };
+module.exports = { SERVER, startDb, startApp, call, stop, db: () => pool, firebaseTokens, firebaseCalls, razorpayOrders, razorpayRefunds, razorpayControl, cloudinaryUploads, base: () => base };

@@ -48,17 +48,24 @@ export default function AdminOrders() {
 
   const handleUpdateStatus = async () => {
     if (!selectedOrder) return;
+    if (statusInput === 'CANCELLED' && !window.confirm(
+      `Cancel order ${selectedOrder.order_number}?\n\nThe items will be returned to stock` +
+      (selectedOrder.payment_method === 'RAZORPAY' ? ' and the online payment will be refunded in full.' : '.') +
+      '\nThis cannot be undone.'
+    )) return;
     try {
-      await api.put(`/api/admin/orders/${selectedOrder.id}/status`, {
+      const res = await api.put(`/api/admin/orders/${selectedOrder.id}/status`, {
         status: statusInput,
         trackingNumber: trackingInput,
         deliveryNotes: notesInput,
       });
       fetchOrders();
       setIsModalOpen(false);
-    } catch (err) {
+      if (res.data?.refund === 'REFUNDED') alert('Order cancelled. The payment was refunded and the stock restored.');
+      else if (res.data?.refund === 'PENDING') alert('Order cancelled and stock restored. The refund did not go through yet; it will be retried automatically (watch the notifications bell).');
+    } catch (err: any) {
       console.error('Failed to update order status:', err);
-      alert('Failed to update order status.');
+      alert(err.response?.data?.message || 'Failed to update order status.');
     }
   };
 
@@ -225,6 +232,7 @@ export default function AdminOrders() {
                     <option value="SHIPPED" className="bg-[#111] text-white">SHIPPED</option>
                     <option value="OUT_FOR_DELIVERY" className="bg-[#111] text-white">OUT FOR DELIVERY</option>
                     <option value="DELIVERED" className="bg-[#111] text-white">DELIVERED</option>
+                    <option value="CANCELLED" className="bg-[#111] text-white">CANCELLED (restock + refund)</option>
                   </select>
                 </div>
                 <div>

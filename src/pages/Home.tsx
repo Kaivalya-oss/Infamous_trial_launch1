@@ -5,12 +5,23 @@ import { motion, useInView } from 'framer-motion';
 import { Link } from 'react-router-dom';
 import gsap from 'gsap';
 import { ScrollTrigger } from 'gsap/ScrollTrigger';
-import { Search, User, ShoppingBag, Play, ArrowRight } from 'lucide-react';
+import { Search, User, ShoppingBag, Play, ArrowRight, Menu, X } from 'lucide-react';
 import QuickViewModal from '../components/QuickViewModal';
 import { useCart } from '../context/CartContext';
 import axios from 'axios';
 
 gsap.registerPlugin(ScrollTrigger);
+
+// Header / footer navigation: in-page sections scroll, "Contact" is its own page (there is no #contact section).
+const NAV_ITEMS: { label: string; id?: string; to?: string }[] = [
+  { label: 'Home', id: 'home' },
+  { label: 'Collections', id: 'collections' },
+  { label: 'Lookbook', id: 'lookbook' },
+  { label: 'Campaigns', id: 'campaigns' },
+  { label: 'About', id: 'about' },
+  { label: 'Contact', to: '/contact' },
+];
+const INSTAGRAM_URL = import.meta.env.VITE_INSTAGRAM_URL as string | undefined;
 
 /* ───────────────────────────── FADE-IN WRAPPER ────────────────────────────── */
 function Reveal({ children, className = '', delay = 0 }: { children: React.ReactNode; className?: string; delay?: number }) {
@@ -105,6 +116,12 @@ export default function Home() {
   }, [productStack.length]);
   const lenisRef = useRef<Lenis | null>(null);
   const { setIsCartOpen, items } = useCart();
+  const [menuOpen, setMenuOpen] = useState(false);
+  const scrollToSection = (id: string) => {
+    setMenuOpen(false);
+    const target = document.getElementById(id);
+    if (target) lenisRef.current?.scrollTo(target, { offset: id === 'home' ? 0 : -80, duration: 1.5 });
+  };
 
   useEffect(() => {
     /* ── Lenis smooth scroll ── */
@@ -209,19 +226,30 @@ export default function Home() {
 
       {/* ════════════════════ NAVIGATION ════════════════════ */}
       <nav className={`fixed top-5 left-1/2 -translate-x-1/2 w-[92%] z-50 flex items-center justify-between transition-colors duration-500 ${navDark ? 'text-textPrimary' : 'text-white'}`}>
-        <div className="font-serif italic text-[32px] tracking-[-2px]">INFAMOUS</div>
+        <Link to="/" onClick={(e) => { e.preventDefault(); scrollToSection('home'); }} aria-label="INFAMOUS home" className="font-serif italic text-[32px] tracking-[-2px]">INFAMOUS</Link>
 
         <div className={`hidden md:flex items-center gap-8 px-8 py-4 rounded-[24px] border transition-all duration-500 backdrop-blur-[20px] ${navDark ? 'bg-white/75 border-black/[0.08] shadow-glass' : 'bg-white/10 border-white/[0.12]'}`}>
-          {['Home', 'Collections', 'Lookbook', 'Campaigns', 'About', 'Contact'].map((link) => (
-            <a key={link} href={`#${link.toLowerCase()}`} onClick={(e) => {
+          {NAV_ITEMS.map((item) => item.to ? (
+            <Link key={item.label} to={item.to} className="text-sm font-medium hover:opacity-60 transition-opacity cursor-pointer">{item.label}</Link>
+          ) : (
+            <a key={item.label} href={`#${item.id}`} onClick={(e) => {
               e.preventDefault();
-              const target = document.getElementById(link.toLowerCase());
-              if (target) lenisRef.current?.scrollTo(target, { offset: -80, duration: 1.5 });
-            }} className="text-sm font-medium hover:opacity-60 transition-opacity cursor-pointer">{link}</a>
+              scrollToSection(item.id!);
+            }} className="text-sm font-medium hover:opacity-60 transition-opacity cursor-pointer">{item.label}</a>
           ))}
         </div>
 
         <div className="flex items-center gap-3">
+          <button
+            type="button"
+            onClick={() => setMenuOpen((open) => !open)}
+            aria-label={menuOpen ? 'Close menu' : 'Open menu'}
+            aria-expanded={menuOpen}
+            aria-controls="mobile-menu"
+            className={`md:hidden w-12 h-12 rounded-full flex items-center justify-center transition-all duration-500 backdrop-blur-[20px] border ${navDark || menuOpen ? 'bg-white/75 border-black/[0.08] text-textPrimary' : 'bg-white/10 border-white/20 text-white'}`}
+          >
+            {menuOpen ? <X size={20} /> : <Menu size={20} />}
+          </button>
           <Link to="/auth/login" className={`w-12 h-12 rounded-full flex items-center justify-center transition-all duration-500 backdrop-blur-[20px] border ${navDark ? 'bg-white/75 border-black/[0.08] hover:bg-white text-inherit' : 'bg-white/10 border-white/[0.12] hover:bg-white/20 text-inherit'}`}>
             <User size={20} />
           </Link>
@@ -238,6 +266,17 @@ export default function Home() {
           </button>
         </div>
       </nav>
+
+      {/* Mobile menu (the desktop pill nav is hidden below md) */}
+      {menuOpen && (
+        <div id="mobile-menu" role="dialog" aria-label="Site menu" className="md:hidden fixed top-[84px] left-1/2 -translate-x-1/2 w-[92%] z-40 rounded-[24px] bg-white/95 backdrop-blur-[20px] border border-black/[0.08] shadow-glass p-3 flex flex-col text-textPrimary">
+          {NAV_ITEMS.map((item) => item.to ? (
+            <Link key={item.label} to={item.to} onClick={() => setMenuOpen(false)} className="px-5 py-4 text-lg font-light rounded-[16px] active:bg-black/5">{item.label}</Link>
+          ) : (
+            <a key={item.label} href={`#${item.id}`} onClick={(e) => { e.preventDefault(); scrollToSection(item.id!); }} className="px-5 py-4 text-lg font-light rounded-[16px] active:bg-black/5">{item.label}</a>
+          ))}
+        </div>
+      )}
 
       {/* ════════════════════ SECTION 1 — HERO ════════════════════ */}
       <section id="home" data-theme="dark" className="relative h-screen w-full flex items-center justify-center overflow-hidden bg-black">
@@ -456,8 +495,10 @@ export default function Home() {
           <div>
             <h4 className="text-white/40 text-xs tracking-[3px] mb-8">EXPLORE</h4>
             <div className="flex flex-col gap-5">
-              {['Collections', 'Lookbook', 'Campaigns', 'About', 'Contact'].map((link) => (
-                <a key={link} href="#" className="text-xl font-light hover:text-white/60 transition-colors">{link}</a>
+              {NAV_ITEMS.filter((item) => item.label !== 'Home').map((item) => item.to ? (
+                <Link key={item.label} to={item.to} className="text-xl font-light hover:text-white/60 transition-colors">{item.label}</Link>
+              ) : (
+                <a key={item.label} href={`#${item.id}`} onClick={(e) => { e.preventDefault(); scrollToSection(item.id!); }} className="text-xl font-light hover:text-white/60 transition-colors">{item.label}</a>
               ))}
             </div>
           </div>
@@ -465,9 +506,11 @@ export default function Home() {
           <div className="text-right">
             <h4 className="text-white/40 text-xs tracking-[3px] mb-8">SOCIAL</h4>
             <div className="flex flex-col gap-5">
-              {['Instagram'].map((link) => (
-                <a key={link} href="#" className="text-white/60 hover:text-white transition-colors">{link}</a>
-              ))}
+              {INSTAGRAM_URL ? (
+                <a href={INSTAGRAM_URL} target="_blank" rel="noopener noreferrer" className="text-white/60 hover:text-white transition-colors">Instagram</a>
+              ) : (
+                <a href="mailto:support@infamous.com" className="text-white/60 hover:text-white transition-colors">support@infamous.com</a>
+              )}
             </div>
           </div>
         </div>

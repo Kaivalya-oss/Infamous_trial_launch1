@@ -27,6 +27,7 @@ export default function Login() {
   const navigate = useNavigate();
   const location = useLocation();
   const from = location.state?.from || '/profile/orders';
+  const accountSuspended = new URLSearchParams(location.search).get('suspended') === 'true';
   const { login, isAuthenticated } = useAuth();
   const [isLoading, setIsLoading] = useState(false);
   const [loginMethod, setLoginMethod] = useState<'email' | 'phone'>('email');
@@ -71,7 +72,7 @@ export default function Login() {
       navigate(from, { replace: true });
     } catch (err: any) {
       console.error(err);
-      setPhoneError(err.message || 'Google Auth Failed');
+      setPhoneError(err.response?.data?.message || err.message || 'Google Auth Failed');
     } finally {
       setIsLoading(false);
     }
@@ -146,6 +147,8 @@ export default function Login() {
         setPhoneError('Incorrect OTP. Please try again.');
       } else if (err.code === 'auth/code-expired') {
         setPhoneError('OTP has expired. Please request a new one.');
+      } else if (err.response?.data?.message) {
+        setPhoneError(err.response.data.message);
       } else {
         setPhoneError('Verification failed. Please try again.');
       }
@@ -213,6 +216,11 @@ export default function Login() {
           <div className="mb-12">
             <h1 className="font-serif italic text-[48px] md:text-[64px] leading-none mb-4">Welcome Back</h1>
             <p className="text-textSecondary font-light">Enter your details to access your account.</p>
+            {accountSuspended && (
+              <p role="alert" className="mt-4 rounded-[12px] bg-red-50 border border-red-200 px-4 py-3 text-sm text-red-700">
+                This account has been suspended. Please contact support if you think this is a mistake.
+              </p>
+            )}
           </div>
 
           <div className="flex gap-4 mb-8">

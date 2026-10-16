@@ -45,6 +45,23 @@ api.interceptors.response.use(
   async (error) => {
     const originalRequest = error.config;
     
+    // A customer who was suspended while signed in: drop the session and tell them why. (Login/refresh calls
+    // show the same message inline, and admin sessions are unaffected.)
+    if (
+      error.response?.status === 403 &&
+      error.response?.data?.code === 'ACCOUNT_SUSPENDED' &&
+      !checkIsAdminRoute(originalRequest?.url) &&
+      !String(originalRequest?.url || '').includes('/api/auth/')
+    ) {
+      localStorage.removeItem('infamous_token');
+      localStorage.removeItem('infamous_refresh_token');
+      localStorage.removeItem('infamous_user');
+      if (window.location.pathname !== '/auth/login') {
+        window.location.href = '/auth/login?suspended=true';
+      }
+      return Promise.reject(error);
+    }
+
     // If error is 401 Unauthorized and we haven't retried yet
     if (error.response?.status === 401 && !originalRequest._retry) {
       originalRequest._retry = true;
