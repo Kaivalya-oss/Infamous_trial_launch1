@@ -21,7 +21,7 @@ const NAV_ITEMS: { label: string; id?: string; to?: string }[] = [
   { label: 'About', id: 'about' },
   { label: 'Contact', to: '/contact' },
 ];
-const INSTAGRAM_URL = import.meta.env.VITE_INSTAGRAM_URL as string | undefined;
+const INSTAGRAM_URL = (import.meta.env.VITE_INSTAGRAM_URL as string | undefined) || 'https://www.instagram.com/infamousonline.in';
 
 /* ───────────────────────────── FADE-IN WRAPPER ────────────────────────────── */
 function Reveal({ children, className = '', delay = 0 }: { children: React.ReactNode; className?: string; delay?: number }) {
@@ -506,11 +506,7 @@ export default function Home() {
           <div className="text-right">
             <h4 className="text-white/40 text-xs tracking-[3px] mb-8">SOCIAL</h4>
             <div className="flex flex-col gap-5">
-              {INSTAGRAM_URL ? (
-                <a href={INSTAGRAM_URL} target="_blank" rel="noopener noreferrer" className="text-white/60 hover:text-white transition-colors">Instagram</a>
-              ) : (
-                <a href="mailto:support@infamous.com" className="text-white/60 hover:text-white transition-colors">support@infamous.com</a>
-              )}
+              <a href={INSTAGRAM_URL} target="_blank" rel="noopener noreferrer" className="text-white/60 hover:text-white transition-colors">Instagram</a>
             </div>
           </div>
         </div>
