@@ -127,7 +127,7 @@ async function call(method, url, body, token, extraHeaders = {}) {
     body: body ? (isForm ? body : JSON.stringify(body)) : undefined,
   });
   const t = await res.text(); let json; try { json = JSON.parse(t); } catch { json = t; }
-  return { status: res.status, body: json };
+  return { status: res.status, body: json, headers: Object.fromEntries(res.headers) };
 }
 
 async function stop() { httpServer && httpServer.close(); pool && await pool.end(); pgServer && await pgServer.stop(); }

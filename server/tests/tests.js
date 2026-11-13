@@ -949,6 +949,27 @@ const count = async (sql, p) => Number((await one(sql, p)).c);
     check('LIFECYCLE admin note in return email is escaped', !!rm && rm.html.includes('Pickup &lt;tomorrow&gt;') && !rm.html.includes('<tomorrow>'));
   }
 
+  // ---------------- CORS ----------------
+  {
+    const acao = async (origin) => (await call('GET', '/api/products', null, null, { Origin: origin })).headers['access-control-allow-origin'];
+    const prevEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    process.env.FRONTEND_URL = 'https://www.shop.test.local';
+    process.env.CORS_ALLOWED_ORIGINS = 'https://preview-1.vercel.app, https://preview-2.vercel.app/';
+    check('CORS production: storefront origin (FRONTEND_URL) is allowed', await acao('https://www.shop.test.local') === 'https://www.shop.test.local');
+    check('CORS production: APP_BASE_URL origin is allowed', await acao('https://shop.test.local') === 'https://shop.test.local');
+    check('CORS production: listed preview origins are allowed (trailing slash tolerated)', await acao('https://preview-1.vercel.app') === 'https://preview-1.vercel.app' && await acao('https://preview-2.vercel.app') === 'https://preview-2.vercel.app');
+    check('CORS production: arbitrary *.vercel.app origin is rejected', await acao('https://evil-project.vercel.app') === undefined);
+    check('CORS production: localhost origins are rejected', await acao('http://localhost:5173') === undefined && await acao('http://192.168.1.5:3000') === undefined);
+    check('CORS production: unrelated and look-alike origins are rejected', await acao('https://evil.example') === undefined && await acao('https://www.shop.test.local.evil.example') === undefined);
+    check('CORS production: requests without an Origin (webhooks, server-to-server) still work', (await call('GET', '/api/products')).status === 200);
+    process.env.NODE_ENV = 'development';
+    check('CORS development: localhost and *.vercel.app stay allowed', await acao('http://localhost:5173') === 'http://localhost:5173' && await acao('https://anything.vercel.app') === 'https://anything.vercel.app');
+    check('CORS development: other origins are still rejected', await acao('https://evil.example') === undefined);
+    if (prevEnv === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = prevEnv;
+    delete process.env.FRONTEND_URL; delete process.env.CORS_ALLOWED_ORIGINS;
+  }
+
   // ---------------- per-IP limiter (last: it exhausts this IP's budget) ----------------
   let firstBlocked = -1, ipStatuses = new Set();
   for (let i = 0; i < 900 && firstBlocked < 0; i++) { const r = await call('POST', '/api/auth/reset-password', { token: 'bad' }, null, xff('10.77.0.1')); ipStatuses.add(r.status); if (r.status === 429) firstBlocked = i; }

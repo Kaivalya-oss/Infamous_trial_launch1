@@ -6,6 +6,7 @@ Tick each box. Stop and report anything that fails (note the page, what you did,
 ## 0. Setup (once)
 - [ ] Render env vars set: `NODE_ENV=production`, `JWT_ACCESS_SECRET`, `FIREBASE_PROJECT_ID`, `RAZORPAY_KEY_ID/SECRET` (test keys), `RAZORPAY_WEBHOOK_SECRET`, `DATABASE_URL`
 - [ ] Email vars on Render: `SMTP_HOST/PORT/USER/PASS`, `SMTP_FROM_EMAIL`, `EMAIL_FROM_NAME`, `APP_BASE_URL` (= the preview/production storefront URL), `ADMIN_NOTIFICATION_EMAIL`
+- [ ] Render `CORS_ALLOWED_ORIGINS` includes the **exact preview URL** (e.g. `https://infamous-trial-launch1-xxxx.vercel.app`). In production the API no longer accepts arbitrary `*.vercel.app` origins, so without this the preview shows CORS errors and every request fails
 - [ ] Render redeployed after setting variables; `https://<render>/` responds
 - [ ] Firebase → Authentication → Settings → Authorized domains includes the preview domain
 - [ ] Razorpay (test) webhook → `https://<render>/api/webhooks/razorpay`, events `payment.captured`, `order.paid`; secret equals `RAZORPAY_WEBHOOK_SECRET`; auto-capture ON

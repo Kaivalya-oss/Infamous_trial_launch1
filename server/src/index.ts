@@ -82,28 +82,27 @@ app.use((_req, res, next) => {
 // topology. The per-IP limiter is best-effort; the per-account limiter below is the real control.
 app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS ?? 1));
 
-const allowedOrigins = [
-  'http://localhost:5173',
-  'http://localhost:3000',
-  process.env.FRONTEND_URL,
-  'https://infamous-trial-launch1-seven.vercel.app'
-].filter(Boolean) as string[];
-
+// Browsers may call this API only from the storefront. In production the list is exact (no wildcard for
+// *.vercel.app, no localhost): FRONTEND_URL, APP_BASE_URL and CORS_ALLOWED_ORIGINS (comma separated; add a
+// Vercel preview URL here when testing a preview against the production API). Outside production, localhost
+// and *.vercel.app are also allowed for development. Requests with no Origin (server-to-server, webhooks) pass.
+const normOrigin = (o?: string) => (o || '').trim().replace(/\/+$/, '');
+function isAllowedOrigin(origin?: string): boolean {
+  if (!origin) return true;
+  const exact = [
+    'https://infamous-trial-launch1-seven.vercel.app',
+    process.env.FRONTEND_URL,
+    process.env.APP_BASE_URL,
+    ...(process.env.CORS_ALLOWED_ORIGINS || '').split(','),
+  ].map(normOrigin).filter(Boolean);
+  if (exact.includes(normOrigin(origin))) return true;
+  if (process.env.NODE_ENV === 'production') return false;
+  return origin.endsWith('.vercel.app') || /^http:\/\/(localhost|127\.0\.0\.1|192\.168\.[\d.]+)(:\d+)?$/.test(origin);
+}
 app.use(cors({
   origin: function (origin, callback) {
-    if (
-      !origin || 
-      allowedOrigins.includes(origin) || 
-      origin.endsWith('.vercel.app') || 
-      origin.startsWith('http://localhost:') ||
-      origin.startsWith('http://127.0.0.1:') ||
-      origin.startsWith('http://192.168.')
-    ) {
-      callback(null, true);
-    } else {
-      console.warn(`[CORS] Rejected origin: ${origin}`);
-      callback(null, false);
-    }
+    if (isAllowedOrigin(origin)) callback(null, true);
+    else { console.warn(`[CORS] Rejected origin: ${origin}`); callback(null, false); }
   },
   credentials: true
 }));
