@@ -897,6 +897,58 @@ const count = async (sql, p) => Number((await one(sql, p)).c);
     check('RESET malformed email address returns the same generic 200', (await call('POST', '/api/auth/forgot-password', { email: 'invalid' })).status === 200);
   }
 
+  // ---------------- EMAIL: order / return / exchange lifecycle ----------------
+  {
+    const mails = env.mails;
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    const waitMail = async (to, part, since) => { for (let i = 0; i < 60; i++) { const m = mails.slice(since).find(x => x.to === to && x.subject.includes(part)); if (m) return m; await sleep(50); } return null; };
+    const mk = async (status) => (await one(`INSERT INTO orders (order_number,user_id,total_amount,status,shipping_address) VALUES ($1,$2,499,$3,'{}'::json) RETURNING id`, ['LC' + Math.floor(Math.random() * 1e9), ids.carol, status])).id;
+    const st = (id, status, extra = {}) => call('PUT', `/api/admin/orders/${id}/status`, { status, ...extra }, ADMIN);
+    const num = async (id) => (await one('SELECT order_number FROM orders WHERE id=$1', [id])).order_number;
+
+    const oid = await mk('PACKED');
+    let mark = mails.length;
+    check('LIFECYCLE shipping an order succeeds', (await st(oid, 'SHIPPED', { trackingNumber: 'TRK<b>123' })).status === 200);
+    const sm = await waitMail('carol@test.local', 'shipped', mark);
+    check('LIFECYCLE SHIPPED email is sent with the order number', !!sm && sm.subject.includes(await num(oid)));
+    check('LIFECYCLE tracking number is included and escaped', !!sm && sm.html.includes('TRK&lt;b&gt;123') && !sm.html.includes('TRK<b>'));
+    mark = mails.length;
+    await st(oid, 'OUT_FOR_DELIVERY');
+    check('LIFECYCLE OUT_FOR_DELIVERY email is sent', !!(await waitMail('carol@test.local', 'out for delivery', mark)));
+    mark = mails.length;
+    await st(oid, 'DELIVERED');
+    check('LIFECYCLE DELIVERED email is sent', !!(await waitMail('carol@test.local', 'delivered', mark)));
+
+    mark = mails.length;
+    const oid2 = await mk('PENDING');
+    await st(oid2, 'CONFIRMED');
+    await sleep(250);
+    check('LIFECYCLE no email for intermediate statuses (CONFIRMED)', !mails.slice(mark).some(m => m.to === 'carol@test.local'));
+    mark = mails.length;
+    check('LIFECYCLE cancelling succeeds', (await st(oid2, 'CANCELLED')).status === 200);
+    check('LIFECYCLE CANCELLED email is sent', !!(await waitMail('carol@test.local', 'cancelled', mark)));
+    mark = mails.length;
+    check('LIFECYCLE a rejected (invalid) transition sends nothing', (await st(oid2, 'SHIPPED')).status === 409);
+    await sleep(250);
+    check('LIFECYCLE no email when the update failed', !mails.slice(mark).some(m => m.to === 'carol@test.local'));
+
+    env.mailControl.fail = true;
+    const oid3 = await mk('PACKED');
+    const down = await st(oid3, 'SHIPPED');
+    await sleep(150);
+    env.mailControl.fail = false;
+    check('LIFECYCLE SMTP outage does not fail the status update', down.status === 200 && (await one('SELECT status FROM orders WHERE id=$1', [oid3])).status === 'SHIPPED');
+
+    // returns
+    const rO = await deliveredOrder(ids.carol, ids.v1, 1299);
+    const rr = await call('POST', '/api/returns', { order_item_id: rO.itemId, reason: 'Wrong size' }, CAROL);
+    mark = mails.length;
+    await call('PATCH', `/api/admin/returns/${rr.body.returnRequest.id}/status`, { status: 'PICKUP_SCHEDULED', admin_notes: 'Pickup <tomorrow>' }, ADMIN);
+    const rm = await waitMail('carol@test.local', `Return #${rr.body.returnRequest.id}`, mark);
+    check('LIFECYCLE return status change emails the customer', !!rm && rm.html.includes('pickup has been scheduled'));
+    check('LIFECYCLE admin note in return email is escaped', !!rm && rm.html.includes('Pickup &lt;tomorrow&gt;') && !rm.html.includes('<tomorrow>'));
+  }
+
   // ---------------- per-IP limiter (last: it exhausts this IP's budget) ----------------
   let firstBlocked = -1, ipStatuses = new Set();
   for (let i = 0; i < 900 && firstBlocked < 0; i++) { const r = await call('POST', '/api/auth/reset-password', { token: 'bad' }, null, xff('10.77.0.1')); ipStatuses.add(r.status); if (r.status === 429) firstBlocked = i; }

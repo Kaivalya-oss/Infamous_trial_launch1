@@ -34,6 +34,23 @@ async function sendOrderConfirmationEmail(order: any, customer: any, items: any[
   await sendTemplate(customer.email, emailTemplates.orderConfirmation(order, customer, items));
 }
 
+// Customer lifecycle emails (best effort, after the database commit; never throw into a request).
+async function sendOrderStatusEmail(orderId: number, status: string, tracking: string | null, refund: string) {
+  if (!['SHIPPED', 'OUT_FOR_DELIVERY', 'DELIVERED', 'CANCELLED'].includes(status)) return;
+  try {
+    const r = await pool.query('SELECT o.order_number, COALESCE(o.customer_email, u.email) AS email, u.name FROM orders o LEFT JOIN users u ON u.id = o.user_id WHERE o.id = $1', [orderId]);
+    const o = r.rows[0];
+    if (o?.email) await sendTemplate(o.email, emailTemplates.orderStatus(o.name, o.order_number, status, tracking, refund));
+  } catch (err: any) { console.error('[EMAIL] order status email failed:', err.message); }
+}
+async function sendCaseStatusEmail(kind: 'Return' | 'Exchange', id: number, userId: number, orderId: number, status: string, notes: string | null) {
+  try {
+    const r = await pool.query('SELECT o.order_number, u.email, u.name FROM orders o, users u WHERE o.id = $1 AND u.id = $2', [orderId, userId]);
+    const c = r.rows[0];
+    if (c?.email) await sendTemplate(c.email, emailTemplates.caseStatus(c.name, kind, id, c.order_number, status, notes));
+  } catch (err: any) { console.error('[EMAIL] case status email failed:', err.message); }
+}
+
 async function sendAdminOrderNotification(order: any, customer: any) {
   if (!process.env.ADMIN_NOTIFICATION_EMAIL) return;
   await sendTemplate(process.env.ADMIN_NOTIFICATION_EMAIL, emailTemplates.adminOrder(order, customer));
@@ -2704,6 +2721,7 @@ app.put('/api/admin/orders/:id/status', verifyAdmin, async (req: any, res) => {
 
     // The refund is an external call, so it runs after the commit; if it fails it stays REFUND_PENDING and the poller retries.
     const refund = refundNeeded ? await refundOrderPayment(orderId).catch(() => 'PENDING' as const) : 'NONE';
+    sendOrderStatusEmail(orderId, status, updated.rows[0]?.tracking_number ?? null, refund);
     res.status(200).json({ message: 'Order updated successfully', order: updated.rows[0], refund });
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {});
@@ -3419,6 +3437,7 @@ app.patch('/api/admin/exchanges/:id/status', verifyAdmin, async (req: any, res) 
 
     await client.query('COMMIT');
 
+    sendCaseStatusEmail('Exchange', exchange.id, exchange.user_id, exchange.order_id, finalStatus, admin_notes || null);
     res.status(200).json({
       success: true,
       message: `Exchange #${id} status updated to ${finalStatus}`,
@@ -3698,6 +3717,7 @@ app.patch('/api/admin/returns/:id/status', verifyAdmin, async (req: any, res) =>
 
     await client.query('COMMIT');
 
+    sendCaseStatusEmail('Return', returnRecord.id, returnRecord.user_id, returnRecord.order_id, status, admin_notes || null);
     res.status(200).json({
       success: true,
       message: `Return #${id} status updated to ${status}`,
