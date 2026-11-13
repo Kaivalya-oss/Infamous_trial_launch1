@@ -21,13 +21,19 @@ Object.assign(process.env, {
 });
 // Blank rather than delete: dotenv never overrides an existing variable, so notifications stay disabled even if the
 // suite is run from a folder that contains a real .env with SMTP / admin-notification settings.
-Object.assign(process.env, { SMTP_HOST: '', SMTP_USER: '', SMTP_PASS: '', ADMIN_NOTIFICATION_EMAIL: '', SMS_PROVIDER_API_KEY: '' });
+// Email: nodemailer is replaced by a capture stub below (nothing is ever sent); SMTP_HOST is a dummy so the server treats email as configured.
+Object.assign(process.env, { SMTP_HOST: 'smtp.test.invalid', SMTP_USER: 'test', SMTP_PASS: 'test', SMTP_FROM_EMAIL: 'noreply@test.local', ADMIN_NOTIFICATION_EMAIL: 'owner@test.local', APP_BASE_URL: 'https://shop.test.local', SMS_PROVIDER_API_KEY: '' });
 
 const sResolve = (m) => require.resolve(m, { paths: [SERVER] });
 function stubModule(name, exports) {
   const p = sResolve(name);
   require.cache[p] = { id: p, filename: p, loaded: true, exports };
 }
+
+// Nodemailer capture: every message the server would send is recorded here
+const mails = [];
+const mailControl = { fail: false };
+stubModule('nodemailer', { __esModule: true, default: { createTransport: () => ({ sendMail: async (m) => { if (mailControl.fail) throw new Error('smtp down'); mails.push(m); return { messageId: 'x' }; } }) } });
 
 // Firebase Admin mock: verifyIdToken returns a decoded token only for known test tokens
 const firebaseTokens = {};
@@ -126,4 +132,4 @@ async function call(method, url, body, token, extraHeaders = {}) {
 
 async function stop() { httpServer && httpServer.close(); pool && await pool.end(); pgServer && await pgServer.stop(); }
 
-module.exports = { SERVER, startDb, startApp, call, stop, db: () => pool, firebaseTokens, firebaseCalls, razorpayOrders, razorpayRefunds, razorpayControl, cloudinaryUploads, base: () => base };
+module.exports = { SERVER, startDb, startApp, call, stop, db: () => pool, firebaseTokens, firebaseCalls, mails, mailControl, razorpayOrders, razorpayRefunds, razorpayControl, cloudinaryUploads, base: () => base };

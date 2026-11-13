@@ -68,8 +68,8 @@ const count = async (sql, p) => Number((await one(sql, p)).c);
 
   // ---------------- C2 / auth basics ----------------
   const fp = await call('POST', '/api/auth/forgot-password', { email: 'admin@test.local' });
-  check('C2 forgot-password generic 200, no token', fp.status === 200 && !('token' in fp.body), fp);
-  check('C2 no reset token stored', await count(`SELECT count(*) c FROM sessions WHERE token LIKE 'reset_%'`) === 0);
+  check('C2 forgot-password generic 200, no token in response', fp.status === 200 && !('token' in fp.body), fp);
+  check('C2 no reset token stored in sessions', await count(`SELECT count(*) c FROM sessions WHERE token LIKE 'reset_%'`) === 0);
 
   const adminLogin = await login('admin@test.local', 'AdminPass123');
   const ADMIN = adminLogin.accessToken;
@@ -789,11 +789,119 @@ const count = async (sql, p) => Number((await one(sql, p)).c);
   const fxAgain = await whPost(captured(fxPay.razorpay_order_id, 'pay_FX2', fxPay.amount));
   check('WEBHOOK exchange fee replay cannot re-confirm or change the stored payment id', (await one('SELECT status, razorpay_payment_id FROM product_exchanges WHERE id=$1', [fxEx.id])).razorpay_payment_id === 'pay_FX1' && fxAgain.status === 200);
 
+  // ---------------- EMAIL: verification + password reset ----------------
+  {
+    const mails = env.mails;
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    const waitMail = async (to, subjectPart, since = 0) => {
+      for (let i = 0; i < 60; i++) { const m = mails.slice(since).find(x => x.to === to && x.subject.includes(subjectPart)); if (m) return m; await sleep(50); }
+      return null;
+    };
+    const tokenOf = (m) => (m && (m.html.match(/token=([a-f0-9]{64})/) || [])[1]) || null;
+    const ip = xff('10.88.0.1');
+    // forge a token row (as if it had been emailed) to test expiry / address binding
+    const issueTokenFor = async (purpose, email, minutes = 30, userId = null) => {
+      const raw = crypto.randomBytes(32).toString('hex');
+      const uid = userId || (await one('SELECT id FROM users WHERE LOWER(email)=$1', [email])).id;
+      await q(`INSERT INTO email_tokens (user_id, purpose, email, token_hash, expires_at) VALUES ($1,$2,$3,$4, NOW() + ($5 || ' minutes')::interval)`, [uid, purpose, email, crypto.createHash('sha256').update(raw).digest('hex'), String(minutes)]);
+      return raw;
+    };
+
+    // registration sends a verification link, escaped and bound to the address
+    let mark = mails.length;
+    const reg = await call('POST', '/api/auth/register', { name: '<img src=x onerror=alert(1)>Eve', email: 'Eve@Test.Local', password: 'EvePass123' }, null, ip);
+    check('EMAIL register still succeeds', reg.status === 201, reg);
+    const vm = await waitMail('eve@test.local', 'Verify', mark);
+    check('EMAIL registration sends a verification email to the normalised address', !!vm, mails.map(m => m.subject));
+    check('EMAIL verification link points at the storefront and carries a 64-hex token', !!vm && vm.html.includes('https://shop.test.local/auth/verify-email?token=') && !!tokenOf(vm));
+    check('EMAIL user-supplied name is HTML-escaped in the message', !!vm && !vm.html.includes('<img') && vm.html.includes('&lt;img'));
+    const vtok = tokenOf(vm);
+    check('EMAIL raw token is not stored (hash only)', await count('SELECT count(*) c FROM email_tokens WHERE token_hash = $1', [vtok]) === 0);
+    check('EMAIL new account starts unverified', (await one('SELECT email_verified FROM users WHERE LOWER(email)=$1', ['eve@test.local'])).email_verified === false);
+    check('EMAIL malformed verify token -> 400', (await call('POST', '/api/auth/verify-email', { token: 'nope' })).status === 400);
+    check('EMAIL verify with a valid token succeeds', (await call('POST', '/api/auth/verify-email', { token: vtok })).status === 200);
+    check('EMAIL account is now verified', (await one('SELECT email_verified FROM users WHERE LOWER(email)=$1', ['eve@test.local'])).email_verified === true);
+    check('EMAIL verification token is single-use', (await call('POST', '/api/auth/verify-email', { token: vtok })).status === 400);
+
+    // resend
+    const eveTok = reg.body.accessToken;
+    const rs0 = await call('POST', '/api/auth/resend-verification', {}, eveTok);
+    check('EMAIL resend on an already verified account is a no-op', rs0.status === 200 && rs0.body.alreadyVerified === true, rs0);
+    check('EMAIL resend requires authentication', (await call('POST', '/api/auth/resend-verification', {})).status === 401);
+
+    // changing the profile email re-verifies, and a link for the old address cannot verify the new one
+    mark = mails.length;
+    const pe = await call('PUT', '/api/profile', { first_name: 'Eve', last_name: 'T', email: 'eve2@test.local', phone_number: '' }, eveTok);
+    check('EMAIL profile email change -> unverified', pe.status === 200 && pe.body.user.email_verified === false, pe);
+    const vm2 = await waitMail('eve2@test.local', 'Verify', mark);
+    check('EMAIL changing email sends a verification link to the NEW address', !!vm2);
+    const oldBound = await issueTokenFor('verify', 'eve@test.local', 30, (await one('SELECT id FROM users WHERE LOWER(email)=$1', ['eve2@test.local'])).id);
+    check('EMAIL a token bound to the previous address cannot verify the new one', (await call('POST', '/api/auth/verify-email', { token: oldBound })).status === 400 && (await one('SELECT email_verified FROM users WHERE LOWER(email)=$1', ['eve2@test.local'])).email_verified === false);
+    check('EMAIL link for the new address verifies it', (await call('POST', '/api/auth/verify-email', { token: tokenOf(vm2) })).status === 200);
+    check('EMAIL expired verification token is rejected', (await call('POST', '/api/auth/verify-email', { token: await issueTokenFor('verify', 'eve2@test.local', -5) })).status === 400);
+    await q('UPDATE users SET email_verified=false WHERE LOWER(email)=$1', ['eve2@test.local']);
+    mark = mails.length;
+    const rs1 = await call('POST', '/api/auth/resend-verification', {}, eveTok);
+    check('EMAIL resend sends a new link to an unverified account', rs1.status === 200 && !!(await waitMail('eve2@test.local', 'Verify', mark)), rs1);
+
+    // SMTP outage must never break sign-up
+    env.mailControl.fail = true;
+    const regDown = await call('POST', '/api/auth/register', { name: 'Frank', email: 'frank@test.local', password: 'FrankPass123' }, null, ip);
+    env.mailControl.fail = false;
+    check('EMAIL SMTP outage does not break registration', regDown.status === 201, regDown);
+
+    // ---- password reset ----
+    mark = mails.length;
+    const fgUnknown = await call('POST', '/api/auth/forgot-password', { email: 'nobody@test.local' });
+    const fgKnown = await call('POST', '/api/auth/forgot-password', { email: 'carol@test.local' });
+    check('RESET response is identical for unknown and known emails', fgUnknown.status === 200 && fgKnown.status === 200 && fgUnknown.body.message === fgKnown.body.message);
+    const rm = await waitMail('carol@test.local', 'Reset', mark);
+    await sleep(150);
+    check('RESET email is sent to the known account only', !!rm && !mails.slice(mark).some(m => m.to === 'nobody@test.local'));
+    check('RESET link points at the reset page with a token', !!rm && rm.html.includes('https://shop.test.local/auth/reset-password?token=') && !!tokenOf(rm));
+    const rtok = tokenOf(rm);
+    check('RESET raw token is not stored', await count('SELECT count(*) c FROM email_tokens WHERE token_hash = $1', [rtok]) === 0);
+
+    const carolOld = await login('carol@test.local', 'CarolPass123');
+    check('RESET weak new password is rejected and does not burn the token', (await call('POST', '/api/auth/reset-password', { token: rtok, newPassword: 'short' })).status === 400 && await count(`SELECT count(*) c FROM email_tokens WHERE purpose='reset' AND used_at IS NULL AND expires_at > NOW() AND user_id=$1`, [ids.carol]) === 1);
+    check('RESET garbage token rejected', (await call('POST', '/api/auth/reset-password', { token: 'a'.repeat(64), newPassword: 'BrandNew123' })).status === 400);
+    mark = mails.length;
+    const rr = await call('POST', '/api/auth/reset-password', { token: rtok, newPassword: 'BrandNew123' });
+    check('RESET valid token changes the password', rr.status === 200, rr);
+    check('RESET old password no longer works, new one does', (await call('POST', '/api/auth/login', { email: 'carol@test.local', password: 'CarolPass123' })).status === 401 && (await call('POST', '/api/auth/login', { email: 'carol@test.local', password: 'BrandNew123' })).status === 200);
+    check('RESET all existing sessions are revoked', (await call('POST', '/api/auth/refresh', { refreshToken: carolOld.refreshToken })).status !== 200);
+    check('RESET token is single-use', (await call('POST', '/api/auth/reset-password', { token: rtok, newPassword: 'AnotherPass123' })).status === 400);
+    check('RESET confirmation email is sent', !!(await waitMail('carol@test.local', 'password was changed', mark)));
+    await q('UPDATE users SET password_hash=$1 WHERE id=$2', [await bcrypt.hash('CarolPass123', 4), ids.carol]);
+
+    // expired token, suspended account, contact-only account
+    check('RESET expired token rejected', (await call('POST', '/api/auth/reset-password', { token: await issueTokenFor('reset', 'dave@test.local', -5), newPassword: 'BrandNew123' })).status === 400);
+    await q(`UPDATE users SET status='Suspended' WHERE id=$1`, [ids.dave]);
+    mark = mails.length;
+    await call('POST', '/api/auth/forgot-password', { email: 'dave@test.local' });
+    await sleep(250);
+    check('RESET no email for a suspended account', !mails.slice(mark).some(m => m.to === 'dave@test.local'));
+    check('RESET a token issued before suspension cannot be used', (await call('POST', '/api/auth/reset-password', { token: await issueTokenFor('reset', 'dave@test.local'), newPassword: 'BrandNew123' })).status === 400);
+    await q(`UPDATE users SET status='Active' WHERE id=$1`, [ids.dave]);
+    const contactOnly = (await one(`INSERT INTO users (name,email,email_verified) VALUES ('Contact','contact@test.local',false) RETURNING id`)).id;
+    mark = mails.length;
+    await call('POST', '/api/auth/forgot-password', { email: 'contact@test.local' });
+    await sleep(250);
+    check('RESET no email for a contact-only account (no password, unverified email)', !mails.slice(mark).some(m => m.to === 'contact@test.local') && await count('SELECT count(*) c FROM email_tokens WHERE user_id=$1', [contactOnly]) === 0);
+
+    // per-email limit
+    let last = 0;
+    for (let i = 0; i < 4; i++) last = (await call('POST', '/api/auth/forgot-password', { email: 'limit@test.local' }, null, xff('10.88.0.9' + i))).status;
+    check('RESET per-email limit: 4th request in an hour -> 429', last === 429);
+    check('RESET other emails are unaffected by that limit', (await call('POST', '/api/auth/forgot-password', { email: 'someone@test.local' }, null, xff('10.88.0.50'))).status === 200);
+    check('RESET malformed email address returns the same generic 200', (await call('POST', '/api/auth/forgot-password', { email: 'invalid' })).status === 200);
+  }
+
   // ---------------- per-IP limiter (last: it exhausts this IP's budget) ----------------
   let firstBlocked = -1, ipStatuses = new Set();
-  for (let i = 0; i < 900 && firstBlocked < 0; i++) { const r = await call('POST', '/api/auth/forgot-password', { email: 'x@y.zz' }, null, xff('10.77.0.1')); ipStatuses.add(r.status); if (r.status === 429) firstBlocked = i; }
+  for (let i = 0; i < 900 && firstBlocked < 0; i++) { const r = await call('POST', '/api/auth/reset-password', { token: 'bad' }, null, xff('10.77.0.1')); ipStatuses.add(r.status); if (r.status === 429) firstBlocked = i; }
   check('RATE per-IP limiter: one IP hammering a credential endpoint is blocked (429) around the configured budget', firstBlocked > 100 && firstBlocked <= 601, { firstBlocked, statuses: [...ipStatuses] });
-  check('RATE per-IP limiter does not affect other IPs', (await call('POST', '/api/auth/forgot-password', { email: 'x@y.zz' }, null, xff('10.77.0.2'))).status === 200);
+  check('RATE per-IP limiter does not affect other IPs', (await call('POST', '/api/auth/reset-password', { token: 'bad' }, null, xff('10.77.0.2'))).status === 400);
   check('RATE webhook endpoint is not subject to the auth limiter', (await whPost(captured('order_not_ours', 'pay_unk2', 1))).status === 200);
 
   console.log(`\nRESULT: ${pass} passed, ${fail} failed`);

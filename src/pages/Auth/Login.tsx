@@ -38,6 +38,8 @@ export default function Login() {
   const [otpSent, setOtpSent] = useState(false);
   const [phoneError, setPhoneError] = useState('');
   const [confirmationResult, setConfirmationResult] = useState<any>(null);
+  // Phone OTP depends on SMS delivery; it stays hidden until VITE_ENABLE_PHONE_LOGIN=true is set at build time.
+  const phoneLoginEnabled = import.meta.env.VITE_ENABLE_PHONE_LOGIN === 'true';
 
   useEffect(() => {
     // Initialize recaptcha when switching to phone tab if not already initialized
@@ -223,20 +225,22 @@ export default function Login() {
             )}
           </div>
 
-          <div className="flex gap-4 mb-8">
-            <button 
-              onClick={() => setLoginMethod('email')}
-              className={`pb-2 text-sm font-medium transition-colors border-b-2 ${loginMethod === 'email' ? 'border-textPrimary text-textPrimary' : 'border-transparent text-textSecondary hover:text-textPrimary'}`}
-            >
-              Email
-            </button>
-            <button 
-              onClick={() => setLoginMethod('phone')}
-              className={`pb-2 text-sm font-medium transition-colors border-b-2 ${loginMethod === 'phone' ? 'border-textPrimary text-textPrimary' : 'border-transparent text-textSecondary hover:text-textPrimary'}`}
-            >
-              Phone OTP
-            </button>
-          </div>
+          {phoneLoginEnabled && (
+            <div className="flex gap-4 mb-8">
+              <button
+                onClick={() => setLoginMethod('email')}
+                className={`pb-2 text-sm font-medium transition-colors border-b-2 ${loginMethod === 'email' ? 'border-textPrimary text-textPrimary' : 'border-transparent text-textSecondary hover:text-textPrimary'}`}
+              >
+                Email
+              </button>
+              <button
+                onClick={() => setLoginMethod('phone')}
+                className={`pb-2 text-sm font-medium transition-colors border-b-2 ${loginMethod === 'phone' ? 'border-textPrimary text-textPrimary' : 'border-transparent text-textSecondary hover:text-textPrimary'}`}
+              >
+                Phone OTP
+              </button>
+            </div>
+          )}
 
           {loginMethod === 'email' ? (
             <form onSubmit={handleSubmit(onSubmit)} className="flex flex-col gap-6">

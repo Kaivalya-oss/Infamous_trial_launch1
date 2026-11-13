@@ -18,6 +18,7 @@ type ForgotPasswordValues = z.infer<typeof forgotPasswordSchema>;
 export default function ForgotPassword() {
   const [isLoading, setIsLoading] = useState(false);
   const [isSubmitted, setIsSubmitted] = useState(false);
+  const [limitMsg, setLimitMsg] = useState('');
 
   const { register, handleSubmit, formState: { errors } } = useForm<ForgotPasswordValues>({
     resolver: zodResolver(forgotPasswordSchema),
@@ -25,14 +26,14 @@ export default function ForgotPassword() {
 
   const onSubmit = async (data: ForgotPasswordValues) => {
     setIsLoading(true);
+    setLimitMsg('');
     try {
       await api.post('/api/auth/forgot-password', { email: data.email });
       setIsSubmitted(true);
     } catch (error: any) {
       console.error('Password reset failed', error);
-      // Even if user not found, we typically show success to prevent email enumeration,
-      // but backend currently sends 404, so we handle it gracefully here if we want.
-      // We will just show submitted regardless to be secure.
+      // Too many requests is the only error worth surfacing; everything else looks like success (no account enumeration).
+      if (error?.response?.status === 429) { setLimitMsg(error.response.data?.message || 'Too many requests. Please try again later.'); return; }
       setIsSubmitted(true);
     } finally {
       setIsLoading(false);
@@ -88,6 +89,7 @@ export default function ForgotPassword() {
                 error={errors.email?.message}
               />
               
+              {limitMsg && <p className="text-sm text-red-600">{limitMsg}</p>}
               <Button type="submit" isLoading={isLoading} className="w-full">
                 Send Reset Link
               </Button>
@@ -98,9 +100,9 @@ export default function ForgotPassword() {
               animate={{ opacity: 1, scale: 1 }}
               className="bg-white/50 p-8 rounded-[24px] border border-black/10 text-center"
             >
-              <h3 className="font-serif text-2xl mb-3 text-textPrimary">Request received</h3>
+              <h3 className="font-serif text-2xl mb-3 text-textPrimary">Check your email</h3>
               <p className="text-textSecondary font-light text-sm mb-6">
-                Online password reset isn't available yet. Please contact our support team and we'll help you regain access to your account.
+                If an account exists for that address, we've sent a link to reset your password. It expires in 30 minutes. Please check your spam folder if it doesn't arrive.
               </p>
               <Button onClick={() => setIsSubmitted(false)} variant="outline" className="w-full">
                 Try another email

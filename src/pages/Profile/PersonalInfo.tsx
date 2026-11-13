@@ -13,6 +13,9 @@ export default function PersonalInfo() {
   const [email, setEmail] = useState('');
   const [phone, setPhone] = useState('');
   const [address, setAddress] = useState('');
+  const [emailVerified, setEmailVerified] = useState(true);
+  const [verifyMsg, setVerifyMsg] = useState('');
+  const [isSending, setIsSending] = useState(false);
 
   const [isLoading, setIsLoading] = useState(false);
   const [isFetching, setIsFetching] = useState(true);
@@ -33,6 +36,7 @@ export default function PersonalInfo() {
           setEmail(u.email || '');
           setPhone(u.phone_number || '');
           setAddress(u.address || '');
+          setEmailVerified(u.email_verified === true);
           updateUser({
             first_name: fName,
             last_name: lName,
@@ -63,6 +67,20 @@ export default function PersonalInfo() {
     };
   }, []);
 
+  const resendVerification = async () => {
+    setIsSending(true);
+    setVerifyMsg('');
+    try {
+      const res = await api.post('/api/auth/resend-verification');
+      if (res.data?.alreadyVerified) setEmailVerified(true);
+      setVerifyMsg(res.data?.alreadyVerified ? 'Your email is already verified.' : 'Verification email sent. Please check your inbox and spam folder.');
+    } catch (err: any) {
+      setVerifyMsg(err.response?.data?.message || 'Could not send the email. Please try again later.');
+    } finally {
+      setIsSending(false);
+    }
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsLoading(true);
@@ -80,6 +98,8 @@ export default function PersonalInfo() {
 
       const updated = response.data?.user;
       if (updated) {
+        setEmailVerified(updated.email_verified === true);
+        setVerifyMsg(updated.email_verified === true ? '' : 'We sent a verification link to your email address.');
         updateUser({
           first_name: updated.first_name,
           last_name: updated.last_name,
@@ -131,6 +151,15 @@ export default function PersonalInfo() {
               value={email}
               onChange={(e) => setEmail(e.target.value)}
             />
+            {email && !emailVerified && (
+              <div className="-mt-3 flex flex-wrap items-center gap-3 text-sm text-amber-700 bg-amber-50 px-4 py-3 rounded-xl">
+                <span>Your email is not verified yet.</span>
+                <button type="button" onClick={resendVerification} disabled={isSending} className="underline font-medium disabled:opacity-50">
+                  {isSending ? 'Sending…' : 'Resend verification email'}
+                </button>
+                {verifyMsg && <span className="w-full text-textSecondary">{verifyMsg}</span>}
+              </div>
+            )}
             <Input
               label="Phone Number"
               value={phone}

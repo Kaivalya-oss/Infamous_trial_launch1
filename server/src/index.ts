@@ -9,7 +9,7 @@ import multer from 'multer';
 import { CloudinaryStorage } from 'multer-storage-cloudinary';
 import crypto from 'crypto';
 import Razorpay from 'razorpay';
-import nodemailer from 'nodemailer';
+import { sendTemplate, emailTemplates, appBaseUrl } from './email';
 import { initializeApp, getApps } from 'firebase-admin/app';
 import { getAuth as getFirebaseAdminAuth } from 'firebase-admin/auth';
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
@@ -27,40 +27,16 @@ if (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET) {
   console.warn('RAZORPAY_KEY_ID or RAZORPAY_KEY_SECRET is missing. Online payments will fail.');
 }
 
-// --- EMAIL TRANSPORTER ---
-const emailTransporter = process.env.SMTP_HOST ? nodemailer.createTransport({
-  host: process.env.SMTP_HOST,
-  port: parseInt(process.env.SMTP_PORT || '587'),
-  secure: process.env.SMTP_PORT === '465',
-  auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
-}) : null;
-
 // --- NOTIFICATION HELPERS (fire-and-forget, never block orders) ---
+// Sending is implemented in ./email (SMTP, provider-agnostic). All user-supplied text is HTML-escaped there.
 async function sendOrderConfirmationEmail(order: any, customer: any, items: any[]) {
-  if (!emailTransporter) { console.log('[EMAIL] SMTP not configured, skipping email'); return; }
-  try {
-    const itemsHtml = items.map(i => `<tr><td style="padding:8px;border-bottom:1px solid #eee">${i.product_name}</td><td style="padding:8px;border-bottom:1px solid #eee">${i.sku}</td><td style="padding:8px;border-bottom:1px solid #eee">${i.quantity}</td><td style="padding:8px;border-bottom:1px solid #eee">₹${i.price}</td></tr>`).join('');
-    await emailTransporter.sendMail({
-      from: `"INFAMOUS" <${process.env.SMTP_FROM_EMAIL || process.env.SMTP_USER}>`,
-      to: customer.email,
-      subject: `Order Confirmed — #${order.order_number}`,
-      html: `<div style="font-family:sans-serif;max-width:600px;margin:0 auto"><h1 style="font-style:italic">INFAMOUS</h1><p>Hi ${customer.name || 'there'},</p><p>Your order <strong>#${order.order_number}</strong> has been confirmed.</p><table style="width:100%;border-collapse:collapse;margin:16px 0"><thead><tr style="background:#f5f5f5"><th style="padding:8px;text-align:left">Product</th><th style="padding:8px;text-align:left">SKU</th><th style="padding:8px;text-align:left">Qty</th><th style="padding:8px;text-align:left">Price</th></tr></thead><tbody>${itemsHtml}</tbody></table><p><strong>Total: ₹${order.total_amount}</strong></p><p><strong>Payment: ${order.payment_method || 'N/A'}</strong></p><p style="color:#888;font-size:12px">Thank you for shopping with INFAMOUS.</p></div>`,
-    });
-    console.log(`[EMAIL] Order confirmation sent to ${customer.email}`);
-  } catch (err) { console.error('[EMAIL] Failed to send order confirmation:', err); }
+  if (!customer?.email) return;
+  await sendTemplate(customer.email, emailTemplates.orderConfirmation(order, customer, items));
 }
 
 async function sendAdminOrderNotification(order: any, customer: any) {
-  if (!emailTransporter || !process.env.ADMIN_NOTIFICATION_EMAIL) { console.log('[EMAIL] Admin notification skipped'); return; }
-  try {
-    await emailTransporter.sendMail({
-      from: `"INFAMOUS System" <${process.env.SMTP_FROM_EMAIL || process.env.SMTP_USER}>`,
-      to: process.env.ADMIN_NOTIFICATION_EMAIL,
-      subject: `🛒 New Order #${order.order_number} — ₹${order.total_amount}`,
-      html: `<div style="font-family:sans-serif"><h2>New Order Received</h2><p><strong>Order:</strong> #${order.order_number}</p><p><strong>Customer:</strong> ${customer.name} (${customer.email})</p><p><strong>Phone:</strong> ${customer.phone_number || 'N/A'}</p><p><strong>Total:</strong> ₹${order.total_amount}</p><p><strong>Payment:</strong> ${order.payment_method || 'N/A'}</p></div>`,
-    });
-    console.log(`[EMAIL] Admin notification sent`);
-  } catch (err) { console.error('[EMAIL] Failed to send admin notification:', err); }
+  if (!process.env.ADMIN_NOTIFICATION_EMAIL) return;
+  await sendTemplate(process.env.ADMIN_NOTIFICATION_EMAIL, emailTemplates.adminOrder(order, customer));
 }
 
 function logSmsNotification(phone: string, message: string) {
@@ -130,6 +106,44 @@ pool.query(`
   ALTER TABLE orders ADD COLUMN IF NOT EXISTS customer_email VARCHAR(255);
   ALTER TABLE orders ADD COLUMN IF NOT EXISTS customer_phone VARCHAR(50);
 `).catch((err: any) => console.error('Failed to migrate order contact snapshot columns:', err.message));
+
+// Inline migration: single-use email tokens (verification + password reset). Only a SHA-256 hash is stored.
+pool.query(`
+  CREATE TABLE IF NOT EXISTS email_tokens (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    purpose VARCHAR(20) NOT NULL,
+    email VARCHAR(255),
+    token_hash VARCHAR(64) NOT NULL UNIQUE,
+    expires_at TIMESTAMPTZ NOT NULL,
+    used_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+  CREATE INDEX IF NOT EXISTS idx_email_tokens_user_purpose ON email_tokens (user_id, purpose);
+`).catch((err: any) => console.error('Failed to migrate email_tokens:', err.message));
+
+const sha256 = (s: string) => crypto.createHash('sha256').update(s).digest('hex');
+const VERIFY_TTL_MIN = 24 * 60;
+const RESET_TTL_MIN = 30;
+
+// Issues a fresh token and invalidates any earlier unused token of the same purpose for that user.
+async function issueEmailToken(userId: number, purpose: 'verify' | 'reset', email: string, ttlMinutes: number): Promise<string> {
+  const raw = crypto.randomBytes(32).toString('hex');
+  await pool.query('UPDATE email_tokens SET used_at = NOW() WHERE user_id = $1 AND purpose = $2 AND used_at IS NULL', [userId, purpose]);
+  await pool.query(
+    `INSERT INTO email_tokens (user_id, purpose, email, token_hash, expires_at) VALUES ($1, $2, $3, $4, NOW() + ($5 || ' minutes')::interval)`,
+    [userId, purpose, email, sha256(raw), String(ttlMinutes)]
+  );
+  return raw;
+}
+
+// Best effort (never throws, never blocks the request): sends the verification link for the user's current email.
+async function sendVerificationEmail(userId: number, name: string, email: string) {
+  try {
+    const token = await issueEmailToken(userId, 'verify', email, VERIFY_TTL_MIN);
+    await sendTemplate(email, emailTemplates.verifyEmail(name, `${appBaseUrl()}/auth/verify-email?token=${token}`));
+  } catch (err: any) { console.error('[EMAIL] Could not send verification email:', err.message); }
+}
 
 // Inline migration: server-side record of each Razorpay checkout (binds payment to user + items + amount)
 pool.query(`
@@ -429,6 +443,7 @@ app.post('/api/auth/register', authIpLimiter, registerLimiter, async (req, res) 
       ['NEW_CUSTOMER', 'New Customer Registered', `New customer ${cleanName} (${email}) signed up.`, user.id.toString(), 'USER']
     ).catch((err: any) => console.error('Failed to create notification:', err));
 
+    sendVerificationEmail(user.id, user.name, user.email);
     const tokens = await generateTokens(user.id, user.email, user.role);
     res.status(201).json({ message: 'Registration successful', ...tokens, user });
   } catch (error) {
@@ -602,26 +617,95 @@ app.post('/api/auth/phone', authIpLimiter, async (req, res) => {
   }
 });
 
-// Reset-email delivery is not implemented (no reset link/page exists), so no reset token is
-// issued. The response is identical for every email to avoid account enumeration.
-app.post('/api/auth/forgot-password', authIpLimiter, (req, res) => {
-  console.log('[AUTH] Password reset requested; reset email delivery is not configured.');
-  res.status(200).json({ message: 'If an account exists for this email, password reset instructions will be sent.' });
+// Password reset by email. The response is identical for every address (no account enumeration) and the
+// email is sent after responding. Only accounts that have a password or a verified email are eligible, so a
+// contact-only email typed into a profile/checkout can never be turned into a login.
+const forgotLimiter = rateLimit({            // per target email, counts every request
+  windowMs: 60 * 60 * 1000, limit: Number(process.env.FORGOT_RATE_LIMIT || 3),
+  keyGenerator: (req: any) => 'forgot:' + (loginEmailKey(req) || 'none'),
+  standardHeaders: 'draft-7', legacyHeaders: false, validate: { keyGeneratorIpFallback: false },
+  handler: tooManyAttempts('Too many reset requests for this email. Please try again in an hour.'),
+});
+app.post('/api/auth/forgot-password', authIpLimiter, forgotLimiter, async (req, res) => {
+  res.status(200).json({ message: 'If an account exists for this email, a password reset link has been sent.' });
+  const email = normalizeEmail(req.body?.email);
+  if (validateEmail(email)) return;
+  try {
+    const r = await pool.query(
+      `SELECT id, name, email FROM users WHERE LOWER(email) = $1 AND COALESCE(status, 'Active') <> 'Suspended'
+         AND (password_hash IS NOT NULL OR email_verified = true) ORDER BY id LIMIT 1`, [email]);
+    const user = r.rows[0];
+    if (!user) return;
+    const token = await issueEmailToken(user.id, 'reset', user.email, RESET_TTL_MIN);
+    await sendTemplate(user.email, emailTemplates.resetPassword(user.name, `${appBaseUrl()}/auth/reset-password?token=${token}`));
+  } catch (err: any) { console.error('[AUTH] Password reset email failed:', err.message); }
 });
 
 app.post('/api/auth/reset-password', authIpLimiter, async (req, res) => {
-  const { token, newPassword } = req.body;
-  if (typeof token !== 'string' || !token || validatePassword(newPassword)) {
-    return res.status(400).json({ message: 'Invalid or expired token' });
-  }
+  const { token, newPassword } = req.body || {};
+  if (typeof token !== 'string' || !/^[a-f0-9]{64}$/.test(token)) return res.status(400).json({ message: 'Invalid or expired token' });
+  const passwordError = validatePassword(newPassword);
+  if (passwordError) return res.status(400).json({ message: passwordError });
+  const client = await pool.connect();
   try {
-    const sessionRes = await pool.query('SELECT user_id FROM sessions WHERE token = $1 AND expires_at > CURRENT_TIMESTAMP', [`reset_${token}`]);
-    if (sessionRes.rows.length === 0) return res.status(400).json({ message: 'Invalid or expired token' });
-    const userId = sessionRes.rows[0].user_id;
     const hash = await bcrypt.hash(newPassword, 10);
-    await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [hash, userId]);
-    await pool.query('DELETE FROM sessions WHERE token = $1', [`reset_${token}`]);
+    await client.query('BEGIN');
+    // Single atomic consume: a token can be used once, only before it expires.
+    const t = await client.query(
+      `UPDATE email_tokens SET used_at = NOW() WHERE token_hash = $1 AND purpose = 'reset' AND used_at IS NULL AND expires_at > NOW() RETURNING user_id, email`,
+      [sha256(token)]);
+    if (t.rows.length === 0) { await client.query('ROLLBACK'); return res.status(400).json({ message: 'Invalid or expired token' }); }
+    const userId = t.rows[0].user_id;
+    const u = await client.query(`UPDATE users SET password_hash = $1, email_verified = CASE WHEN email IS NULL THEN email_verified ELSE true END, updated_at = CURRENT_TIMESTAMP
+                                  WHERE id = $2 AND LOWER(email) = LOWER($3) AND COALESCE(status, 'Active') <> 'Suspended' RETURNING name, email`, [hash, userId, t.rows[0].email]);
+    if (u.rows.length === 0) { await client.query('ROLLBACK'); return res.status(400).json({ message: 'Invalid or expired token' }); }
+    await client.query(`UPDATE email_tokens SET used_at = NOW() WHERE user_id = $1 AND purpose = 'reset' AND used_at IS NULL`, [userId]);
+    await client.query('DELETE FROM sessions WHERE user_id = $1', [userId]); // sign out every device
+    await client.query('COMMIT');
+    invalidateAccountCache(userId);
+    sendTemplate(u.rows[0].email, emailTemplates.passwordChanged(u.rows[0].name)).catch(() => {});
     res.status(200).json({ message: 'Password has been reset' });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error(error);
+    res.status(500).json({ message: 'Internal server error' });
+  } finally { client.release(); }
+});
+
+// Email verification: the link opens a page that POSTs the token (so mail scanners that prefetch links
+// cannot consume it). The token is bound to the address it was sent to.
+app.post('/api/auth/verify-email', authIpLimiter, async (req, res) => {
+  const { token } = req.body || {};
+  if (typeof token !== 'string' || !/^[a-f0-9]{64}$/.test(token)) return res.status(400).json({ message: 'Invalid or expired link' });
+  try {
+    const t = await pool.query(
+      `UPDATE email_tokens SET used_at = NOW() WHERE token_hash = $1 AND purpose = 'verify' AND used_at IS NULL AND expires_at > NOW() RETURNING user_id, email`,
+      [sha256(token)]);
+    if (t.rows.length === 0) return res.status(400).json({ message: 'Invalid or expired link' });
+    const u = await pool.query(
+      `UPDATE users SET email_verified = true, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND LOWER(email) = LOWER($2) RETURNING id`,
+      [t.rows[0].user_id, t.rows[0].email]);
+    if (u.rows.length === 0) return res.status(400).json({ message: 'This link is for an email address that is no longer on your account' });
+    res.status(200).json({ message: 'Email verified' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+const resendVerificationLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, limit: Number(process.env.VERIFY_RESEND_LIMIT || 5),
+  keyGenerator: (req: any) => 'verify:' + String(req.user?.userId), validate: { keyGeneratorIpFallback: false },
+  standardHeaders: 'draft-7', legacyHeaders: false, handler: tooManyAttempts('Too many verification emails requested. Please try again later.'),
+});
+app.post('/api/auth/resend-verification', authenticateToken, resendVerificationLimiter, async (req: any, res) => {
+  try {
+    const r = await pool.query('SELECT id, name, email, email_verified FROM users WHERE id = $1', [req.user.userId]);
+    const user = r.rows[0];
+    if (!user?.email) return res.status(400).json({ message: 'Add an email address to your profile first' });
+    if (user.email_verified) return res.status(200).json({ message: 'Your email is already verified', alreadyVerified: true });
+    await sendVerificationEmail(user.id, user.name, user.email);
+    res.status(200).json({ message: 'Verification email sent' });
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: 'Internal server error' });
@@ -711,6 +795,7 @@ app.put('/api/profile', authenticateToken, async (req: any, res) => {
   }
 
   try {
+    const prevEmail = (await pool.query('SELECT email FROM users WHERE id = $1', [userId])).rows[0]?.email;
     // Check if email belongs to another user
     const existingEmail = await pool.query('SELECT id FROM users WHERE LOWER(email) = LOWER($1) AND id != $2', [email, userId]);
     if (existingEmail.rows.length > 0) {
@@ -734,6 +819,9 @@ app.put('/api/profile', authenticateToken, async (req: any, res) => {
     );
 
     const user = updateRes.rows[0];
+    if (user && user.email_verified === false && normalizeEmail(prevEmail) !== normalizeEmail(user.email)) {
+      sendVerificationEmail(user.id, user.name, user.email);
+    }
 
     // Upsert default shipping address if provided
     if (address !== undefined && address !== null) {
@@ -1245,6 +1333,9 @@ async function notifyAdmins(type: string, title: string, message: string, refere
     'INSERT INTO admin_notifications (type, title, message, reference_id, reference_type) VALUES ($1, $2, $3, $4, $5)',
     [type, title, message, referenceId, referenceType]
   ).catch((e: any) => console.error('[PAYMENT] Failed to create admin notification:', e.message));
+  if (type === 'PAYMENT_ISSUE' && process.env.ADMIN_NOTIFICATION_EMAIL) {
+    sendTemplate(process.env.ADMIN_NOTIFICATION_EMAIL, emailTemplates.adminAlert(title, message)).catch(() => {});
+  }
 }
 
 // CREATED -> FAILED, exactly once. Only the caller that flips the state raises the alert.

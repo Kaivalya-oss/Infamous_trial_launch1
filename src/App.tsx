@@ -13,6 +13,8 @@ import OrderSuccess from './pages/OrderSuccess';
 import Login from './pages/Auth/Login';
 import Register from './pages/Auth/Register';
 import ForgotPassword from './pages/Auth/ForgotPassword';
+import ResetPassword from './pages/Auth/ResetPassword';
+import VerifyEmail from './pages/Auth/VerifyEmail';
 import ProfileLayout from './pages/Profile/ProfileLayout';
 import Orders from './pages/Profile/Orders';
 import PersonalInfo from './pages/Profile/PersonalInfo';
@@ -60,6 +62,8 @@ export default function App() {
               <Route path="/auth/login" element={<Login />} />
               <Route path="/auth/register" element={<Register />} />
               <Route path="/auth/forgot-password" element={<ForgotPassword />} />
+              <Route path="/auth/reset-password" element={<ResetPassword />} />
+              <Route path="/auth/verify-email" element={<VerifyEmail />} />
               
               {/* Static Pages */}
               <Route path="/privacy-policy" element={<PrivacyPolicy />} />
