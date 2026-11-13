@@ -7,6 +7,7 @@ import { ArrowLeft, ShoppingBag } from 'lucide-react';
 import { Button } from '../components/ui/Button';
 import { QuantitySelector } from '../components/ui/QuantitySelector';
 import ProductReviews from '../components/ProductReviews';
+import PriceTag from '../components/PriceTag';
 
 
 export default function ProductDetails() {
@@ -91,7 +92,7 @@ export default function ProductDetails() {
         </div>
         <div className="w-full md:w-1/2 flex flex-col justify-center">
           <h1 className="font-serif italic text-4xl md:text-5xl mb-4">{product.name}</h1>
-          <p className="text-2xl font-medium mb-8">₹{displayPrice}</p>
+          <p className="text-2xl font-medium mb-8"><PriceTag price={displayPrice} compareAt={specificVariant?.compare_at_price} saleName={specificVariant?.sale_name} /></p>
           <p className="text-textSecondary font-light leading-relaxed mb-8">{product.description || product.short_description}</p>
           
           <div className="flex gap-4 mb-6">

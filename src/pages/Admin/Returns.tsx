@@ -42,7 +42,7 @@ function ActionButtons({ returnItem, onAction }: { returnItem: any; onAction: (i
       );
       break;
     case 'ITEM_RECEIVED':
-      actions.push({ status: 'REFUND_INITIATED', label: 'Initiate Refund', style: 'bg-orange-500/20 hover:bg-orange-500/30 text-orange-400', icon: IndianRupee, needsNotes: false });
+      actions.push({ status: 'REFUND_INITIATED', label: 'Refund / Issue Credit', style: 'bg-orange-500/20 hover:bg-orange-500/30 text-orange-400', icon: IndianRupee, needsNotes: false });
       break;
     case 'REFUND_INITIATED':
       actions.push({ status: 'COMPLETED', label: 'Mark Completed', style: 'bg-blue-500/20 hover:bg-blue-500/30 text-blue-400', icon: CheckCircle, needsNotes: false });
@@ -122,6 +122,11 @@ export default function AdminReturns() {
 
   const handleAction = async (id: number, status: string, adminNotes: string) => {
     setActionError('');
+    if (status === 'REFUND_INITIATED') {
+      const r = returns.find(x => x.id === id);
+      const how = r?.refund_method === 'CREDIT' ? 'add store credit' : 'refund the original payment (online orders) or flag a manual refund (cash on delivery)';
+      if (!window.confirm(`This will ${how} for ₹${Number(r?.refund_amount || 0).toFixed(0)} right now and cannot be undone. Continue?`)) return;
+    }
     try {
       const res = await api.patch(`/api/admin/returns/${id}/status`, { status, admin_notes: adminNotes || undefined });
       const actualStatus = res.data.actual_status || status;
@@ -229,6 +234,15 @@ export default function AdminReturns() {
                       </td>
                       <td className="px-6 py-4">
                         <p className="text-sm font-semibold">₹{Number(r.refund_amount).toFixed(0)}</p>
+                        <p className="text-[10px] text-white/50 mt-0.5 uppercase tracking-[1px]">
+                          {r.refund_method === 'CREDIT' ? 'Customer wants store credit' : 'Customer wants original payment'}
+                        </p>
+                        {Number(r.credit_issued) > 0 && <p className="text-[10px] text-green-400 mt-0.5">Credit issued ₹{Number(r.credit_issued).toFixed(0)}</p>}
+                        {Number(r.cash_refund_amount) > 0 && (
+                          <p className={`text-[10px] mt-0.5 ${r.cash_refund_status === 'REFUNDED' ? 'text-green-400' : r.cash_refund_status === 'MANUAL' ? 'text-red-400' : 'text-orange-400'}`}>
+                            Cash ₹{Number(r.cash_refund_amount).toFixed(0)}: {r.cash_refund_status === 'REFUNDED' ? 'refunded to payment' : r.cash_refund_status === 'MANUAL' ? 'REFUND MANUALLY (bank/UPI)' : 'refund in progress'}
+                          </p>
+                        )}
                       </td>
                       <td className="px-6 py-4">
                         <span className={`px-3 py-1 rounded-full text-xs font-medium ${cfg.color}`}>{cfg.label}</span>

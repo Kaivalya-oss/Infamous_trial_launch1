@@ -6,6 +6,7 @@ import { useCart } from '../context/CartContext';
 import { Button } from './ui/Button';
 import { QuantitySelector } from './ui/QuantitySelector';
 import ProductReviews from './ProductReviews';
+import PriceTag from './PriceTag';
 
 interface Product {
   id?: string | number;
@@ -162,7 +163,7 @@ export default function QuickViewModal({ product, onClose, zIndex = 999, isTopmo
               <div className="p-8 md:p-12 flex-1">
                 <p className="text-sm font-medium tracking-[2px] text-textSecondary uppercase mb-4">Limited Edition</p>
                 <h2 className="font-serif italic text-4xl md:text-5xl leading-none mb-4">{product.name}</h2>
-                <p className="text-2xl font-medium mb-8">₹{displayPrice}</p>
+                <p className="text-2xl font-medium mb-8"><PriceTag price={displayPrice} compareAt={(selectedVariant as any)?.compare_at_price} saleName={(selectedVariant as any)?.sale_name} /></p>
                 
                 <p className="text-textSecondary font-light leading-relaxed mb-8">
                   A brutalist approach to modern luxury. Heavyweight fabrication and architectural 

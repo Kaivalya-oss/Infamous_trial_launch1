@@ -1,5 +1,5 @@
 import { Link, Outlet, useLocation, useNavigate } from 'react-router-dom';
-import { User, Package, RefreshCw, Settings, LogOut, ArrowLeft } from 'lucide-react';
+import { User, Package, RefreshCw, Settings, LogOut, ArrowLeft, Wallet } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 
 export default function ProfileLayout() {
@@ -16,6 +16,7 @@ export default function ProfileLayout() {
     { name: 'Personal Info', path: '/profile', icon: User },
     { name: 'Orders & Tracking', path: '/profile/orders', icon: Package },
     { name: 'Exchanges', path: '/profile/exchanges', icon: RefreshCw },
+    { name: 'Store Credit', path: '/profile/credit', icon: Wallet },
     { name: 'Security Settings', path: '/profile/settings', icon: Settings },
   ];
 

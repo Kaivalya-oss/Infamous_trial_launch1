@@ -20,6 +20,7 @@ import Orders from './pages/Profile/Orders';
 import PersonalInfo from './pages/Profile/PersonalInfo';
 import SecuritySettings from './pages/Profile/SecuritySettings';
 import Exchanges from './pages/Profile/Exchanges';
+import StoreCredit from './pages/Profile/StoreCredit';
 import IntroOverlay from './components/IntroOverlay';
 import ScrollToTop from './components/ScrollToTop';
 import Footer from './components/Footer';
@@ -34,6 +35,7 @@ import AdminOrders from './pages/Admin/Orders';
 import AdminCustomers from './pages/Admin/Customers';
 import AdminExchanges from './pages/Admin/Exchanges';
 import AdminReturns from './pages/Admin/Returns';
+import AdminSales from './pages/Admin/Sales';
 import AdminSettings from './pages/Admin/Settings';
 import AdminReviews from './pages/Admin/Reviews';
 import AdminLogin from './pages/Admin/AdminLogin';
@@ -87,6 +89,7 @@ export default function App() {
                   <Route path="reviews" element={<AdminReviews />} />
                   <Route path="exchanges" element={<AdminExchanges />} />
                   <Route path="returns" element={<AdminReturns />} />
+                  <Route path="sales" element={<AdminSales />} />
                   <Route path="settings" element={<AdminSettings />} />
                 </Route>
 
@@ -98,6 +101,7 @@ export default function App() {
                   <Route index element={<PersonalInfo />} />
                   <Route path="orders" element={<Orders />} />
                   <Route path="exchanges" element={<Exchanges />} />
+                  <Route path="credit" element={<StoreCredit />} />
                   <Route path="settings" element={<SecuritySettings />} />
                 </Route>
               </Route>

@@ -3839,7 +3839,7 @@ app.get('/api/admin/returns', verifyAdmin, async (req: any, res) => {
     let queryStr = `
       SELECT pr.id, pr.user_id, pr.order_id, pr.order_item_id, pr.variant_id,
              pr.quantity, pr.reason, pr.customer_notes, pr.status,
-             pr.refund_amount, pr.admin_notes, pr.processed_by,
+             pr.refund_amount, pr.refund_method, pr.credit_issued, pr.cash_refund_amount, pr.cash_refund_status, pr.admin_notes, pr.processed_by,
              pr.created_at, pr.updated_at,
              u.name AS customer_name, u.email AS customer_email,
              o.order_number,

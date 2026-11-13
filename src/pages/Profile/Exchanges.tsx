@@ -59,6 +59,9 @@ interface ReturnRecord {
   status: string;
   reason: string;
   refund_amount: string;
+  refund_method?: 'ORIGINAL' | 'CREDIT';
+  credit_issued?: string;
+  cash_refund_status?: string | null;
   admin_notes: string | null;
   created_at: string;
   updated_at: string;
@@ -492,6 +495,7 @@ function ReturnModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: (
   const [selectedItem, setSelectedItem] = useState<OrderItem | null>(null);
   const [reason, setReason] = useState('');
   const [customerNotes, setCustomerNotes] = useState('');
+  const [refundMethod, setRefundMethod] = useState<'ORIGINAL' | 'CREDIT'>('ORIGINAL');
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState('');
 
@@ -510,6 +514,7 @@ function ReturnModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: (
       await api.post('/api/returns', {
         order_item_id: selectedItem.order_item_id,
         reason,
+        refund_method: refundMethod,
         customer_notes: customerNotes.trim() || undefined,
       });
       onSuccess();
@@ -684,9 +689,29 @@ function ReturnModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: (
                     </div>
                   </div>
 
+                  <div>
+                    <p className="text-xs font-medium tracking-[1px] uppercase text-textSecondary mb-2">How would you like your refund?</p>
+                    <div className="flex flex-col gap-2">
+                      {([
+                        ['ORIGINAL', 'Refund to my original payment', 'Online payments go back to the card/UPI used (5-7 working days). Cash-on-delivery orders are refunded by our team by bank/UPI transfer.'],
+                        ['CREDIT', 'Store credit', 'Added to your INFAMOUS account as soon as we receive the item. Use it on any future order. It does not expire and cannot be withdrawn as cash.'],
+                      ] as const).map(([value, title, hint]) => (
+                        <button
+                          key={value}
+                          type="button"
+                          onClick={() => setRefundMethod(value)}
+                          className={`w-full text-left px-4 py-3 rounded-[12px] border text-sm transition-all ${refundMethod === value ? 'border-black bg-black/5' : 'border-black/10 hover:border-black/30'}`}
+                        >
+                          <span className="font-medium block">{title}</span>
+                          <span className="text-xs text-textSecondary">{hint}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
                   <div className="p-4 rounded-[14px] bg-green-50 border border-green-200/60 text-xs text-green-800 flex gap-2">
                     <CheckCircle2 size={14} className="shrink-0 mt-0.5" />
-                    <span>Your return will be approved immediately. Our team will schedule a pickup and process your refund after the item is received and inspected.</span>
+                    <span>Your return will be approved immediately. Our team will schedule a pickup and {refundMethod === 'CREDIT' ? 'add the store credit' : 'process your refund'} after the item is received and inspected.</span>
                   </div>
                 </div>
 
@@ -993,7 +1018,9 @@ export default function Exchanges() {
                       )}
                       <div className="flex items-center gap-2 mt-1">
                         <IndianRupee size={12} className="text-green-600" />
-                        <span className="text-xs text-green-600 font-medium">Refund: ₹{parseFloat(ret.refund_amount).toLocaleString()}</span>
+                        <span className="text-xs text-green-600 font-medium">
+                          Refund: ₹{parseFloat(ret.refund_amount).toLocaleString()} · {ret.refund_method === 'CREDIT' ? 'as store credit' : 'to original payment'}
+                        </span>
                       </div>
                     </div>
                   </div>

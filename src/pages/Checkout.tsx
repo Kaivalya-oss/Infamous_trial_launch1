@@ -11,6 +11,7 @@ import { QuantitySelector } from '../components/ui/QuantitySelector';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import * as z from 'zod';
+import { formatINR } from '../lib/money';
 
 const checkoutSchema = z.object({
   fullName: z.string().min(2, "Name is required"),
@@ -43,6 +44,9 @@ export default function Checkout() {
   
   const [step, setStep] = useState(1);
   const [paymentMethod, setPaymentMethod] = useState<'RAZORPAY' | 'COD' | null>(null);
+  // Store credit: the server re-checks the balance and decides the real amounts; this is only for display and choice.
+  const [creditBalance, setCreditBalance] = useState(0);
+  const [useCredit, setUseCredit] = useState(true);
   const [deliveryType, setDeliveryType] = useState<string | null>(null);
   const [selectedSlot, setSelectedSlot] = useState<string | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -96,6 +100,15 @@ export default function Checkout() {
     }
     return () => { isMounted = false; };
   }, [isAuthenticated, user]);
+
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    api.get('/api/credits').then(r => setCreditBalance(Number(r.data?.balance) || 0)).catch(() => setCreditBalance(0));
+  }, [isAuthenticated]);
+
+  const creditApplied = useCredit ? Math.min(creditBalance, cartTotal) : 0;
+  const amountDue = Math.max(0, cartTotal - creditApplied);
+  const creditCoversAll = creditApplied > 0 && amountDue === 0;
 
   const { register, handleSubmit, watch, formState: { errors } } = useForm<CheckoutFormValues>({
     resolver: zodResolver(checkoutSchema),
@@ -181,6 +194,7 @@ export default function Checkout() {
         items: checkoutItems,
         address: addressData,
         contact: { email: contactEmail, phone: contactPhone },
+        useCredit: creditApplied > 0,
       });
 
       setProcessingMessage('Opening payment gateway...');
@@ -252,7 +266,7 @@ export default function Checkout() {
   };
 
   // --- COD PAYMENT ---
-  const handleCODPayment = async () => {
+  const handleCODPayment = async (endpoint: '/api/checkout/cod' | '/api/checkout/credit' = '/api/checkout/cod') => {
     if (isSubmittingRef.current) return;
     isSubmittingRef.current = true;
     setIsProcessing(true);
@@ -267,13 +281,14 @@ export default function Checkout() {
     }
 
     try {
-      const { data } = await api.post('/api/checkout/cod', {
+      const { data } = await api.post(endpoint, {
         items: checkoutItems,
         address: addressData,
         contact: {
           email: contactEmail,
           phone: contactPhone,
         },
+        useCredit: creditApplied > 0,
         idempotencyKey: idempotencyKey.current,
       });
 
@@ -296,7 +311,8 @@ export default function Checkout() {
   };
 
   const handlePayment = () => {
-    if (paymentMethod === 'RAZORPAY') handleRazorpayPayment();
+    if (creditCoversAll) handleCODPayment('/api/checkout/credit');
+    else if (paymentMethod === 'RAZORPAY') handleRazorpayPayment();
     else if (paymentMethod === 'COD') handleCODPayment();
   };
 
@@ -431,8 +447,22 @@ export default function Checkout() {
                     )}
                   </AnimatePresence>
 
+                  {/* Store credit */}
+                  {creditBalance > 0 && (
+                    <label className="flex items-start gap-3 p-5 rounded-[16px] border-2 border-black/10 mb-4 cursor-pointer">
+                      <input type="checkbox" checked={useCredit} onChange={(e) => setUseCredit(e.target.checked)} className="mt-1 h-4 w-4 accent-black" />
+                      <div className="flex-1">
+                        <p className="font-medium">Use store credit</p>
+                        <p className="text-xs text-textSecondary mt-0.5">
+                          Balance ₹{formatINR(creditBalance)}
+                          {useCredit && creditApplied > 0 ? ` — ₹${formatINR(creditApplied)} will be applied to this order` : ''}
+                        </p>
+                      </div>
+                    </label>
+                  )}
+
                   {/* Payment Options */}
-                  <div className="flex flex-col gap-4 mb-8">
+                  <div className={`flex flex-col gap-4 mb-8 ${creditCoversAll ? 'hidden' : ''}`}>
                     <button
                       type="button"
                       onClick={() => setPaymentMethod('RAZORPAY')}
@@ -460,7 +490,7 @@ export default function Checkout() {
 
                   <Button
                     onClick={handlePayment}
-                    disabled={!paymentMethod || isProcessing}
+                    disabled={(!paymentMethod && !creditCoversAll) || isProcessing}
                     className="w-full flex items-center justify-center gap-3"
                   >
                     {isProcessing ? (
@@ -468,10 +498,12 @@ export default function Checkout() {
                         <Loader2 size={18} className="animate-spin" />
                         {processingMessage || 'Processing...'}
                       </>
+                    ) : creditCoversAll ? (
+                      `Pay with store credit — ₹${formatINR(cartTotal)}`
                     ) : paymentMethod === 'RAZORPAY' ? (
-                      `Pay ₹${cartTotal.toLocaleString()}`
+                      `Pay ₹${formatINR(amountDue)}`
                     ) : paymentMethod === 'COD' ? (
-                      `Place Order — ₹${cartTotal.toLocaleString()}`
+                      `Place Order — ₹${formatINR(amountDue)}`
                     ) : (
                       'Select a Payment Method'
                     )}
@@ -512,16 +544,22 @@ export default function Checkout() {
             <div className="border-t border-black/10 pt-6 flex flex-col gap-3 text-sm">
               <div className="flex justify-between text-textSecondary">
                 <span>Subtotal</span>
-                <span>₹{cartTotal.toLocaleString()}</span>
+                <span>₹{formatINR(cartTotal)}</span>
               </div>
               <div className="flex justify-between text-textSecondary">
                 <span>Shipping</span>
                 <span>Calculated at delivery</span>
               </div>
+              {creditApplied > 0 && (
+                <div className="flex justify-between text-green-700">
+                  <span>Store credit</span>
+                  <span>−₹{formatINR(creditApplied)}</span>
+                </div>
+              )}
             </div>
             <div className="border-t border-black/10 mt-6 pt-6 flex justify-between items-end">
-              <span className="font-medium">Total</span>
-              <span className="font-serif text-3xl">₹{cartTotal.toLocaleString()}</span>
+              <span className="font-medium">{creditApplied > 0 ? 'To pay' : 'Total'}</span>
+              <span className="font-serif text-3xl">₹{formatINR(amountDue)}</span>
             </div>
           </div>
         </div>

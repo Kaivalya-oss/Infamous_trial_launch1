@@ -214,10 +214,81 @@ export default function AdminCustomers() {
                   <p className="text-white/60 mt-2">Last Login: {selectedCustomer.last_login ? new Date(selectedCustomer.last_login).toLocaleString() : 'Never'}</p>
                 </div>
               </div>
+
+              <CreditAdjust
+                customer={selectedCustomer}
+                onChanged={(balance) => {
+                  setSelectedCustomer({ ...selectedCustomer, credit_balance: balance });
+                  setCustomers(prev => prev.map(c => c.id === selectedCustomer.id ? { ...c, credit_balance: balance } : c));
+                }}
+              />
             </motion.div>
           </div>
         )}
       </AnimatePresence>
     </motion.div>
+  );
+}
+
+// Store credit for one customer: current balance, a goodwill/correction form (reason is mandatory) and the ledger.
+function CreditAdjust({ customer, onChanged }: { customer: any; onChanged: (balance: number) => void }) {
+  const [amount, setAmount] = useState('');
+  const [reason, setReason] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState('');
+  const [ledger, setLedger] = useState<any[]>([]);
+
+  const load = () => {
+    api.get(`/api/admin/customers/${customer.id}/credit`)
+      .then(res => { setLedger(res.data.ledger || []); onChanged(Number(res.data.balance) || 0); })
+      .catch(() => setLedger([]));
+  };
+  useEffect(() => { load(); }, [customer.id]);
+
+  const submit = async (sign: 1 | -1) => {
+    const value = Number(amount);
+    if (!Number.isFinite(value) || value <= 0) return setMessage('Enter an amount greater than 0.');
+    if (reason.trim().length < 3) return setMessage('A reason is required (for example "Goodwill for late delivery").');
+    if (!window.confirm(`${sign > 0 ? 'Add' : 'Remove'} ₹${value} ${sign > 0 ? 'to' : 'from'} ${customer.name}'s store credit?`)) return;
+    setBusy(true);
+    setMessage('');
+    try {
+      const res = await api.post(`/api/admin/customers/${customer.id}/credit`, { amount: sign * value, reason: reason.trim() });
+      onChanged(Number(res.data.balance) || 0);
+      setAmount('');
+      setReason('');
+      setMessage('Store credit updated.');
+      load();
+    } catch (err: any) {
+      setMessage(err.response?.data?.message || 'Could not update store credit.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="bg-white/5 rounded-[12px] p-4 text-sm">
+      <p className="text-xs text-white/40 uppercase tracking-[1px] mb-2">Store Credit</p>
+      <p className="text-2xl font-serif mb-3">₹{Number(customer.credit_balance || 0).toLocaleString()}</p>
+      <div className="flex flex-col sm:flex-row gap-2 mb-2">
+        <input value={amount} onChange={e => setAmount(e.target.value)} inputMode="decimal" placeholder="Amount ₹" className="bg-black/30 border border-white/10 rounded-lg px-3 py-2 w-full sm:w-32 outline-none" />
+        <input value={reason} onChange={e => setReason(e.target.value)} maxLength={200} placeholder="Reason (required)" className="bg-black/30 border border-white/10 rounded-lg px-3 py-2 flex-1 outline-none" />
+      </div>
+      <div className="flex gap-2 mb-2">
+        <Button type="button" onClick={() => submit(1)} isLoading={busy} className="text-xs">Add credit</Button>
+        <Button type="button" variant="outline" onClick={() => submit(-1)} disabled={busy} className="text-xs">Remove credit</Button>
+      </div>
+      {message && <p className="text-xs text-white/70 mb-2">{message}</p>}
+      {ledger.length > 0 && (
+        <div className="mt-3 max-h-40 overflow-y-auto divide-y divide-white/5">
+          {ledger.slice(0, 20).map(row => (
+            <div key={row.id} className="py-2 flex justify-between gap-3 text-xs">
+              <span className="text-white/60">{new Date(row.created_at).toLocaleDateString()} · {row.type.replace(/_/g, ' ').toLowerCase()}{row.reason ? ` · ${row.reason}` : ''}</span>
+              <span className={Number(row.amount) >= 0 ? 'text-green-400' : 'text-white/80'}>{Number(row.amount) >= 0 ? '+' : '−'}₹{Math.abs(Number(row.amount)).toLocaleString()}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }

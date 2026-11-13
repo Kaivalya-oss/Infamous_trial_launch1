@@ -4,6 +4,7 @@ import { motion } from 'framer-motion';
 import { CheckCircle, Package, ArrowRight, ShoppingBag } from 'lucide-react';
 import api from '../lib/axios';
 import { Button } from '../components/ui/Button';
+import { formatINR } from '../lib/money';
 
 export default function OrderSuccess() {
   const { orderId } = useParams();
@@ -72,11 +73,17 @@ export default function OrderSuccess() {
             </div>
             <div>
               <p className="text-xs text-textSecondary uppercase tracking-[1px] mb-1">Total</p>
-              <p className="font-medium">₹{parseFloat(order.total_amount).toLocaleString()}</p>
+              <p className="font-medium">₹{formatINR(order.total_amount)}</p>
+              {Number(order.credit_applied) > 0 && (
+                <p className="text-xs text-green-700 mt-1">Store credit used: −₹{formatINR(order.credit_applied)}</p>
+              )}
             </div>
             <div>
               <p className="text-xs text-textSecondary uppercase tracking-[1px] mb-1">Payment</p>
-              <p className="font-medium">{order.payment_method || 'N/A'}</p>
+              <p className="font-medium">{order.payment_method === 'CREDIT' ? 'Store credit' : (order.payment_method || 'N/A')}</p>
+              {order.payment_method === 'COD' && (
+                <p className="text-xs text-textSecondary mt-1">Pay ₹{formatINR(Number(order.total_amount) - Number(order.credit_applied || 0))} on delivery</p>
+              )}
             </div>
             <div>
               <p className="text-xs text-textSecondary uppercase tracking-[1px] mb-1">Status</p>
@@ -93,7 +100,13 @@ export default function OrderSuccess() {
                   <p className="font-medium">{item.name}</p>
                   <p className="text-xs text-textSecondary mt-0.5">SKU: {item.sku} • Qty: {item.quantity}</p>
                 </div>
-                <p className="font-medium">₹{parseFloat(item.price).toLocaleString()}</p>
+                <p className="font-medium">
+                  {item.original_price && Number(item.original_price) > Number(item.price) && (
+                    <span className="line-through text-textSecondary/70 mr-2 font-normal">₹{formatINR(item.original_price)}</span>
+                  )}
+                  ₹{formatINR(item.price)}
+                  {item.sale_name && <span className="block text-[10px] uppercase tracking-[1px] text-textSecondary font-normal">{item.sale_name}</span>}
+                </p>
               </div>
             ))}
           </div>

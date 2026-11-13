@@ -9,6 +9,7 @@ import { Search, User, ShoppingBag, Play, ArrowRight, Menu, X } from 'lucide-rea
 import QuickViewModal from '../components/QuickViewModal';
 import { useCart } from '../context/CartContext';
 import axios from 'axios';
+import PriceTag from '../components/PriceTag';
 
 gsap.registerPlugin(ScrollTrigger);
 
@@ -437,7 +438,7 @@ export default function Home() {
                 </div>
                 <div className="flex justify-between items-end pt-5">
                   <h4 className="font-medium text-lg">{product.name}</h4>
-                  <span className="font-medium text-textSecondary">₹{product.price || (product.variants && product.variants.length > 0 ? product.variants[0].price : 0)}</span>
+                  <span className="font-medium text-textSecondary"><PriceTag price={product.price || product.variants?.[0]?.price || 0} compareAt={product.variants?.[0]?.compare_at_price} saleName={product.variants?.[0]?.sale_name} /></span>
                 </div>
               </div>
               );

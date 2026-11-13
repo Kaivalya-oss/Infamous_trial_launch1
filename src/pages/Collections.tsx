@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import axios from 'axios';
 import QuickViewModal from '../components/QuickViewModal';
+import PriceTag from '../components/PriceTag';
 
 export default function Collections() {
   const [products, setProducts] = useState<any[]>([]);
@@ -58,7 +59,7 @@ export default function Collections() {
                    <Link to={`/product/${product.slug}`}>
                      <h4 className="font-medium text-lg hover:underline">{product.name}</h4>
                    </Link>
-                   <span className="font-medium text-textSecondary">₹{product.price || (product.variants && product.variants.length > 0 ? product.variants[0].price : 0)}</span>
+                   <span className="font-medium text-textSecondary"><PriceTag price={product.price || product.variants?.[0]?.price || 0} compareAt={product.variants?.[0]?.compare_at_price} saleName={product.variants?.[0]?.sale_name} /></span>
                  </div>
                </div>
              );

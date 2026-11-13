@@ -1,5 +1,5 @@
 import { Link, Outlet, useLocation, useNavigate } from 'react-router-dom';
-import { LayoutDashboard, Package, Archive, ShoppingBag, Users, MessageSquare, RefreshCw, RotateCcw, Settings, LogOut } from 'lucide-react';
+import { LayoutDashboard, Package, Archive, ShoppingBag, Users, MessageSquare, RefreshCw, RotateCcw, Settings, LogOut, Tag } from 'lucide-react';
 import { useAdminAuth } from '../../context/AdminAuthContext';
 import AdminNotifications from '../../components/admin/AdminNotifications';
 
@@ -22,6 +22,7 @@ export default function AdminLayout() {
     { name: 'Reviews', path: '/admin/reviews', icon: MessageSquare },
     { name: 'Exchanges', path: '/admin/exchanges', icon: RefreshCw },
     { name: 'Returns', path: '/admin/returns', icon: RotateCcw },
+    { name: 'Sales', path: '/admin/sales', icon: Tag },
     { name: 'Settings', path: '/admin/settings', icon: Settings },
   ];
 
