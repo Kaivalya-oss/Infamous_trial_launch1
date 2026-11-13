@@ -7,9 +7,8 @@ Do this only after `PREVIEW_CHECKLIST.md` is fully ticked. Owners: **[You]** = d
 - [ ] [You] Old admin account `admin@infamous.com` deleted or its password rotated; create the real admin with `server/create_admin.js` using env vars (never commit credentials)
 - [ ] [You] GitHub repo set to **private** (old admin password is in git history)
 - [ ] [You] Delete leftover dev scripts' access: `server/test_merge.js` signs an admin token and calls production. Delete the file or confirm it is not deployed, and rotate `JWT_ACCESS_SECRET` if it was ever run with the production secret
-- [x] CORS tightened: with `NODE_ENV=production` only `FRONTEND_URL`, `APP_BASE_URL` and `CORS_ALLOWED_ORIGINS` (plus the current `infamous-trial-launch1-seven.vercel.app`) may call the API; wildcard `*.vercel.app` and localhost are rejected
+- [x] CORS tightened: with `NODE_ENV=production` only `FRONTEND_URL`, `APP_BASE_URL` and `CORS_ALLOWED_ORIGINS` may call the API; wildcard `*.vercel.app` and localhost are rejected
 - [ ] [You] Render: `FRONTEND_URL` and `APP_BASE_URL` set to the real storefront origin (without them the real domain is blocked by CORS); `CORS_ALLOWED_ORIGINS` empty (or only origins you really need)
-- [ ] [Claude, optional] Remove the hard-coded `https://infamous-trial-launch1-seven.vercel.app` origin once the real domain is live
 
 ## B. Accounts under the owner mailbox (client request: "everything on one email")
 Create/transfer so the **business owner** owns each, with 2-step verification on. Keep the developer as an added member, not the owner.

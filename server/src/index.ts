@@ -90,7 +90,6 @@ const normOrigin = (o?: string) => (o || '').trim().replace(/\/+$/, '');
 function isAllowedOrigin(origin?: string): boolean {
   if (!origin) return true;
   const exact = [
-    'https://infamous-trial-launch1-seven.vercel.app',
     process.env.FRONTEND_URL,
     process.env.APP_BASE_URL,
     ...(process.env.CORS_ALLOWED_ORIGINS || '').split(','),
