@@ -10,6 +10,7 @@ import { CloudinaryStorage } from 'multer-storage-cloudinary';
 import crypto from 'crypto';
 import Razorpay from 'razorpay';
 import { sendTemplate, emailTemplates, appBaseUrl } from './email';
+import { SALES_MIGRATION, saleJoin, effectivePrice, compareAtPrice, validateSale } from './sales';
 import { CREDIT_MIGRATION, addCredit, spendCredit, postCredit, splitRefund, round2 } from './credits';
 import { initializeApp, getApps } from 'firebase-admin/app';
 import { getAuth as getFirebaseAdminAuth } from 'firebase-admin/auth';
@@ -190,7 +191,8 @@ const intentsMigration = pool.query(`
 // Store credit (ledger, balance, order/return columns). Runs after the intents table exists.
 intentsMigration
   .then(() => pool.query(CREDIT_MIGRATION))
-  .catch((err: any) => console.error('Failed to migrate store credit:', err.message));
+  .then(() => pool.query(SALES_MIGRATION))
+  .catch((err: any) => console.error('Failed to migrate store credit / sales:', err.message));
 // Separate statement so a failure here can never roll back the table above
 pool.query(`
   CREATE UNIQUE INDEX IF NOT EXISTS idx_exchanges_razorpay_payment_id
@@ -883,10 +885,11 @@ app.get('/api/cart', authenticateToken, async (req: any, res) => {
     if (cartRes.rows.length === 0) return res.status(200).json({ items: [] });
     const cartId = cartRes.rows[0].id;
     const itemsRes = await pool.query(`
-      SELECT ci.id as cart_item_id, ci.quantity, v.id as variant_id, v.sku, v.price, v.color, v.size, v.stock, p.name as product_name, p.slug
+      SELECT ci.id as cart_item_id, ci.quantity, v.id as variant_id, v.sku, ${effectivePrice('v')} AS price, ${compareAtPrice('v')} AS compare_at_price, sl.name AS sale_name, v.color, v.size, v.stock, p.name as product_name, p.slug
       FROM cart_items ci
       JOIN product_variants v ON ci.variant_id = v.id
       JOIN products p ON v.product_id = p.id
+      ${saleJoin('v')}
       WHERE ci.cart_id = $1
     `, [cartId]);
     res.status(200).json({ items: itemsRes.rows });
@@ -1027,10 +1030,11 @@ app.post('/api/cart/merge', authenticateToken, async (req: any, res) => {
 
     // Now return the merged items back to the client (includes stock for UI max-quantity)
     const mergedItemsRes = await pool.query(`
-      SELECT ci.quantity, ci.variant_id, v.color, v.size, v.stock, p.name, v.price, p.id as product_id
+      SELECT ci.quantity, ci.variant_id, v.color, v.size, v.stock, p.name, ${effectivePrice('v')} AS price, p.id as product_id
       FROM cart_items ci
       JOIN product_variants v ON ci.variant_id = v.id
       JOIN products p ON v.product_id = p.id
+      ${saleJoin('v')}
       WHERE ci.cart_id = $1
       ORDER BY ci.id
     `, [cartId]);
@@ -1078,10 +1082,11 @@ app.get('/api/products', async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT p.*,
-        COALESCE(json_agg(DISTINCT jsonb_build_object('id', v.id, 'sku', v.sku, 'color', v.color, 'size', v.size, 'price', v.price, 'stock', v.stock)) FILTER (WHERE v.id IS NOT NULL), '[]') AS variants,
+        COALESCE(json_agg(DISTINCT jsonb_build_object('id', v.id, 'sku', v.sku, 'color', v.color, 'size', v.size, 'price', ${effectivePrice('v')}, 'compare_at_price', ${compareAtPrice('v')}, 'sale_name', sl.name, 'sale_ends_at', sl.ends_at, 'stock', v.stock)) FILTER (WHERE v.id IS NOT NULL), '[]') AS variants,
         COALESCE(json_agg(DISTINCT jsonb_build_object('id', m.id, 'cloudinary_url', m.cloudinary_url, 'cloudinary_public_id', m.cloudinary_public_id, 'is_cover', m.is_cover, 'media_type', m.media_type, 'display_order', m.display_order, 'variant_id', m.variant_id)) FILTER (WHERE m.id IS NOT NULL), '[]') AS media
       FROM products p
       LEFT JOIN product_variants v ON p.id = v.product_id AND v.status IS DISTINCT FROM 'ARCHIVED'
+      ${saleJoin('v')}
       LEFT JOIN product_images m ON p.id = m.product_id
       WHERE p.status = 'PUBLISHED'
       GROUP BY p.id
@@ -1098,10 +1103,11 @@ app.get('/api/products/:slug', async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT p.*,
-        COALESCE(json_agg(DISTINCT jsonb_build_object('id', v.id, 'sku', v.sku, 'color', v.color, 'size', v.size, 'price', v.price, 'stock', v.stock)) FILTER (WHERE v.id IS NOT NULL), '[]') AS variants,
+        COALESCE(json_agg(DISTINCT jsonb_build_object('id', v.id, 'sku', v.sku, 'color', v.color, 'size', v.size, 'price', ${effectivePrice('v')}, 'compare_at_price', ${compareAtPrice('v')}, 'sale_name', sl.name, 'sale_ends_at', sl.ends_at, 'stock', v.stock)) FILTER (WHERE v.id IS NOT NULL), '[]') AS variants,
         COALESCE(json_agg(DISTINCT jsonb_build_object('id', m.id, 'cloudinary_url', m.cloudinary_url, 'cloudinary_public_id', m.cloudinary_public_id, 'is_cover', m.is_cover, 'media_type', m.media_type, 'display_order', m.display_order, 'variant_id', m.variant_id)) FILTER (WHERE m.id IS NOT NULL), '[]') AS media
       FROM products p
       LEFT JOIN product_variants v ON p.id = v.product_id AND v.status IS DISTINCT FROM 'ARCHIVED'
+      ${saleJoin('v')}
       LEFT JOIN product_images m ON p.id = m.product_id
       WHERE p.slug = $1
       GROUP BY p.id
@@ -1201,7 +1207,7 @@ async function createOrderTransaction(
 
   for (const item of items) {
     const variantRes = await client.query(
-      'SELECT v.id, v.price, v.stock, v.sku, v.color, v.size, p.name as product_name FROM product_variants v JOIN products p ON v.product_id = p.id WHERE v.id = $1 FOR UPDATE',
+      `SELECT v.id, ${effectivePrice('v')} AS price, v.price AS original_price, sl.name AS sale_name, v.stock, v.sku, v.color, v.size, p.name as product_name FROM product_variants v JOIN products p ON v.product_id = p.id ${saleJoin('v')} WHERE v.id = $1 FOR UPDATE OF v`,
       [item.variant_id]
     );
     if (variantRes.rows.length === 0) throw new Error(`Variant ID ${item.variant_id} not found`);
@@ -1209,7 +1215,7 @@ async function createOrderTransaction(
     if (variant.stock < item.quantity) throw new Error(`Insufficient stock for ${variant.product_name} (${variant.color}/${variant.size}). Available: ${variant.stock}`);
     await client.query('UPDATE product_variants SET stock = stock - $1 WHERE id = $2', [item.quantity, item.variant_id]);
     totalAmount += parseFloat(variant.price) * item.quantity;
-    orderItems.push({ variant_id: item.variant_id, product_name: variant.product_name, sku: variant.sku, price: variant.price, quantity: item.quantity, color: variant.color, size: variant.size });
+    orderItems.push({ variant_id: item.variant_id, product_name: variant.product_name, sku: variant.sku, price: variant.price, original_price: variant.original_price, sale_name: variant.sale_name, quantity: item.quantity, color: variant.color, size: variant.size });
   }
 
   totalAmount = round2(totalAmount);
@@ -1245,8 +1251,8 @@ async function createOrderTransaction(
 
   for (const oi of orderItems) {
     await client.query(
-      'INSERT INTO order_items (order_id, variant_id, product_name, sku, price, quantity) VALUES ($1, $2, $3, $4, $5, $6)',
-      [order.id, oi.variant_id, oi.product_name, oi.sku, oi.price, oi.quantity]
+      'INSERT INTO order_items (order_id, variant_id, product_name, sku, price, quantity, original_price, sale_name) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
+      [order.id, oi.variant_id, oi.product_name, oi.sku, oi.price, oi.quantity, oi.original_price, oi.sale_name]
     );
   }
 
@@ -1312,7 +1318,7 @@ app.post('/api/checkout/create-order', authenticateToken, async (req: any, res) 
     // Calculate total from DB prices (NEVER trust frontend prices)
     let totalAmount = 0;
     for (const item of items) {
-      const vRes = await pool.query('SELECT price, stock FROM product_variants WHERE id = $1', [item.variant_id]);
+      const vRes = await pool.query(`SELECT ${effectivePrice('v')} AS price, v.stock FROM product_variants v ${saleJoin('v')} WHERE v.id = $1`, [item.variant_id]);
       if (vRes.rows.length === 0) return res.status(400).json({ message: `Variant ${item.variant_id} not found` });
       if (vRes.rows[0].stock < item.quantity) return res.status(400).json({ message: `Insufficient stock for variant ${item.variant_id}` });
       totalAmount += parseFloat(vRes.rows[0].price) * item.quantity;
@@ -1775,7 +1781,7 @@ app.get('/api/orders/:id', authenticateToken, async (req: any, res) => {
   try {
     const result = await pool.query(`
       SELECT o.*,
-        COALESCE(json_agg(DISTINCT jsonb_build_object('id', oi.id, 'sku', oi.sku, 'name', oi.product_name, 'price', oi.price, 'quantity', oi.quantity, 'variant_id', oi.variant_id)) FILTER (WHERE oi.id IS NOT NULL), '[]') AS items,
+        COALESCE(json_agg(DISTINCT jsonb_build_object('id', oi.id, 'sku', oi.sku, 'name', oi.product_name, 'price', oi.price, 'original_price', oi.original_price, 'sale_name', oi.sale_name, 'quantity', oi.quantity, 'variant_id', oi.variant_id)) FILTER (WHERE oi.id IS NOT NULL), '[]') AS items,
         COALESCE(json_agg(DISTINCT jsonb_build_object('status', h.status, 'notes', h.notes, 'date', h.created_at)) FILTER (WHERE h.id IS NOT NULL), '[]') AS timeline,
         p.payment_method, p.status as payment_status, p.razorpay_payment_id
       FROM orders o
@@ -1798,7 +1804,7 @@ app.get('/api/orders', authenticateToken, async (req: any, res) => {
   try {
     const result = await pool.query(`
       SELECT o.*,
-        COALESCE(json_agg(DISTINCT jsonb_build_object('id', oi.id, 'sku', oi.sku, 'name', oi.product_name, 'price', oi.price, 'quantity', oi.quantity)) FILTER (WHERE oi.id IS NOT NULL), '[]') AS items,
+        COALESCE(json_agg(DISTINCT jsonb_build_object('id', oi.id, 'sku', oi.sku, 'name', oi.product_name, 'price', oi.price, 'original_price', oi.original_price, 'sale_name', oi.sale_name, 'quantity', oi.quantity)) FILTER (WHERE oi.id IS NOT NULL), '[]') AS items,
         COALESCE(json_agg(DISTINCT jsonb_build_object('status', h.status, 'notes', h.notes, 'date', h.created_at)) FILTER (WHERE h.id IS NOT NULL), '[]') AS timeline
       FROM orders o
       LEFT JOIN order_items oi ON o.id = oi.order_id
@@ -2571,6 +2577,87 @@ app.get('/api/admin/customers', verifyAdmin, async (req, res) => {
   }
 });
 
+// --- SALES (named, time-boxed discounts) ---
+// Public: the sales running right now (for the storefront banner). Prices themselves come from the product/cart APIs.
+app.get('/api/sales/active', async (_req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT id, name, discount_type, discount_value, ends_at, applies_to_all FROM sales
+       WHERE is_active AND NOW() >= starts_at AND NOW() < ends_at ORDER BY ends_at ASC`);
+    res.status(200).json({ sales: r.rows });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+const SALE_SELECT = `
+  SELECT s.*, COALESCE((SELECT json_agg(sp.product_id ORDER BY sp.product_id) FROM sale_products sp WHERE sp.sale_id = s.id), '[]') AS product_ids,
+    CASE WHEN NOT s.is_active THEN 'DISABLED' WHEN NOW() < s.starts_at THEN 'UPCOMING' WHEN NOW() >= s.ends_at THEN 'ENDED' ELSE 'ACTIVE' END AS state
+  FROM sales s`;
+
+app.get('/api/admin/sales', verifyAdmin, async (_req, res) => {
+  try {
+    res.status(200).json({ sales: (await pool.query(`${SALE_SELECT} ORDER BY s.starts_at DESC, s.id DESC LIMIT 200`)).rows });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+async function saveSale(req: any, res: any, saleId: number | null) {
+  const v = validateSale(req.body);
+  if (v.error) return res.status(400).json({ message: v.error });
+  const sale = v.sale!;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    if (sale.product_ids.length > 0) {
+      const found = await client.query('SELECT id FROM products WHERE id = ANY($1::int[])', [sale.product_ids]);
+      if (found.rows.length !== sale.product_ids.length) { await client.query('ROLLBACK'); return res.status(400).json({ message: 'One or more selected products do not exist' }); }
+    }
+    let id = saleId;
+    if (id === null) {
+      id = (await client.query(
+        `INSERT INTO sales (name, discount_type, discount_value, starts_at, ends_at, applies_to_all, is_active, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+        [sale.name, sale.discount_type, sale.discount_value, sale.starts_at, sale.ends_at, sale.applies_to_all, sale.is_active, req.user.userId])).rows[0].id;
+    } else {
+      const upd = await client.query(
+        `UPDATE sales SET name=$1, discount_type=$2, discount_value=$3, starts_at=$4, ends_at=$5, applies_to_all=$6, is_active=$7, updated_at=NOW() WHERE id=$8 RETURNING id`,
+        [sale.name, sale.discount_type, sale.discount_value, sale.starts_at, sale.ends_at, sale.applies_to_all, sale.is_active, id]);
+      if (upd.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Sale not found' }); }
+      await client.query('DELETE FROM sale_products WHERE sale_id = $1', [id]);
+    }
+    for (const pid of sale.product_ids) await client.query('INSERT INTO sale_products (sale_id, product_id) VALUES ($1, $2)', [id, pid]);
+    await client.query('COMMIT');
+    const row = (await pool.query(`${SALE_SELECT} WHERE s.id = $1`, [id])).rows[0];
+    res.status(saleId === null ? 201 : 200).json({ sale: row });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('Save sale failed:', (error as Error).message);
+    res.status(500).json({ message: 'Internal server error' });
+  } finally { client.release(); }
+}
+app.post('/api/admin/sales', verifyAdmin, (req: any, res) => saveSale(req, res, null));
+app.put('/api/admin/sales/:id', verifyAdmin, (req: any, res) => {
+  const id = parsePositiveInt(req.params.id);
+  if (id === null) return res.status(400).json({ message: 'Invalid sale id' });
+  return saveSale(req, res, id);
+});
+// Deleting a sale never changes past orders: they keep the price they were charged and the sale name.
+app.delete('/api/admin/sales/:id', verifyAdmin, async (req: any, res) => {
+  const id = parsePositiveInt(req.params.id);
+  if (id === null) return res.status(400).json({ message: 'Invalid sale id' });
+  try {
+    const r = await pool.query('DELETE FROM sales WHERE id = $1 RETURNING id', [id]);
+    if (r.rows.length === 0) return res.status(404).json({ message: 'Sale not found' });
+    res.status(200).json({ message: 'Sale deleted' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
 // --- STORE CREDIT ---
 const creditHistory = async (userId: number) => {
   const bal = await pool.query('SELECT credit_balance FROM users WHERE id = $1', [userId]);
@@ -2730,7 +2817,7 @@ app.get('/api/admin/orders', verifyAdmin, async (req, res) => {
     const result = await pool.query(`
       SELECT o.*, u.name as customer_name, u.email as customer_email, u.phone_number as customer_phone,
         p.payment_method, p.status as payment_status, p.razorpay_payment_id,
-        COALESCE(json_agg(DISTINCT jsonb_build_object('id', oi.id, 'sku', oi.sku, 'name', oi.product_name, 'price', oi.price, 'quantity', oi.quantity, 'variant_id', oi.variant_id)) FILTER (WHERE oi.id IS NOT NULL), '[]') AS items
+        COALESCE(json_agg(DISTINCT jsonb_build_object('id', oi.id, 'sku', oi.sku, 'name', oi.product_name, 'price', oi.price, 'original_price', oi.original_price, 'sale_name', oi.sale_name, 'quantity', oi.quantity, 'variant_id', oi.variant_id)) FILTER (WHERE oi.id IS NOT NULL), '[]') AS items
       FROM orders o
       LEFT JOIN users u ON o.user_id = u.id
       LEFT JOIN payments p ON o.id = p.order_id
@@ -2772,7 +2859,7 @@ app.get('/api/admin/orders/:id', verifyAdmin, async (req, res) => {
     const result = await pool.query(`
       SELECT o.*, u.name as customer_name, u.email as customer_email, u.phone_number as customer_phone,
         p.payment_method, p.status as payment_status, p.razorpay_payment_id,
-        COALESCE(json_agg(DISTINCT jsonb_build_object('id', oi.id, 'sku', oi.sku, 'name', oi.product_name, 'price', oi.price, 'quantity', oi.quantity)) FILTER (WHERE oi.id IS NOT NULL), '[]') AS items,
+        COALESCE(json_agg(DISTINCT jsonb_build_object('id', oi.id, 'sku', oi.sku, 'name', oi.product_name, 'price', oi.price, 'original_price', oi.original_price, 'sale_name', oi.sale_name, 'quantity', oi.quantity)) FILTER (WHERE oi.id IS NOT NULL), '[]') AS items,
         COALESCE(json_agg(DISTINCT jsonb_build_object('status', h.status, 'notes', h.notes, 'date', h.created_at)) FILTER (WHERE h.id IS NOT NULL), '[]') AS timeline
       FROM orders o
       LEFT JOIN users u ON o.user_id = u.id
@@ -3002,8 +3089,9 @@ app.get('/api/exchanges/replacement-options', authenticateToken, async (req: any
 
     // Get all other variants of the same product with stock > 0
     const variantsRes = await pool.query(`
-      SELECT pv.id, pv.sku, pv.color, pv.size, pv.price, pv.stock
+      SELECT pv.id, pv.sku, pv.color, pv.size, ${effectivePrice('pv')} AS price, pv.stock
       FROM product_variants pv
+      ${saleJoin('pv')}
       WHERE pv.product_id = $1
         AND pv.id != $2
         AND pv.stock > 0
@@ -3100,8 +3188,9 @@ app.post('/api/exchanges', authenticateToken, async (req: any, res) => {
 
     // Verify requested variant exists, has stock, and is different from original
     const requestedVariantRes = await client.query(`
-      SELECT pv.id, pv.price, pv.stock, pv.color, pv.size, pv.product_id, pv.status
+      SELECT pv.id, ${effectivePrice('pv')} AS price, pv.stock, pv.color, pv.size, pv.product_id, pv.status
       FROM product_variants pv
+      ${saleJoin('pv')}
       WHERE pv.id = $1
     `, [requested_variant_id]);
 

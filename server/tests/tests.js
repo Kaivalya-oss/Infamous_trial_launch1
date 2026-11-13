@@ -1141,6 +1141,120 @@ const count = async (sql, p) => Number((await one(sql, p)).c);
     check('CREDIT admin customer list includes each balance', cl.status === 200 && Number(cl.body.customers.find(c => c.id === u6.id).credit_balance) === await bal(u6));
   }
 
+  // ---------------- SALES (named discounts) ----------------
+  {
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    let seq = 0;
+    const mkUser = async (name) => {
+      const email = `${name}@sale.test`;
+      const id = (await one(`INSERT INTO users (name,email,password_hash,phone_number,email_verified) VALUES ($1,$2,$3,$4,true) RETURNING id`, [name, email, await bcrypt.hash('SalePass1', 4), `+9198000${String(10000 + (++seq)).slice(1)}`])).id;
+      await q('INSERT INTO cart (user_id) VALUES ($1)', [id]);
+      return { id, email, tok: (await login(email, 'SalePass1')).accessToken };
+    };
+    const catId = (await one('SELECT id FROM categories LIMIT 1')).id;
+    const sp = (await one(`INSERT INTO products (name,slug,status,category_id) VALUES ('Sale Tee','sale-tee','PUBLISHED',$1) RETURNING id`, [catId])).id;
+    const other = (await one(`INSERT INTO products (name,slug,status,category_id) VALUES ('Full Price Tee','full-price-tee','PUBLISHED',$1) RETURNING id`, [catId])).id;
+    const sv = (await one(`INSERT INTO product_variants (product_id,sku,color,size,price,stock) VALUES ($1,'SL-A','Blue','M',1000,100) RETURNING id`, [sp])).id;
+    const cheap = (await one(`INSERT INTO product_variants (product_id,sku,color,size,price,stock) VALUES ($1,'SL-B','Blue','S',600,100) RETURNING id`, [sp])).id;
+    const ov = (await one(`INSERT INTO product_variants (product_id,sku,color,size,price,stock) VALUES ($1,'FP-A','Green','M',500,100) RETURNING id`, [other])).id;
+    const hours = (h) => new Date(Date.now() + h * 3600 * 1000).toISOString();
+    const mk = (over = {}) => ({ name: 'Diwali Sale', discount_type: 'PERCENT', discount_value: 20, starts_at: hours(-1), ends_at: hours(24), applies_to_all: false, product_ids: [sp], ...over });
+    const priceOf = async (variantId, slug = 'sale-tee') => (await call('GET', `/api/products/${slug}`)).body.product.variants.find(v => v.id === variantId);
+    const createSale = (over) => call('POST', '/api/admin/sales', mk(over), ADMIN);
+    const U = await mkUser('sale1');
+
+    // --- who can manage sales, and validation
+    check('SALE customers cannot create sales', (await call('POST', '/api/admin/sales', mk(), U.tok)).status === 403);
+    check('SALE anonymous cannot list admin sales', (await call('GET', '/api/admin/sales')).status === 401);
+    const bad = async (over) => (await createSale(over)).status;
+    check('SALE rejects a missing name / bad type / bad value', await bad({ name: '' }) === 400 && await bad({ discount_type: 'BOGO' }) === 400 && await bad({ discount_value: 0 }) === 400 && await bad({ discount_value: '20' }) === 400);
+    check('SALE rejects more than 90% off', await bad({ discount_value: 95 }) === 400);
+    check('SALE rejects end before start and invalid dates', await bad({ starts_at: hours(5), ends_at: hours(1) }) === 400 && await bad({ starts_at: 'soon' }) === 400);
+    check('SALE needs products or whole-shop', await bad({ product_ids: [] }) === 400 && await bad({ product_ids: [999999] }) === 400 && await bad({ product_ids: ['a'] }) === 400);
+    check('SALE nothing was created by the rejected requests', await count('SELECT count(*) c FROM sales') === 0);
+
+    // --- no sale: raw prices
+    const noSale = await priceOf(sv);
+    check('SALE without a sale the normal price is shown and there is no compare-at price', Number(noSale.price) === 1000 && noSale.compare_at_price === null && noSale.sale_name === null, noSale);
+
+    // --- an active percentage sale
+    const cr = await createSale();
+    check('SALE admin creates a named percentage sale', cr.status === 201 && cr.body.sale.name === 'Diwali Sale' && cr.body.sale.state === 'ACTIVE' && JSON.stringify(cr.body.sale.product_ids) === JSON.stringify([sp]), cr.body);
+    const saleId = cr.body.sale.id;
+    const d1 = await priceOf(sv), d2 = await priceOf(cheap);
+    check('SALE product page shows the sale price, original price and the sale name', Number(d1.price) === 800 && Number(d1.compare_at_price) === 1000 && d1.sale_name === 'Diwali Sale' && !!d1.sale_ends_at && Number(d2.price) === 480, { d1, d2 });
+    const list = (await call('GET', '/api/products')).body.products;
+    const lp = list.find(p => p.id === sp).variants.find(v => v.id === sv), lo = list.find(p => p.id === other).variants.find(v => v.id === ov);
+    check('SALE product list applies the sale only to the chosen product', Number(lp.price) === 800 && Number(lo.price) === 500 && lo.compare_at_price === null);
+    const pub = await call('GET', '/api/sales/active');
+    check('SALE public active-sales list names the running sale', pub.status === 200 && pub.body.sales.some(s => s.name === 'Diwali Sale' && Number(s.discount_value) === 20));
+    check('SALE admin list shows the sale with its state', (await call('GET', '/api/admin/sales', null, ADMIN)).body.sales.some(s => s.id === saleId && s.state === 'ACTIVE'));
+
+    // --- cart and checkout use the server-side sale price
+    await call('POST', '/api/cart/items', { variantId: sv, quantity: 2 }, U.tok);
+    const cart = (await call('GET', '/api/cart', null, U.tok)).body.items.find(i => i.variant_id === sv);
+    check('SALE cart shows the sale price with the original', Number(cart.price) === 800 && Number(cart.compare_at_price) === 1000 && cart.sale_name === 'Diwali Sale', cart);
+    const cod = await call('POST', '/api/checkout/cod', { items: [{ variant_id: sv, quantity: 2 }], address: ADDR, price: 1, total: 1, discount: 99999 }, U.tok);
+    const oi = await one('SELECT * FROM order_items WHERE order_id=$1', [cod.body.orderId]);
+    const ord = await one('SELECT total_amount FROM orders WHERE id=$1', [cod.body.orderId]);
+    const pay = await one('SELECT amount FROM payments WHERE order_id=$1', [cod.body.orderId]);
+    check('SALE order is charged the sale price and ignores prices sent by the browser', cod.status === 200 && Number(ord.total_amount) === 1600 && Number(pay.amount) === 1600 && Number(oi.price) === 800, { total: ord.total_amount, pay: pay.amount, oi });
+    check('SALE order line keeps the original price and the sale name', Number(oi.original_price) === 1000 && oi.sale_name === 'Diwali Sale');
+    const hist = (await call('GET', '/api/orders', null, U.tok)).body.orders.find(o => o.id === cod.body.orderId);
+    check('SALE order history exposes the sale name', JSON.stringify(hist).includes('Diwali Sale'));
+    const rz = await call('POST', '/api/checkout/create-order', { items: [{ variant_id: sv, quantity: 1 }], address: ADDR, price: 1 }, U.tok);
+    check('SALE Razorpay amount is the sale price', rz.status === 200 && rz.body.amount === 80000, rz.body);
+
+    // --- a sale that ends before the payment arrives must not undercharge: refund, no order
+    await q(`UPDATE sales SET ends_at = NOW() - interval '1 minute', starts_at = NOW() - interval '2 days' WHERE id=$1`, [saleId]);
+    const refunds0 = env.razorpayRefunds.length, orders0 = await count('SELECT count(*) c FROM orders WHERE user_id=$1', [U.id]);
+    const vr = await call('POST', '/api/checkout/verify-payment', { razorpay_order_id: rz.body.razorpayOrderId, razorpay_payment_id: 'pay_SL1', razorpay_signature: sig(rz.body.razorpayOrderId, 'pay_SL1'), address: ADDR }, U.tok);
+    check('SALE price changed after the Razorpay order was created: no order, the payment is refunded', vr.status !== 200 && await count('SELECT count(*) c FROM orders WHERE user_id=$1', [U.id]) === orders0 && env.razorpayRefunds.length === refunds0 + 1, { status: vr.status, body: vr.body });
+
+    // --- ended, upcoming, disabled sales do nothing
+    check('SALE an ended sale no longer discounts', Number((await priceOf(sv)).price) === 1000);
+    const upcoming = await createSale({ name: 'New Year Sale', starts_at: hours(48), ends_at: hours(96) });
+    check('SALE an upcoming sale does not discount yet and shows as UPCOMING', upcoming.body.sale.state === 'UPCOMING' && Number((await priceOf(sv)).price) === 1000);
+    check('SALE upcoming sales are not in the public active list', !(await call('GET', '/api/sales/active')).body.sales.some(s => s.name === 'New Year Sale'));
+    const disabled = await createSale({ name: 'Disabled Sale', is_active: false });
+    check('SALE a disabled sale does not discount', disabled.body.sale.state === 'DISABLED' && Number((await priceOf(sv)).price) === 1000);
+
+    // --- editing, overlapping sales (best price wins), flat amounts, whole-shop
+    const edit = await call('PUT', `/api/admin/sales/${saleId}`, mk({ name: 'Diwali Mega Sale', discount_value: 25 }), ADMIN);
+    check('SALE admin can edit a sale (name, value, dates)', edit.status === 200 && edit.body.sale.name === 'Diwali Mega Sale' && Number((await priceOf(sv)).price) === 750, edit.body);
+    check('SALE editing an unknown sale -> 404', (await call('PUT', '/api/admin/sales/999999', mk(), ADMIN)).status === 404);
+    const flat = await createSale({ name: 'Flat 300 Off', discount_type: 'FLAT', discount_value: 300 });
+    const best = await priceOf(sv);
+    check('SALE with overlapping sales the lowest price wins and its name is shown', Number(best.price) === 700 && best.sale_name === 'Flat 300 Off', best);
+    const huge = await createSale({ name: 'Huge Flat', discount_type: 'FLAT', discount_value: 5000, product_ids: [sp] });
+    check('SALE a flat discount larger than the price never goes below ₹1', Number((await priceOf(cheap)).price) === 1);
+    await call('DELETE', `/api/admin/sales/${huge.body.sale.id}`, null, ADMIN);
+    const shop = await createSale({ name: 'Shop-wide 10%', discount_value: 10, applies_to_all: true, product_ids: [] });
+    check('SALE a whole-shop sale discounts products that were not selected', Number((await priceOf(ov, 'full-price-tee')).price) === 450 && shop.status === 201);
+    await call('DELETE', `/api/admin/sales/${shop.body.sale.id}`, null, ADMIN);
+
+    // --- combining with store credit
+    await call('POST', `/api/admin/customers/${U.id}/credit`, { amount: 300, reason: 'Sale test credit' }, ADMIN);
+    const mix = await call('POST', '/api/checkout/cod', { items: [{ variant_id: sv, quantity: 1 }], address: ADDR, useCredit: true }, U.tok);
+    const mixPay = await one('SELECT amount FROM payments WHERE order_id=$1', [mix.body.orderId]);
+    check('SALE sale price and store credit combine: 700 less 300 credit = 400 to pay', mix.status === 200 && Number(mixPay.amount) === 400 && mix.body.creditApplied === 300, mix.body);
+
+    // --- a return refunds what the customer actually paid (the sale price)
+    for (const s of ['PACKED', 'SHIPPED', 'OUT_FOR_DELIVERY', 'DELIVERED']) await call('PUT', `/api/admin/orders/${mix.body.orderId}/status`, { status: s }, ADMIN);
+    const item = await one('SELECT id, price FROM order_items WHERE order_id=$1', [mix.body.orderId]);
+    const ret = await call('POST', '/api/returns', { order_item_id: item.id, reason: 'Size' }, U.tok);
+    check('SALE a return refunds the discounted price actually paid, not the list price', ret.status === 201 && Number(ret.body.returnRequest.refund_amount) === 700 && Number(item.price) === 700, ret.body);
+
+    // --- deleting a sale leaves past orders untouched
+    await call('DELETE', `/api/admin/sales/${flat.body.sale.id}`, null, ADMIN);
+    const after = await one('SELECT price, sale_name FROM order_items WHERE order_id=$1', [mix.body.orderId]);
+    check('SALE deleting a sale does not change past orders', Number(after.price) === 700 && after.sale_name === 'Flat 300 Off');
+    check('SALE deleting an unknown sale -> 404; the shop returns to list price when none are active', (await call('DELETE', '/api/admin/sales/999999', null, ADMIN)).status === 404);
+    await call('DELETE', `/api/admin/sales/${saleId}`, null, ADMIN);
+    await q('DELETE FROM sales');
+    check('SALE with all sales gone the price is the list price again', Number((await priceOf(sv)).price) === 1000);
+  }
+
   // ---------------- CORS ----------------
   {
     const acao = async (origin) => (await call('GET', '/api/products', null, null, { Origin: origin })).headers['access-control-allow-origin'];
