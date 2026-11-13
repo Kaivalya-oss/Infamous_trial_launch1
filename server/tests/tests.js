@@ -949,6 +949,198 @@ const count = async (sql, p) => Number((await one(sql, p)).c);
     check('LIFECYCLE admin note in return email is escaped', !!rm && rm.html.includes('Pickup &lt;tomorrow&gt;') && !rm.html.includes('<tomorrow>'));
   }
 
+  // ---------------- STORE CREDIT ----------------
+  {
+    const mails = env.mails;
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    let phoneSeq = 0;
+    const mkUser = async (name) => {
+      const email = `${name}@credit.test`;
+      const id = (await one(`INSERT INTO users (name,email,password_hash,phone_number,email_verified) VALUES ($1,$2,$3,$4,true) RETURNING id`, [name, email, await bcrypt.hash('CreditPass1', 4), `+9199000${String(10000 + (++phoneSeq)).slice(1)}`])).id;
+      await q('INSERT INTO cart (user_id) VALUES ($1)', [id]);
+      return { id, email, tok: (await login(email, 'CreditPass1')).accessToken };
+    };
+    const catId = (await one('SELECT id FROM categories LIMIT 1')).id;
+    const cp = (await one(`INSERT INTO products (name,slug,status,category_id) VALUES ('Credit Tee','credit-tee','PUBLISHED',$1) RETURNING id`, [catId])).id;
+    const vA = (await one(`INSERT INTO product_variants (product_id,sku,color,size,price,stock) VALUES ($1,'CR-A','Red','M',1000,100) RETURNING id`, [cp])).id;
+    const vB = (await one(`INSERT INTO product_variants (product_id,sku,color,size,price,stock) VALUES ($1,'CR-B','Red','L',600,100) RETURNING id`, [cp])).id;
+    const bal = async (u) => Number((await one('SELECT credit_balance FROM users WHERE id=$1', [u.id])).credit_balance);
+    const give = (u, amount, reason = 'Test credit') => call('POST', `/api/admin/customers/${u.id}/credit`, { amount, reason }, ADMIN);
+    const cod = (u, items, extra = {}) => call('POST', '/api/checkout/cod', { items, address: ADDR, ...extra }, u.tok);
+    const pay = async (orderId) => one('SELECT * FROM payments WHERE order_id=$1', [orderId]);
+    const A1 = [{ variant_id: vA, quantity: 1 }], B1 = [{ variant_id: vB, quantity: 1 }];
+
+    // --- admin adjustments and the customer's own view
+    const u1 = await mkUser('credit1');
+    check('CREDIT customers cannot grant credit', (await call('POST', `/api/admin/customers/${u1.id}/credit`, { amount: 500, reason: 'x y z' }, u1.tok)).status === 403);
+    check('CREDIT admin grant needs a reason', (await call('POST', `/api/admin/customers/${u1.id}/credit`, { amount: 500 }, ADMIN)).status === 400);
+    check('CREDIT admin grant rejects zero / non-numeric amounts', (await give(u1, 0)).status === 400 && (await call('POST', `/api/admin/customers/${u1.id}/credit`, { amount: '500', reason: 'abc' }, ADMIN)).status === 400);
+    const g1 = await give(u1, 500, 'Welcome credit');
+    check('CREDIT admin can grant credit', g1.status === 200 && g1.body.balance === 500 && await bal(u1) === 500, g1);
+    check('CREDIT admin cannot take the balance below zero', (await give(u1, -600, 'Correction')).status === 400 && await bal(u1) === 500);
+    const mine = await call('GET', '/api/credits', null, u1.tok);
+    check('CREDIT customer sees balance and ledger with the reason', mine.status === 200 && mine.body.balance === 500 && mine.body.ledger[0].type === 'ADMIN_ADJUST' && mine.body.ledger[0].reason === 'Welcome credit', mine.body);
+    check('CREDIT /api/credits requires login', (await call('GET', '/api/credits')).status === 401);
+
+    // --- COD order reduced by credit
+    const stockA0 = await stock(vA);
+    const c1 = await cod(u1, A1, { useCredit: true });
+    const o1 = await one('SELECT * FROM orders WHERE id=$1', [c1.body.orderId]);
+    const p1 = await pay(c1.body.orderId);
+    check('CREDIT partial credit on COD: order total unchanged, credit recorded, cash due reduced', c1.status === 200 && Number(o1.total_amount) === 1000 && Number(o1.credit_applied) === 500 && Number(p1.amount) === 500 && c1.body.amountDue === 500 && c1.body.paymentMethod === 'COD', c1.body);
+    check('CREDIT balance dropped to zero and the debit is in the ledger', await bal(u1) === 0 && (await one(`SELECT amount, balance_after FROM credit_ledger WHERE order_id=$1 AND type='ORDER_SPEND'`, [c1.body.orderId])).balance_after !== undefined && Number((await one(`SELECT amount FROM credit_ledger WHERE order_id=$1 AND type='ORDER_SPEND'`, [c1.body.orderId])).amount) === -500);
+    await sleep(150);
+    const cm = mails.find(m => m.to === u1.email && m.subject.includes(o1.order_number));
+    check('CREDIT confirmation email shows credit used and the amount to pay', !!cm && cm.html.includes('Store credit used') && cm.html.includes('500.00'), cm && cm.html.slice(0, 200));
+    check('CREDIT stock is reduced as normal', await stock(vA) === stockA0 - 1);
+    const c1b = await cod(u1, A1);
+    check('CREDIT without useCredit nothing is spent (and there is none left to spend)', c1b.status === 200 && Number((await one('SELECT credit_applied FROM orders WHERE id=$1', [c1b.body.orderId])).credit_applied) === 0);
+
+    // --- credit-only orders
+    await give(u1, 2000);
+    const stockB0 = await stock(vB);
+    const c2 = await call('POST', '/api/checkout/credit', { items: B1, address: ADDR }, u1.tok);
+    const p2 = await pay(c2.body.orderId);
+    check('CREDIT pay-with-credit order is created as paid with no cash due', c2.status === 200 && c2.body.paymentMethod === 'CREDIT' && Number(p2.amount) === 0 && p2.status === 'PAID' && await bal(u1) === 1400, c2.body);
+    const ordersBefore2 = await count('SELECT count(*) c FROM orders');
+    const c3 = await call('POST', '/api/checkout/credit', { items: [{ variant_id: vA, quantity: 2 }], address: ADDR }, u1.tok);
+    check('CREDIT pay-with-credit is refused when the balance does not cover the order, and nothing changes', c3.status === 400 && await bal(u1) === 1400 && await count('SELECT count(*) c FROM orders') === ordersBefore2 && await stock(vB) === stockB0 - 1, c3.body);
+    const c4 = await cod(u1, B1, { useCredit: true });
+    check('CREDIT COD order fully covered by credit becomes a credit order', c4.status === 200 && c4.body.paymentMethod === 'CREDIT' && await bal(u1) === 800, c4.body);
+    check('CREDIT credit cannot be spent by sending a client-side amount', (await cod(u1, B1, { useCredit: false, creditApplied: 9999, credit: 9999 })).status === 200 && await bal(u1) === 800);
+
+    // --- two simultaneous orders cannot spend the same credit twice
+    const u2 = await mkUser('credit2');
+    await give(u2, 1000);
+    const race = await Promise.all([cod(u2, A1, { useCredit: true, idempotencyKey: 'race-a' }), cod(u2, A1, { useCredit: true, idempotencyKey: 'race-b' })]);
+    const spent = Number((await one(`SELECT COALESCE(SUM(credit_applied),0) s FROM orders WHERE user_id=$1`, [u2.id])).s);
+    check('CREDIT concurrent orders spend the balance exactly once, never below zero', race.every(r => r.status === 200) && spent === 1000 && await bal(u2) === 0, { spent, statuses: race.map(r => r.status) });
+
+    // --- Razorpay with credit
+    const u3 = await mkUser('credit3');
+    await give(u3, 300);
+    const rz = await call('POST', '/api/checkout/create-order', { items: A1, address: ADDR, useCredit: true }, u3.tok);
+    check('CREDIT Razorpay order charges only the remainder', rz.status === 200 && rz.body.amount === 70000 && rz.body.creditApplied === 300 && Number((await one('SELECT credit_paise FROM checkout_payment_intents WHERE razorpay_order_id=$1', [rz.body.razorpayOrderId])).credit_paise) === 30000, rz.body);
+    check('CREDIT creating the Razorpay order does not spend credit yet', await bal(u3) === 300);
+    const vr = await call('POST', '/api/checkout/verify-payment', { razorpay_order_id: rz.body.razorpayOrderId, razorpay_payment_id: 'pay_CR1', razorpay_signature: sig(rz.body.razorpayOrderId, 'pay_CR1'), address: ADDR }, u3.tok);
+    const ro = await one('SELECT * FROM orders WHERE user_id=$1 ORDER BY id DESC LIMIT 1', [u3.id]);
+    const rp = ro && await pay(ro.id);
+    check('CREDIT verified Razorpay payment creates the order, spends the credit once, records cash paid', vr.status === 200 && Number(ro.credit_applied) === 300 && Number(ro.total_amount) === 1000 && Number(rp.amount) === 700 && rp.status === 'PAID' && await bal(u3) === 0, vr.body);
+    await give(u3, 5000);
+    check('CREDIT Razorpay checkout is refused (use credit checkout) when credit covers everything', (await call('POST', '/api/checkout/create-order', { items: B1, address: ADDR, useCredit: true }, u3.tok)).status === 400);
+    const rzNo = await call('POST', '/api/checkout/create-order', { items: B1, address: ADDR }, u3.tok);
+    check('CREDIT Razorpay checkout without useCredit charges the full price', rzNo.status === 200 && rzNo.body.amount === 60000 && rzNo.body.creditApplied === 0);
+
+    // --- credit used elsewhere between payment creation and payment: the payment is refunded, no order
+    const u4 = await mkUser('credit4');
+    await give(u4, 300);
+    const rz4 = await call('POST', '/api/checkout/create-order', { items: A1, address: ADDR, useCredit: true }, u4.tok);
+    await give(u4, -300, 'Drained before paying');
+    const refundsBefore = env.razorpayRefunds.length, orders4 = await count('SELECT count(*) c FROM orders WHERE user_id=$1', [u4.id]);
+    const vr4 = await call('POST', '/api/checkout/verify-payment', { razorpay_order_id: rz4.body.razorpayOrderId, razorpay_payment_id: 'pay_CR4', razorpay_signature: sig(rz4.body.razorpayOrderId, 'pay_CR4'), address: ADDR }, u4.tok);
+    check('CREDIT if the credit is gone when payment arrives, no order is created and the payment is refunded', vr4.status !== 200 && await count('SELECT count(*) c FROM orders WHERE user_id=$1', [u4.id]) === orders4 && env.razorpayRefunds.length === refundsBefore + 1 && env.razorpayRefunds[env.razorpayRefunds.length - 1].amount === 70000 && await bal(u4) === 0, { status: vr4.status, body: vr4.body });
+
+    // --- cancelling an order gives the credit back, once
+    const u5 = await mkUser('credit5');
+    await give(u5, 1000);
+    const k1 = await cod(u5, A1, { useCredit: true });
+    check('CREDIT order paid fully with credit starts at zero balance', k1.body.paymentMethod === 'CREDIT' && await bal(u5) === 0);
+    const cancel1 = await call('PUT', `/api/admin/orders/${k1.body.orderId}/status`, { status: 'CANCELLED' }, ADMIN);
+    check('CREDIT cancelling a credit order restores the full credit and cancels the payment', cancel1.status === 200 && await bal(u5) === 1000 && (await pay(k1.body.orderId)).status === 'CANCELLED', cancel1.body);
+    check('CREDIT cancelling again is refused (400) and credit is not restored twice', (await call('PUT', `/api/admin/orders/${k1.body.orderId}/status`, { status: 'CANCELLED' }, ADMIN)).status === 400 && await bal(u5) === 1000 && await count(`SELECT count(*) c FROM credit_ledger WHERE order_id=$1 AND type='ORDER_CANCEL_RESTORE'`, [k1.body.orderId]) === 1);
+    await give(u5, -600, 'Reset for next test');
+    const k2 = await cod(u5, A1, { useCredit: true });
+    await call('PUT', `/api/admin/orders/${k2.body.orderId}/status`, { status: 'CANCELLED' }, ADMIN);
+    check('CREDIT cancelling a part-credit COD order restores just the credit', Number((await one('SELECT credit_applied FROM orders WHERE id=$1', [k2.body.orderId])).credit_applied) === 400 && await bal(u5) === 400 && (await pay(k2.body.orderId)).status === 'CANCELLED');
+
+    // --- returns: refund to original payment, or store credit, chosen by the customer
+    const u6 = await mkUser('credit6');
+    const iid = async (u, price = 1000, variant = vA) => { const d = await deliveredOrder(u.id, variant, price); return d; };
+    check('CREDIT return with an invalid refund method -> 400', (await call('POST', '/api/returns', { order_item_id: (await iid(u6)).itemId, reason: 'x', refund_method: 'CASH' }, u6.tok)).status === 400);
+    const dCredit = await iid(u6);
+    const rc = await call('POST', '/api/returns', { order_item_id: dCredit.itemId, reason: 'Wrong size', refund_method: 'CREDIT' }, u6.tok);
+    check('CREDIT return remembers the customer chose store credit', rc.status === 201 && rc.body.returnRequest.refund_method === 'CREDIT', rc.body);
+    const rcId = rc.body.returnRequest.id, rpath = `/api/admin/returns/${rcId}/status`;
+    const refundsN = env.razorpayRefunds.length;
+    for (const s of ['PICKUP_SCHEDULED', 'ITEM_RECEIVED']) await call('PATCH', rpath, { status: s }, ADMIN);
+    check('CREDIT no credit is issued before the item comes back and the refund step runs', await bal(u6) === 0);
+    const mark = mails.length;
+    const ri = await call('PATCH', rpath, { status: 'REFUND_INITIATED' }, ADMIN);
+    const retRow = await one('SELECT * FROM product_returns WHERE id=$1', [rcId]);
+    check('CREDIT refund step issues store credit equal to the item price, no Razorpay refund', ri.status === 200 && await bal(u6) === 1000 && Number(retRow.credit_issued) === 1000 && Number(retRow.cash_refund_amount) === 0 && env.razorpayRefunds.length === refundsN, ri.body);
+    check('CREDIT the credit is recorded against the return in the ledger', await count(`SELECT count(*) c FROM credit_ledger WHERE return_id=$1 AND type='RETURN_CREDIT'`, [rcId]) === 1);
+    check('CREDIT the refund step cannot be repeated (credit never issued twice)', (await call('PATCH', rpath, { status: 'REFUND_INITIATED' }, ADMIN)).status === 400 && await bal(u6) === 1000);
+    await sleep(200);
+    const rm = mails.slice(mark).find(m => m.to === u6.email && m.subject.includes('Return'));
+    check('CREDIT return email says credit was added to the account', !!rm && rm.html.includes('store credit') && rm.html.includes('1000'), rm && rm.html.slice(0, 300));
+    check('CREDIT return can then be completed', (await call('PATCH', rpath, { status: 'COMPLETED' }, ADMIN)).status === 200);
+
+    // original-payment refund of an online order (partial Razorpay refund of just this item)
+    const dOnline = await iid(u6, 1000);
+    await q(`INSERT INTO payments (order_id,user_id,payment_method,amount,status,razorpay_payment_id) VALUES ($1,$2,'RAZORPAY',1000,'PAID','pay_RET1')`, [dOnline.orderId, u6.id]);
+    const ro1 = await call('POST', '/api/returns', { order_item_id: dOnline.itemId, reason: 'Defect' }, u6.tok);
+    check('CREDIT refund method defaults to the original payment', ro1.body.returnRequest.refund_method === 'ORIGINAL');
+    const ro1Id = ro1.body.returnRequest.id, ro1Path = `/api/admin/returns/${ro1Id}/status`;
+    for (const s of ['PICKUP_SCHEDULED', 'ITEM_RECEIVED', 'REFUND_INITIATED']) await call('PATCH', ro1Path, { status: s }, ADMIN);
+    await sleep(300);
+    const lastRefund = env.razorpayRefunds[env.razorpayRefunds.length - 1];
+    const ro1Row = await one('SELECT * FROM product_returns WHERE id=$1', [ro1Id]);
+    check('CREDIT original-payment return refunds exactly the item amount to the Razorpay payment', lastRefund.payment_id === 'pay_RET1' && lastRefund.amount === 100000 && ro1Row.cash_refund_status === 'REFUNDED' && !!ro1Row.razorpay_refund_id && await bal(u6) === 1000, { lastRefund, ro1Row });
+    check('CREDIT customer balance is untouched by an original-payment refund', await bal(u6) === 1000);
+
+    // COD orders cannot be refunded through Razorpay: the owner is told to refund manually
+    const dCod = await iid(u6, 600, vB);
+    await q(`INSERT INTO payments (order_id,user_id,payment_method,amount,status) VALUES ($1,$2,'COD',600,'PAID')`, [dCod.orderId, u6.id]);
+    const rcod = await call('POST', '/api/returns', { order_item_id: dCod.itemId, reason: 'Changed mind' }, u6.tok);
+    const rcodPath = `/api/admin/returns/${rcod.body.returnRequest.id}/status`;
+    const refundsBeforeCod = env.razorpayRefunds.length;
+    for (const s of ['PICKUP_SCHEDULED', 'ITEM_RECEIVED', 'REFUND_INITIATED']) await call('PATCH', rcodPath, { status: s }, ADMIN);
+    check('CREDIT COD return marks a manual refund and alerts the owner', (await one('SELECT cash_refund_status, cash_refund_amount FROM product_returns WHERE id=$1', [rcod.body.returnRequest.id])).cash_refund_status === 'MANUAL' && env.razorpayRefunds.length === refundsBeforeCod && await count(`SELECT count(*) c FROM admin_notifications WHERE title='Manual refund required for a return' AND reference_id=$1`, [String(rcod.body.returnRequest.id)]) === 1);
+
+    // order partly paid with credit: the credit part returns as credit, the cash part to the card
+    const dMix = await iid(u6, 1000);
+    await q('UPDATE orders SET credit_applied = 400 WHERE id=$1', [dMix.orderId]);
+    await q(`INSERT INTO payments (order_id,user_id,payment_method,amount,status,razorpay_payment_id) VALUES ($1,$2,'RAZORPAY',600,'PAID','pay_RET2')`, [dMix.orderId, u6.id]);
+    const rmix = await call('POST', '/api/returns', { order_item_id: dMix.itemId, reason: 'Defect' }, u6.tok);
+    const balBeforeMix = await bal(u6);
+    for (const s of ['PICKUP_SCHEDULED', 'ITEM_RECEIVED', 'REFUND_INITIATED']) await call('PATCH', `/api/admin/returns/${rmix.body.returnRequest.id}/status`, { status: s }, ADMIN);
+    await sleep(300);
+    const mixRefund = env.razorpayRefunds[env.razorpayRefunds.length - 1];
+    check('CREDIT part-credit order: credit part comes back as credit, cash part to the payment', await bal(u6) === balBeforeMix + 400 && mixRefund.payment_id === 'pay_RET2' && mixRefund.amount === 60000);
+
+    // failing Razorpay refund is retried by the reconciler and never doubled
+    const dFail = await iid(u6, 1000);
+    await q(`INSERT INTO payments (order_id,user_id,payment_method,amount,status,razorpay_payment_id) VALUES ($1,$2,'RAZORPAY',1000,'PAID','pay_RET3')`, [dFail.orderId, u6.id]);
+    const rfail = await call('POST', '/api/returns', { order_item_id: dFail.itemId, reason: 'Defect' }, u6.tok);
+    const rfId = rfail.body.returnRequest.id;
+    env.razorpayControl.refundFails = true;
+    for (const s of ['PICKUP_SCHEDULED', 'ITEM_RECEIVED', 'REFUND_INITIATED']) await call('PATCH', `/api/admin/returns/${rfId}/status`, { status: s }, ADMIN);
+    await sleep(300);
+    env.razorpayControl.refundFails = false;
+    const failRow = await one('SELECT cash_refund_status, cash_refund_attempts, razorpay_refund_id FROM product_returns WHERE id=$1', [rfId]);
+    check('CREDIT a failed Razorpay refund stays pending for retry', failRow.cash_refund_status === 'PENDING' && Number(failRow.cash_refund_attempts) === 1 && !failRow.razorpay_refund_id, failRow);
+    await q(`UPDATE product_returns SET updated_at = NOW() - interval '5 minutes' WHERE id=$1`, [rfId]);
+    const refundsBeforeRetry = env.razorpayRefunds.length;
+    await call('POST', '/api/admin/payments/reconcile', {}, ADMIN);
+    await call('POST', '/api/admin/payments/reconcile', {}, ADMIN);
+    check('CREDIT the reconciler completes the refund exactly once', (await one('SELECT cash_refund_status FROM product_returns WHERE id=$1', [rfId])).cash_refund_status === 'REFUNDED' && env.razorpayRefunds.length === refundsBeforeRetry + 1);
+    const dGive = await iid(u6, 1000);
+    await q(`INSERT INTO payments (order_id,user_id,payment_method,amount,status,razorpay_payment_id) VALUES ($1,$2,'RAZORPAY',1000,'PAID','pay_RET4')`, [dGive.orderId, u6.id]);
+    const rgive = await call('POST', '/api/returns', { order_item_id: dGive.itemId, reason: 'Defect' }, u6.tok);
+    const rgId = rgive.body.returnRequest.id;
+    env.razorpayControl.refundFails = true;
+    for (const s of ['PICKUP_SCHEDULED', 'ITEM_RECEIVED']) await call('PATCH', `/api/admin/returns/${rgId}/status`, { status: s }, ADMIN);
+    await q('UPDATE product_returns SET cash_refund_attempts = 4 WHERE id=$1', [rgId]);
+    await call('PATCH', `/api/admin/returns/${rgId}/status`, { status: 'REFUND_INITIATED' }, ADMIN);
+    await sleep(300);
+    env.razorpayControl.refundFails = false;
+    check('CREDIT after repeated failures the refund becomes manual and the owner is alerted', (await one('SELECT cash_refund_status FROM product_returns WHERE id=$1', [rgId])).cash_refund_status === 'MANUAL' && await count(`SELECT count(*) c FROM admin_notifications WHERE title='MANUAL REFUND REQUIRED (return)' AND reference_id=$1`, [String(rgId)]) === 1);
+
+    // admin customer list exposes the balance
+    const cl = await call('GET', '/api/admin/customers', null, ADMIN);
+    check('CREDIT admin customer list includes each balance', cl.status === 200 && Number(cl.body.customers.find(c => c.id === u6.id).credit_balance) === await bal(u6));
+  }
+
   // ---------------- CORS ----------------
   {
     const acao = async (origin) => (await call('GET', '/api/products', null, null, { Origin: origin })).headers['access-control-allow-origin'];

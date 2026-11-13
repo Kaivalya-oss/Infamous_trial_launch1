@@ -72,14 +72,14 @@ export const emailTemplates = {
     const rows = items.map((i) => `<tr><td style="padding:8px;border-bottom:1px solid #eee">${esc(i.product_name)}</td><td style="padding:8px;border-bottom:1px solid #eee">${esc(i.sku)}</td><td style="padding:8px;border-bottom:1px solid #eee">${esc(i.quantity)}</td><td style="padding:8px;border-bottom:1px solid #eee">₹${esc(i.price)}</td></tr>`).join('');
     return {
       subject: `Order Confirmed — #${order.order_number}`,
-      html: layout(`<p>Hi ${esc(customer.name || 'there')},</p><p>Your order <strong>#${esc(order.order_number)}</strong> has been confirmed.</p><table style="width:100%;border-collapse:collapse;margin:16px 0"><thead><tr style="background:#f5f5f5"><th style="padding:8px;text-align:left">Product</th><th style="padding:8px;text-align:left">SKU</th><th style="padding:8px;text-align:left">Qty</th><th style="padding:8px;text-align:left">Price</th></tr></thead><tbody>${rows}</tbody></table><p><strong>Total: ₹${esc(order.total_amount)}</strong></p><p><strong>Payment: ${esc(order.payment_method || 'N/A')}</strong></p><p>Thank you for shopping with INFAMOUS.</p>`),
+      html: layout(`<p>Hi ${esc(customer.name || 'there')},</p><p>Your order <strong>#${esc(order.order_number)}</strong> has been confirmed.</p><table style="width:100%;border-collapse:collapse;margin:16px 0"><thead><tr style="background:#f5f5f5"><th style="padding:8px;text-align:left">Product</th><th style="padding:8px;text-align:left">SKU</th><th style="padding:8px;text-align:left">Qty</th><th style="padding:8px;text-align:left">Price</th></tr></thead><tbody>${rows}</tbody></table><p><strong>Total: ₹${esc(order.total_amount)}</strong></p>${Number(order.credit_applied) > 0 ? `<p>Store credit used: −₹${esc(order.credit_applied)}<br><strong>Amount to pay: ₹${esc((Number(order.total_amount) - Number(order.credit_applied)).toFixed(2))}</strong></p>` : ''}<p><strong>Payment: ${esc(order.payment_method === 'CREDIT' ? 'Store credit' : (order.payment_method || 'N/A'))}</strong></p><p>Thank you for shopping with INFAMOUS.</p>`),
     };
   },
   adminOrder: (order: any, customer: any) => ({
     subject: `New Order #${order.order_number} — ₹${order.total_amount}`,
     html: layout(`<h2>New Order Received</h2><p><strong>Order:</strong> #${esc(order.order_number)}</p><p><strong>Customer:</strong> ${esc(customer.name)} (${esc(customer.email)})</p><p><strong>Total:</strong> ₹${esc(order.total_amount)}</p><p><strong>Payment:</strong> ${esc(order.payment_method || 'N/A')}</p>`),
   }),
-  orderStatus: (name: string, orderNumber: string, status: string, tracking?: string | null, refund?: string) => {
+  orderStatus: (name: string, orderNumber: string, status: string, tracking?: string | null, refund?: string, creditRestored = 0) => {
     const copy: Record<string, [string, string]> = {
       SHIPPED: ['Your order has shipped', 'is on its way.'],
       OUT_FOR_DELIVERY: ['Your order is out for delivery', 'is out for delivery and should reach you today.'],
@@ -88,18 +88,19 @@ export const emailTemplates = {
     };
     const [subject, line] = copy[status] || ['Order update', 'has been updated to ' + status + '.'];
     const extra = (tracking ? `<p><strong>Tracking number:</strong> ${esc(tracking)}</p>` : '') +
-      (status === 'CANCELLED' && refund && refund !== 'NONE' ? '<p>If you paid online, your refund has been started and usually reaches your account in 5-7 working days.</p>' : '');
+      (status === 'CANCELLED' && refund && refund !== 'NONE' ? '<p>If you paid online, your refund has been started and usually reaches your account in 5-7 working days.</p>' : '') +
+      (status === 'CANCELLED' && creditRestored > 0 ? `<p>₹${esc(creditRestored)} of store credit used on this order has been returned to your account.</p>` : '');
     return { subject: `${subject} — #${orderNumber}`, html: layout(`<p>Hi ${esc(name || 'there')},</p><p>Your order <strong>#${esc(orderNumber)}</strong> ${line}</p>${extra}<p><a href="${esc(appBaseUrl())}/profile/orders">View your orders</a></p>`) };
   },
-  caseStatus: (name: string, kind: 'Return' | 'Exchange', id: number, orderNumber: string, status: string, notes?: string | null) => {
+  caseStatus: (name: string, kind: 'Return' | 'Exchange', id: number, orderNumber: string, status: string, notes?: string | null, refundInfo?: { credit: number; cash: number }) => {
     const copy: Record<string, string> = {
       APPROVED: 'has been approved.', AWAITING_PAYMENT: 'has been approved. Please pay the exchange fee from your account to continue.',
       PAYMENT_CONFIRMED: 'has been approved and is ready for pickup scheduling.', REJECTED: 'could not be approved.',
       PICKUP_SCHEDULED: 'pickup has been scheduled.', ITEM_RECEIVED: 'item has been received at our warehouse.',
-      DISPATCHED: 'replacement has been dispatched.', REFUND_INITIATED: 'refund has been initiated and usually reaches you in 5-7 working days.',
+      DISPATCHED: 'replacement has been dispatched.', REFUND_INITIATED: 'refund has been initiated.',
       COMPLETED: 'is complete.', CANCELLED: 'has been cancelled.',
     };
-    return { subject: `${kind} #${id} update — order #${orderNumber}`, html: layout(`<p>Hi ${esc(name || 'there')},</p><p>Your ${kind.toLowerCase()} request <strong>#${id}</strong> for order #${esc(orderNumber)} ${copy[status] || 'was updated to ' + esc(status) + '.'}</p>${notes ? `<p><strong>Note from our team:</strong> ${esc(notes)}</p>` : ''}`) };
+    return { subject: `${kind} #${id} update — order #${orderNumber}`, html: layout(`<p>Hi ${esc(name || 'there')},</p><p>Your ${kind.toLowerCase()} request <strong>#${id}</strong> for order #${esc(orderNumber)} ${copy[status] || 'was updated to ' + esc(status) + '.'}</p>${refundInfo && status === 'REFUND_INITIATED' ? `<p>${refundInfo.credit > 0 ? `₹${esc(refundInfo.credit)} has been added to your store credit and can be used on any order.` : ''} ${refundInfo.cash > 0 ? `₹${esc(refundInfo.cash)} is being refunded to your original payment method.` : ''}</p>` : ''}${notes ? `<p><strong>Note from our team:</strong> ${esc(notes)}</p>` : ''}`) };
   },
   adminAlert: (title: string, message: string) => ({
     subject: `[INFAMOUS] ${title}`,

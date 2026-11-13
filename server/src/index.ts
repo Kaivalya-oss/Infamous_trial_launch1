@@ -10,6 +10,7 @@ import { CloudinaryStorage } from 'multer-storage-cloudinary';
 import crypto from 'crypto';
 import Razorpay from 'razorpay';
 import { sendTemplate, emailTemplates, appBaseUrl } from './email';
+import { CREDIT_MIGRATION, addCredit, spendCredit, postCredit, splitRefund, round2 } from './credits';
 import { initializeApp, getApps } from 'firebase-admin/app';
 import { getAuth as getFirebaseAdminAuth } from 'firebase-admin/auth';
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
@@ -38,16 +39,16 @@ async function sendOrderConfirmationEmail(order: any, customer: any, items: any[
 async function sendOrderStatusEmail(orderId: number, status: string, tracking: string | null, refund: string) {
   if (!['SHIPPED', 'OUT_FOR_DELIVERY', 'DELIVERED', 'CANCELLED'].includes(status)) return;
   try {
-    const r = await pool.query('SELECT o.order_number, COALESCE(o.customer_email, u.email) AS email, u.name FROM orders o LEFT JOIN users u ON u.id = o.user_id WHERE o.id = $1', [orderId]);
+    const r = await pool.query('SELECT o.order_number, o.credit_applied, COALESCE(o.customer_email, u.email) AS email, u.name FROM orders o LEFT JOIN users u ON u.id = o.user_id WHERE o.id = $1', [orderId]);
     const o = r.rows[0];
-    if (o?.email) await sendTemplate(o.email, emailTemplates.orderStatus(o.name, o.order_number, status, tracking, refund));
+    if (o?.email) await sendTemplate(o.email, emailTemplates.orderStatus(o.name, o.order_number, status, tracking, refund, Number(o.credit_applied || 0)));
   } catch (err: any) { console.error('[EMAIL] order status email failed:', err.message); }
 }
-async function sendCaseStatusEmail(kind: 'Return' | 'Exchange', id: number, userId: number, orderId: number, status: string, notes: string | null) {
+async function sendCaseStatusEmail(kind: 'Return' | 'Exchange', id: number, userId: number, orderId: number, status: string, notes: string | null, refundInfo?: { credit: number; cash: number }) {
   try {
     const r = await pool.query('SELECT o.order_number, u.email, u.name FROM orders o, users u WHERE o.id = $1 AND u.id = $2', [orderId, userId]);
     const c = r.rows[0];
-    if (c?.email) await sendTemplate(c.email, emailTemplates.caseStatus(c.name, kind, id, c.order_number, status, notes));
+    if (c?.email) await sendTemplate(c.email, emailTemplates.caseStatus(c.name, kind, id, c.order_number, status, notes, refundInfo));
   } catch (err: any) { console.error('[EMAIL] case status email failed:', err.message); }
 }
 
@@ -161,7 +162,7 @@ async function sendVerificationEmail(userId: number, name: string, email: string
 }
 
 // Inline migration: server-side record of each Razorpay checkout (binds payment to user + items + amount)
-pool.query(`
+const intentsMigration = pool.query(`
   CREATE TABLE IF NOT EXISTS checkout_payment_intents (
     razorpay_order_id VARCHAR(255) PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -185,6 +186,11 @@ pool.query(`
   CREATE INDEX IF NOT EXISTS idx_payment_intents_status_created ON checkout_payment_intents(status, created_at);
   ALTER TABLE payments ADD COLUMN IF NOT EXISTS razorpay_refund_id VARCHAR(255);
 `).catch((err: any) => console.error('Failed to migrate checkout_payment_intents:', err.message));
+
+// Store credit (ledger, balance, order/return columns). Runs after the intents table exists.
+intentsMigration
+  .then(() => pool.query(CREDIT_MIGRATION))
+  .catch((err: any) => console.error('Failed to migrate store credit:', err.message));
 // Separate statement so a failure here can never roll back the table above
 pool.query(`
   CREATE UNIQUE INDEX IF NOT EXISTS idx_exchanges_razorpay_payment_id
@@ -1121,7 +1127,9 @@ async function createOrderTransaction(
   razorpayData?: {orderId: string, paymentId: string, signature: string | null},
   idempotencyKey?: string,
   contactData?: { email?: string; phone?: string; phone_number?: string },
-  expectedAmountPaise?: number
+  expectedAmountPaise?: number,
+  // Store credit to spend on this order: 'MAX' = as much as the balance and order total allow, or an exact amount in paise.
+  creditRequest?: number | 'MAX'
 ) {
   // Defensive re-validation: every checkout path must pass integer quantities >= 1, no duplicates
   const validated = validateCheckoutItems(items);
@@ -1146,7 +1154,7 @@ async function createOrderTransaction(
 
   // Lock user record FOR UPDATE strictly using req.user.userId
   const userRes = await client.query(
-    'SELECT email, phone_number, email_verified, phone_verified FROM users WHERE id = $1 FOR UPDATE',
+    'SELECT email, phone_number, email_verified, phone_verified, credit_balance FROM users WHERE id = $1 FOR UPDATE',
     [userId]
   );
   if (userRes.rows.length === 0) throw new Error('User not found');
@@ -1204,17 +1212,31 @@ async function createOrderTransaction(
     orderItems.push({ variant_id: item.variant_id, product_name: variant.product_name, sku: variant.sku, price: variant.price, quantity: item.quantity, color: variant.color, size: variant.size });
   }
 
-  // Paid orders: the DB-recomputed total must equal what Razorpay actually charged
-  if (expectedAmountPaise !== undefined && Math.round(totalAmount * 100) !== expectedAmountPaise) {
+  totalAmount = round2(totalAmount);
+
+  // Store credit (the user row is locked above, so the balance cannot change under us)
+  let creditApplied = 0;
+  if (creditRequest !== undefined && creditRequest !== 0) {
+    const balance = round2(Number(userRow.credit_balance || 0));
+    creditApplied = creditRequest === 'MAX' ? Math.min(balance, totalAmount) : round2(creditRequest / 100);
+    if (creditApplied > balance || creditApplied > totalAmount) throw new Error('Your store credit balance changed. Please review your order and try again.');
+  }
+  const payable = round2(totalAmount - creditApplied);
+  if (paymentMethod === 'CREDIT' && payable > 0) throw new Error('Your store credit does not cover the whole order.');
+  if (paymentMethod === 'COD' && creditApplied > 0 && payable === 0) { paymentMethod = 'CREDIT'; paymentStatus = 'PAID'; }
+
+  // Paid orders: the DB-recomputed amount to pay must equal what Razorpay actually charged
+  if (expectedAmountPaise !== undefined && Math.round(payable * 100) !== expectedAmountPaise) {
     throw new Error('Order total changed after payment was created. Please contact support with your payment ID.');
   }
 
   const orderNumber = `INF-${new Date().getFullYear()}-${crypto.randomInt(10000, 99999)}`;
   const orderRes = await client.query(
-    `INSERT INTO orders (order_number, user_id, total_amount, status, shipping_address, customer_email, customer_phone, idempotency_key) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
-    [orderNumber, userId, totalAmount, 'CONFIRMED', JSON.stringify(address), finalEmail, finalPhone, idempotencyKey || null]
+    `INSERT INTO orders (order_number, user_id, total_amount, status, shipping_address, customer_email, customer_phone, idempotency_key, credit_applied) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+    [orderNumber, userId, totalAmount, 'CONFIRMED', JSON.stringify(address), finalEmail, finalPhone, idempotencyKey || null, creditApplied]
   );
   const order = orderRes.rows[0];
+  if (creditApplied > 0) await spendCredit(client, userId, creditApplied, order.id, `Order ${orderNumber}`);
 
   await client.query(
     `INSERT INTO admin_notifications (type, title, message, reference_id, reference_type) VALUES ($1, $2, $3, $4, $5)`,
@@ -1230,17 +1252,17 @@ async function createOrderTransaction(
 
   await client.query(
     'INSERT INTO payments (order_id, user_id, payment_method, amount, status, razorpay_order_id, razorpay_payment_id, razorpay_signature) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
-    [order.id, userId, paymentMethod, totalAmount, paymentStatus, razorpayData?.orderId || null, razorpayData?.paymentId || null, razorpayData?.signature || null]
+    [order.id, userId, paymentMethod, payable, paymentStatus, razorpayData?.orderId || null, razorpayData?.paymentId || null, razorpayData?.signature || null]
   );
 
-  await client.query('INSERT INTO order_status_history (order_id, status, notes) VALUES ($1, $2, $3)', [order.id, 'CONFIRMED', `Order placed via ${paymentMethod}`]);
+  await client.query('INSERT INTO order_status_history (order_id, status, notes) VALUES ($1, $2, $3)', [order.id, 'CONFIRMED', `Order placed via ${paymentMethod}${creditApplied > 0 ? ` (store credit used: ₹${creditApplied})` : ''}`]);
 
   const cartRes = await client.query('SELECT id FROM cart WHERE user_id = $1', [userId]);
   if (cartRes.rows.length > 0) {
     await client.query('DELETE FROM cart_items WHERE cart_id = $1', [cartRes.rows[0].id]);
   }
 
-  return { duplicate: false, orderId: order.id, orderNumber, totalAmount, order, orderItems, finalEmail, finalPhone };
+  return { duplicate: false, orderId: order.id, orderNumber, totalAmount, creditApplied, payable, paymentMethod, order, orderItems, finalEmail, finalPhone };
 }
 
 // Read-only pre-payment check of the same contact rules createOrderTransaction enforces, so a
@@ -1296,7 +1318,18 @@ app.post('/api/checkout/create-order', authenticateToken, async (req: any, res) 
       totalAmount += parseFloat(vRes.rows[0].price) * item.quantity;
     }
 
-    const amountInPaise = Math.round(totalAmount * 100);
+    totalAmount = round2(totalAmount);
+    // Optional store credit: reduces what Razorpay charges. It is spent (and re-checked) when the order is created.
+    let creditApplied = 0;
+    if (req.body.useCredit === true) {
+      const bal = await pool.query('SELECT credit_balance FROM users WHERE id = $1', [userId]);
+      creditApplied = Math.min(round2(Number(bal.rows[0]?.credit_balance || 0)), totalAmount);
+      const rest = round2(totalAmount - creditApplied);
+      if (creditApplied > 0 && rest === 0) return res.status(400).json({ message: 'Your store credit covers the whole order. Choose "Pay with store credit" instead.' });
+      if (creditApplied > 0 && rest < 1) creditApplied = round2(totalAmount - 1); // Razorpay's minimum charge is ₹1
+    }
+    const amountInPaise = Math.round(round2(totalAmount - creditApplied) * 100);
+    const creditPaise = Math.round(creditApplied * 100);
     const razorpayOrder = await razorpay.orders.create({
       amount: amountInPaise,
       currency: 'INR',
@@ -1305,14 +1338,15 @@ app.post('/api/checkout/create-order', authenticateToken, async (req: any, res) 
 
     // Bind this Razorpay order to the user, the exact items and the amount charged
     await pool.query(
-      'INSERT INTO checkout_payment_intents (razorpay_order_id, user_id, items, amount_paise, address, contact) VALUES ($1, $2, $3, $4, $5, $6)',
-      [razorpayOrder.id, userId, JSON.stringify(items), amountInPaise, JSON.stringify(validatedAddress.address), JSON.stringify(contact)]
+      'INSERT INTO checkout_payment_intents (razorpay_order_id, user_id, items, amount_paise, address, contact, credit_paise) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+      [razorpayOrder.id, userId, JSON.stringify(items), amountInPaise, JSON.stringify(validatedAddress.address), JSON.stringify(contact), creditPaise]
     );
 
     res.status(200).json({
       success: true,
       razorpayOrderId: razorpayOrder.id,
       amount: amountInPaise,
+      creditApplied,
       currency: 'INR',
       keyId: process.env.RAZORPAY_KEY_ID,
     });
@@ -1448,7 +1482,8 @@ async function finalizePaidIntent(p: { razorpayOrderId: string; paymentId: strin
     const address = intent.address ?? p.clientAddress;
     const contact = intent.contact ?? p.clientContact;
     const result = await createOrderTransaction(client, intent.user_id, items, address, 'RAZORPAY', 'PAID',
-      { orderId: p.razorpayOrderId, paymentId: p.paymentId, signature: p.signature }, undefined, contact, intent.amount_paise);
+      { orderId: p.razorpayOrderId, paymentId: p.paymentId, signature: p.signature }, undefined, contact, intent.amount_paise,
+      Number(intent.credit_paise) > 0 ? Number(intent.credit_paise) : undefined);
     await client.query(
       "UPDATE checkout_payment_intents SET status = 'COMPLETED', order_id = $1, razorpay_payment_id = $2, updated_at = CURRENT_TIMESTAMP WHERE razorpay_order_id = $3",
       [result.orderId, p.paymentId, p.razorpayOrderId]
@@ -1460,6 +1495,7 @@ async function finalizePaidIntent(p: { razorpayOrderId: string; paymentId: strin
     if (customer) {
       sendOrderConfirmationEmail({ ...result.order, payment_method: 'RAZORPAY' }, customer, result.orderItems!);
       sendAdminOrderNotification({ ...result.order, payment_method: 'RAZORPAY' }, customer);
+      // (credit used, if any, is shown by the template from order.credit_applied)
       if (customer.phone_number) logSmsNotification(customer.phone_number, `INFAMOUS: Your order #${result.orderNumber} has been placed. Total: ₹${result.totalAmount}. We'll keep you updated!`);
     }
     return { kind: 'created', result };
@@ -1615,6 +1651,35 @@ async function refundOrderPayment(orderId: number): Promise<'REFUNDED' | 'PENDIN
   }
 }
 
+// Refunds the cash part of an approved return to the original Razorpay payment. Claimed atomically so a retry,
+// the poller and an admin click can never refund twice; after 5 failed attempts it becomes a manual refund.
+async function refundReturnCash(returnId: number): Promise<'REFUNDED' | 'PENDING' | 'MANUAL' | 'NONE'> {
+  if (!razorpay) return 'NONE';
+  const claim = await pool.query(
+    `UPDATE product_returns SET cash_refund_status = 'PROCESSING', cash_refund_attempts = cash_refund_attempts + 1, updated_at = CURRENT_TIMESTAMP
+     WHERE id = $1 AND razorpay_refund_id IS NULL
+       AND (cash_refund_status = 'PENDING' OR (cash_refund_status = 'PROCESSING' AND updated_at < CURRENT_TIMESTAMP - INTERVAL '10 minutes'))
+     RETURNING order_id, cash_refund_amount, cash_refund_attempts`, [returnId]);
+  if (claim.rows.length === 0) return 'NONE';
+  const { order_id: orderId, cash_refund_amount: amount, cash_refund_attempts: attempts } = claim.rows[0];
+  try {
+    const pay = await pool.query('SELECT razorpay_payment_id FROM payments WHERE order_id = $1 AND razorpay_payment_id IS NOT NULL ORDER BY id LIMIT 1', [orderId]);
+    if (pay.rows.length === 0) throw new Error('No online payment found for this order');
+    const refund = await razorpay.payments.refund(pay.rows[0].razorpay_payment_id, {
+      amount: Math.round(parseFloat(amount) * 100), speed: 'normal', notes: { reason: 'Return refund', return_id: String(returnId), order_id: String(orderId) },
+    });
+    await pool.query("UPDATE product_returns SET cash_refund_status = 'REFUNDED', razorpay_refund_id = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2", [refund.id, returnId]);
+    return 'REFUNDED';
+  } catch (e: any) {
+    const detail = String(e?.error?.description || e?.message || 'unknown error').slice(0, 300);
+    const giveUp = Number(attempts) >= MAX_REFUND_ATTEMPTS;
+    await pool.query('UPDATE product_returns SET cash_refund_status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [giveUp ? 'MANUAL' : 'PENDING', returnId]);
+    console.error(`[PAYMENT] Refund for return ${returnId} failed: ${detail}`);
+    if (giveUp) await notifyAdmins('PAYMENT_ISSUE', 'MANUAL REFUND REQUIRED (return)', `Return #${returnId}: the automatic refund of ₹${amount} failed ${attempts} times (${detail}). Refund it in the Razorpay dashboard.`, String(returnId), 'RETURN');
+    return giveUp ? 'MANUAL' : 'PENDING';
+  }
+}
+
 let paymentReconcilerRunning = false;
 async function reconcilePayments(): Promise<{ checked: number; completed: number; failed: number; refunds: number }> {
   const summary = { checked: 0, completed: 0, failed: 0, refunds: 0 };
@@ -1642,6 +1707,11 @@ async function reconcilePayments(): Promise<{ checked: number; completed: number
         console.error(`[RECONCILE] ${row.razorpay_order_id}: ${e.message}`);
       }
     }
+    // 1b. Return refunds that did not go through the first time.
+    const stuckReturns = await pool.query(
+      `SELECT id FROM product_returns WHERE razorpay_refund_id IS NULL AND cash_refund_attempts < $1
+         AND cash_refund_status IN ('PENDING', 'PROCESSING') AND updated_at < CURRENT_TIMESTAMP - INTERVAL '2 minutes' LIMIT 10`, [MAX_REFUND_ATTEMPTS]);
+    for (const row of stuckReturns.rows) { if ((await refundReturnCash(row.id).catch(() => 'PENDING')) === 'REFUNDED') summary.refunds++; }
     // 2. Refunds that did not go through the first time.
     const failedIntents = await pool.query(
       `SELECT razorpay_order_id FROM checkout_payment_intents
@@ -1660,8 +1730,8 @@ if (process.env.VERCEL !== '1' && process.env.DISABLE_PAYMENT_RECONCILER !== '1'
   setInterval(() => { reconcilePayments().catch((e: any) => console.error('[RECONCILE] run failed:', e.message)); }, 5 * 60 * 1000).unref();
 }
 
-// COD checkout
-app.post('/api/checkout/cod', authenticateToken, async (req: any, res) => {
+// Orders that need no payment gateway: COD (optionally reduced by store credit) and store-credit-only orders.
+const placeNonGatewayOrder = (method: 'COD' | 'CREDIT') => async (req: any, res: any) => {
   const userId = req.user.userId;
   const { items, address, contact, idempotencyKey } = req.body;
   if (!items || items.length === 0) return res.status(400).json({ message: 'Cart is empty' });
@@ -1669,7 +1739,8 @@ app.post('/api/checkout/cod', authenticateToken, async (req: any, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const result = await createOrderTransaction(client, userId, items, address, 'COD', 'PENDING', undefined, idempotencyKey, contact);
+    const result = await createOrderTransaction(client, userId, items, address, method, method === 'COD' ? 'PENDING' : 'PAID', undefined, idempotencyKey, contact, undefined,
+      method === 'CREDIT' || req.body.useCredit === true ? 'MAX' : undefined);
     await client.query('COMMIT');
 
     if (result.duplicate) {
@@ -1679,12 +1750,12 @@ app.post('/api/checkout/cod', authenticateToken, async (req: any, res) => {
     const customerRes = await pool.query('SELECT name, email, phone_number FROM users WHERE id = $1', [userId]);
     const customer = customerRes.rows[0];
     if (customer) {
-      sendOrderConfirmationEmail({ ...result.order, payment_method: 'COD' }, customer, result.orderItems!);
-      sendAdminOrderNotification({ ...result.order, payment_method: 'COD' }, customer);
-      if (customer.phone_number) logSmsNotification(customer.phone_number, `INFAMOUS: Your COD order #${result.orderNumber} is confirmed. Total: ₹${result.totalAmount}. Pay on delivery.`);
+      sendOrderConfirmationEmail({ ...result.order, payment_method: result.paymentMethod }, customer, result.orderItems!);
+      sendAdminOrderNotification({ ...result.order, payment_method: result.paymentMethod }, customer);
+      if (customer.phone_number) logSmsNotification(customer.phone_number, result.paymentMethod === 'COD' ? `INFAMOUS: Your COD order #${result.orderNumber} is confirmed. Pay ₹${result.payable} on delivery.` : `INFAMOUS: Your order #${result.orderNumber} is confirmed and paid.`);
     }
 
-    res.status(200).json({ success: true, message: 'COD order placed', orderId: result.orderId, orderNumber: result.orderNumber, totalAmount: result.totalAmount, finalEmail: result.finalEmail, finalPhone: result.finalPhone });
+    res.status(200).json({ success: true, message: result.paymentMethod === 'COD' ? 'COD order placed' : 'Order placed', paymentMethod: result.paymentMethod, creditApplied: result.creditApplied, amountDue: result.payable, orderId: result.orderId, orderNumber: result.orderNumber, totalAmount: result.totalAmount, finalEmail: result.finalEmail, finalPhone: result.finalPhone });
   } catch (error: any) {
     await client.query('ROLLBACK');
     console.error('COD checkout failed:', error.message);
@@ -1693,7 +1764,9 @@ app.post('/api/checkout/cod', authenticateToken, async (req: any, res) => {
   } finally {
     client.release();
   }
-});
+};
+app.post('/api/checkout/cod', authenticateToken, placeNonGatewayOrder('COD'));
+app.post('/api/checkout/credit', authenticateToken, placeNonGatewayOrder('CREDIT'));
 
 // Single order detail (customer - ownership verified)
 app.get('/api/orders/:id', authenticateToken, async (req: any, res) => {
@@ -2484,7 +2557,7 @@ app.get('/api/admin/analytics', verifyAdmin, async (req, res) => {
 app.get('/api/admin/customers', verifyAdmin, async (req, res) => {
   try {
     const result = await pool.query(`
-      SELECT u.id, u.name, u.email, u.phone_number as phone, u.created_at as "joinDate", u.last_login, u.status,
+      SELECT u.id, u.name, u.email, u.phone_number as phone, u.created_at as "joinDate", u.last_login, u.status, u.credit_balance,
       COUNT(o.id) as orders, COALESCE(SUM(o.total_amount), 0) as ltv
       FROM users u
       LEFT JOIN orders o ON u.id = o.user_id
@@ -2497,6 +2570,60 @@ app.get('/api/admin/customers', verifyAdmin, async (req, res) => {
     res.status(500).json({ message: 'Internal server error' });
   }
 });
+
+// --- STORE CREDIT ---
+const creditHistory = async (userId: number) => {
+  const bal = await pool.query('SELECT credit_balance FROM users WHERE id = $1', [userId]);
+  const ledger = await pool.query(
+    `SELECT l.id, l.amount, l.balance_after, l.type, l.reason, l.created_at, o.order_number
+     FROM credit_ledger l LEFT JOIN orders o ON o.id = l.order_id WHERE l.user_id = $1 ORDER BY l.id DESC LIMIT 100`, [userId]);
+  return { balance: Number(bal.rows[0]?.credit_balance || 0), ledger: ledger.rows };
+};
+
+app.get('/api/credits', authenticateToken, async (req: any, res) => {
+  try {
+    res.status(200).json(await creditHistory(req.user.userId));
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+app.get('/api/admin/customers/:id/credit', verifyAdmin, async (req: any, res) => {
+  const id = parsePositiveInt(req.params.id);
+  if (id === null) return res.status(400).json({ message: 'Invalid customer id' });
+  try {
+    res.status(200).json(await creditHistory(id));
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// Goodwill credit (or a correction). A reason is mandatory and is kept in the ledger with the admin's id.
+app.post('/api/admin/customers/:id/credit', verifyAdmin, async (req: any, res) => {
+  const id = parsePositiveInt(req.params.id);
+  const amount = typeof req.body?.amount === 'number' ? round2(req.body.amount) : NaN;
+  const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : '';
+  if (id === null) return res.status(400).json({ message: 'Invalid customer id' });
+  if (!Number.isFinite(amount) || amount === 0 || Math.abs(amount) > 100000) return res.status(400).json({ message: 'Amount must be a non-zero number up to ₹1,00,000' });
+  if (reason.length < 3 || reason.length > 200) return res.status(400).json({ message: 'A reason of 3-200 characters is required' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const u = await client.query("SELECT id FROM users WHERE id = $1 AND role = 'USER' FOR UPDATE", [id]);
+    if (u.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Customer not found' }); }
+    const r = await postCredit(client, id, amount, 'ADMIN_ADJUST', reason, { adminId: req.user.userId });
+    await client.query('COMMIT');
+    res.status(200).json({ message: 'Store credit updated', balance: r.balance });
+  } catch (error: any) {
+    await client.query('ROLLBACK').catch(() => {});
+    const insufficient = /not enough/i.test(error?.message || '');
+    if (!insufficient) console.error(error);
+    res.status(insufficient ? 400 : 500).json({ message: insufficient ? 'That would take the balance below zero' : 'Internal server error' });
+  } finally { client.release(); }
+});
+
 
 app.put('/api/admin/customers/:id/status', verifyAdmin, async (req, res) => {
   const { id } = req.params;
@@ -2684,7 +2811,7 @@ app.put('/api/admin/orders/:id/status', verifyAdmin, async (req: any, res) => {
   try {
     await client.query('BEGIN');
     // Lock the order so concurrent updates/cancellations are serialized (stock is restored exactly once).
-    const orderRes = await client.query('SELECT id, status FROM orders WHERE id = $1 FOR UPDATE', [orderId]);
+    const orderRes = await client.query('SELECT id, status, user_id, credit_applied FROM orders WHERE id = $1 FOR UPDATE', [orderId]);
     if (orderRes.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Order not found' }); }
     const current: string = orderRes.rows[0].status;
 
@@ -2707,6 +2834,12 @@ app.put('/api/admin/orders/:id/status', verifyAdmin, async (req: any, res) => {
       // Online payments are queued for refund; an unpaid COD order simply has its payment cancelled.
       const paid = await client.query("UPDATE payments SET status = 'REFUND_PENDING', updated_at = CURRENT_TIMESTAMP WHERE order_id = $1 AND payment_method = 'RAZORPAY' AND status = 'PAID' RETURNING id", [orderId]);
       refundNeeded = paid.rows.length > 0;
+      // Store credit spent on the order goes back to the customer's balance (once: a unique ledger guard backs the row lock).
+      const creditUsed = Number(orderRes.rows[0].credit_applied || 0);
+      if (creditUsed > 0 && orderRes.rows[0].user_id) {
+        await addCredit(client, orderRes.rows[0].user_id, creditUsed, 'ORDER_CANCEL_RESTORE', `Order #${orderId} cancelled`, { orderId, adminId: req.user.userId });
+      }
+      await client.query("UPDATE payments SET status = 'CANCELLED', updated_at = CURRENT_TIMESTAMP WHERE order_id = $1 AND payment_method = 'CREDIT' AND status = 'PAID'", [orderId]);
       await client.query("UPDATE payments SET status = 'CANCELLED', updated_at = CURRENT_TIMESTAMP WHERE order_id = $1 AND payment_method = 'COD' AND status = 'PENDING'", [orderId]);
     }
 
@@ -3477,6 +3610,8 @@ const RETURN_TRANSITIONS: Record<string, string[]> = {
 app.post('/api/returns', authenticateToken, async (req: any, res) => {
   const userId = req.user.userId;
   const { order_item_id, reason, customer_notes } = req.body;
+  const refundMethod = req.body.refund_method === undefined ? 'ORIGINAL' : req.body.refund_method;
+  if (refundMethod !== 'ORIGINAL' && refundMethod !== 'CREDIT') return res.status(400).json({ message: 'refund_method must be ORIGINAL or CREDIT' });
 
   if (!order_item_id || !reason) {
     return res.status(400).json({ message: 'order_item_id and reason are required' });
@@ -3550,12 +3685,12 @@ app.post('/api/returns', authenticateToken, async (req: any, res) => {
     // Insert return — auto-accepted (status = APPROVED)
     const insertRes = await client.query(`
       INSERT INTO product_returns
-        (user_id, order_id, order_item_id, variant_id, quantity, reason, customer_notes, status, refund_amount)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, 'APPROVED', $8)
+        (user_id, order_id, order_item_id, variant_id, quantity, reason, customer_notes, status, refund_amount, refund_method)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, 'APPROVED', $8, $9)
       RETURNING *
     `, [
       userId, item.order_id, order_item_id, item.variant_id, item.quantity,
-      cleanReason, customer_notes || null, refundAmount
+      cleanReason, customer_notes || null, refundAmount, refundMethod
     ]);
 
     const returnRecord = insertRes.rows[0];
@@ -3587,7 +3722,7 @@ app.get('/api/returns', authenticateToken, async (req: any, res) => {
   const userId = req.user.userId;
   try {
     const result = await pool.query(`
-      SELECT pr.id, pr.status, pr.reason, pr.customer_notes, pr.refund_amount,
+      SELECT pr.id, pr.status, pr.reason, pr.customer_notes, pr.refund_amount, pr.refund_method, pr.credit_issued, pr.cash_refund_amount, pr.cash_refund_status,
              pr.admin_notes, pr.created_at, pr.updated_at,
              o.order_number,
              oi.product_name, oi.sku, oi.price, oi.quantity,
@@ -3695,6 +3830,23 @@ app.patch('/api/admin/returns/:id/status', verifyAdmin, async (req: any, res) =>
       });
     }
 
+    // REFUND_INITIATED pays the customer back, once, in the way they chose: store credit, or the original payment.
+    // The part of an order that was paid with store credit always goes back as store credit.
+    let credit = 0, cash = 0, cashStatus: string | null = null;
+    if (status === 'REFUND_INITIATED') {
+      const ord = (await client.query('SELECT total_amount, credit_applied FROM orders WHERE id = $1', [returnRecord.order_id])).rows[0];
+      const refundAmount = round2(Number(returnRecord.refund_amount));
+      if (returnRecord.refund_method === 'CREDIT') credit = refundAmount;
+      else ({ creditPart: credit, cashPart: cash } = splitRefund(refundAmount, ord.total_amount, ord.credit_applied));
+      if (credit > 0) {
+        await addCredit(client, returnRecord.user_id, credit, 'RETURN_CREDIT', `Return #${returnRecord.id} (order item refund)`, { returnId: returnRecord.id, orderId: returnRecord.order_id, adminId: req.user.userId });
+      }
+      if (cash > 0) {
+        const pay = await client.query("SELECT 1 FROM payments WHERE order_id = $1 AND razorpay_payment_id IS NOT NULL AND status IN ('PAID', 'SUCCESS', 'CAPTURED') LIMIT 1", [returnRecord.order_id]);
+        cashStatus = pay.rows.length > 0 && razorpay ? 'PENDING' : 'MANUAL';
+      }
+    }
+
     // On ITEM_RECEIVED, restore stock
     if (status === 'ITEM_RECEIVED') {
       await client.query(
@@ -3708,14 +3860,22 @@ app.patch('/api/admin/returns/:id/status', verifyAdmin, async (req: any, res) =>
       SET status = $1,
           admin_notes = COALESCE($2, admin_notes),
           processed_by = $3,
+          credit_issued = credit_issued + $5,
+          cash_refund_amount = cash_refund_amount + $6,
+          cash_refund_status = COALESCE($7, cash_refund_status),
           updated_at = CURRENT_TIMESTAMP
       WHERE id = $4
       RETURNING *
-    `, [status, admin_notes || null, req.user.userId, id]);
+    `, [status, admin_notes || null, req.user.userId, id, credit, cash, cashStatus]);
 
     await client.query('COMMIT');
 
-    sendCaseStatusEmail('Return', returnRecord.id, returnRecord.user_id, returnRecord.order_id, status, admin_notes || null);
+    sendCaseStatusEmail('Return', returnRecord.id, returnRecord.user_id, returnRecord.order_id, status, admin_notes || null, status === 'REFUND_INITIATED' ? { credit, cash } : undefined);
+    if (cashStatus === 'PENDING') refundReturnCash(returnRecord.id).catch((e: any) => console.error('[RETURN] cash refund error:', e.message));
+    if (cashStatus === 'MANUAL') {
+      await notifyAdmins('PAYMENT_ISSUE', 'Manual refund required for a return',
+        `Return #${returnRecord.id}: refund ₹${cash.toFixed(2)} to the customer by bank/UPI transfer (the order was cash on delivery or cannot be refunded through Razorpay), then mark the return completed.`, String(returnRecord.id), 'RETURN');
+    }
     res.status(200).json({
       success: true,
       message: `Return #${id} status updated to ${status}`,
