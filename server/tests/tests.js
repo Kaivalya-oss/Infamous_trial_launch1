@@ -119,7 +119,7 @@ const count = async (sql, p) => Number((await one(sql, p)).c);
   // (2) Attacker writes a victim's email + phone into their own profile
   const mallory = await mkUser('Mallory', 'mallory@test.local', { password: 'MalloryPass123' });
   const MAL = (await login('mallory@test.local', 'MalloryPass123')).accessToken;
-  const malPut = await call('PUT', '/api/profile', { first_name: 'Mal', last_name: 'Lory', email: 'victim@gmail.test', phone_number: '+919777777777' }, MAL);
+  const malPut = await call('PUT', '/api/profile', { first_name: 'Mal', last_name: 'Lory', email: 'victim@gmail.test', phone_number: '+919777777777', currentPassword: 'MalloryPass123' }, MAL);
   const mrow = await urow(mallory);
   check('PROFILE stores typed email/phone but NOT as verified', malPut.status === 200 && mrow.email === 'victim@gmail.test' && mrow.email_verified === false && mrow.phone_number === '+919777777777' && mrow.phone_verified === false, mrow);
   const vg = await call('POST', '/api/auth/google', { idToken: gTok('tok-g-victim', 'g-victim', 'victim@gmail.test') });
@@ -834,7 +834,7 @@ const count = async (sql, p) => Number((await one(sql, p)).c);
 
     // changing the profile email re-verifies, and a link for the old address cannot verify the new one
     mark = mails.length;
-    const pe = await call('PUT', '/api/profile', { first_name: 'Eve', last_name: 'T', email: 'eve2@test.local', phone_number: '' }, eveTok);
+    const pe = await call('PUT', '/api/profile', { first_name: 'Eve', last_name: 'T', email: 'eve2@test.local', phone_number: '', currentPassword: 'EvePass123' }, eveTok);
     check('EMAIL profile email change -> unverified', pe.status === 200 && pe.body.user.email_verified === false, pe);
     const vm2 = await waitMail('eve2@test.local', 'Verify', mark);
     check('EMAIL changing email sends a verification link to the NEW address', !!vm2);
@@ -1387,6 +1387,230 @@ const count = async (sql, p) => Number((await one(sql, p)).c);
     check('RETURN 7-day window: a request on day 8 is refused', (await call('POST', '/api/returns', { order_item_id: late.itemId, reason: 'Late' }, R.tok)).status === 403);
     const inTime = await deliveredOrder(R.id, v, 700, 1, 6);
     check('RETURN 7-day window: a request on day 6 is accepted', (await call('POST', '/api/returns', { order_item_id: inTime.itemId, reason: 'In time' }, R.tok)).status === 201);
+  }
+
+  // ---------------- SECURITY FIXES: S-01 email change, S-02 sessions, P-01/S-07 repository hygiene ----------------
+  {
+    const mails = env.mails;
+    const fs = require('fs'), pathx = require('path'), cpx = require('child_process');
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    const sha = (t) => crypto.createHash('sha256').update(t).digest('hex');
+    const ipOf = (n) => xff(`10.97.0.${n}`);
+    const reg = async (name, ipn, pw = 'PocPass123') => {
+      const r = await call('POST', '/api/auth/register', { name: `${name} User`, email: `${name}@s01.test`, password: pw }, null, ipOf(ipn));
+      return { email: `${name}@s01.test`, pw, tok: r.body.accessToken, refresh: r.body.refreshToken, id: r.body.user && r.body.user.id, status: r.status };
+    };
+    const profile = (tok, over = {}) => call('PUT', '/api/profile', { first_name: 'Poc', last_name: 'User', phone_number: '', ...over }, tok);
+    const emailOf = async (id) => (await one('SELECT email FROM users WHERE id=$1', [id])).email;
+
+    // ---------- S-01: the login email can no longer be changed with a stolen access token alone ----------
+    const v = await reg('victim', 1);
+    check('S-01 setup: account registered', v.status === 201 && !!v.tok);
+    let mark = mails.length;
+    const noPw = await profile(v.tok, { email: 'attacker@s01.test' });
+    check('S-01 changing the login email without the password is refused (403)', noPw.status === 403 && noPw.body.code === 'PASSWORD_REQUIRED_FOR_EMAIL_CHANGE', noPw.body);
+    check('S-01 the email was not changed by the refused request', await emailOf(v.id) === v.email);
+    const wrong = await profile(v.tok, { email: 'attacker@s01.test', currentPassword: 'WrongPass999' });
+    check('S-01 a wrong password is refused too', wrong.status === 403 && await emailOf(v.id) === v.email);
+    await call('POST', '/api/auth/forgot-password', { email: 'attacker@s01.test' });
+    await sleep(300);
+    check('S-01 so the account-takeover chain is closed: no reset link can reach the attacker address', !mails.slice(mark).some(m => m.to === 'attacker@s01.test'));
+    check('S-01 and the real owner can still sign in with the original email and password', (await call('POST', '/api/auth/login', { email: v.email, password: v.pw }, null, ipOf(2))).status === 200);
+
+    mark = mails.length;
+    const ok = await profile(v.tok, { email: 'newvictim@s01.test', currentPassword: v.pw });
+    check('S-01 with the correct password the email change works', ok.status === 200 && ok.body.user.email === 'newvictim@s01.test' && ok.body.user.email_verified === false && ok.body.user.has_password === true, ok.body);
+    const oldNotice = await (async () => { for (let i = 0; i < 40; i++) { const m = mails.slice(mark).find(x => x.to === v.email && x.subject.includes('email was changed')); if (m) return m; await sleep(50); } return null; })();
+    check('S-01 the PREVIOUS address is told about the change (masked new address only)', !!oldNotice && oldNotice.html.includes('n***@s01.test') && !oldNotice.html.includes('newvictim@s01.test'), oldNotice && oldNotice.html.slice(0, 160));
+    const verifyNew = await (async () => { for (let i = 0; i < 40; i++) { const m = mails.slice(mark).find(x => x.to === 'newvictim@s01.test' && x.subject.includes('Verify')); if (m) return m; await sleep(50); } return null; })();
+    check('S-01 the new address gets a verification link', !!verifyNew);
+    check('S-01 changing the same email in different case does not need the password', (await profile(v.tok, { email: 'NEWVICTIM@S01.TEST', first_name: 'Poc' })).status === 200);
+    check('S-01 changing only name/phone does not need the password', (await profile(v.tok, { email: 'newvictim@s01.test', first_name: 'Renamed', phone_number: '+919800000001' })).status === 200);
+    check('S-01 GET /api/profile tells the app whether a password is required', (await call('GET', '/api/profile', null, v.tok)).body.user.has_password === true);
+
+    // brute-forcing the password through the email form is rate limited (failed attempts only)
+    const b = await reg('bruter', 3);
+    const statuses = [];
+    for (let i = 0; i < 6; i++) statuses.push((await profile(b.tok, { email: 'x@s01.test', currentPassword: 'Guess' + i + 'Pass1' })).status);
+    check('S-01 repeated wrong passwords on the email form are rate limited (429 after 5)', statuses.slice(0, 5).every(s => s === 403) && statuses[5] === 429, statuses);
+    check('S-01 and a correct password does not bypass the lock-out', (await profile(b.tok, { email: 'x@s01.test', currentPassword: b.pw })).status === 429 && await emailOf(b.id) === b.email);
+
+    // accounts with no password (Google / phone) are unaffected: their email is contact data, never a credential
+    env.firebaseTokens['tok-google-s01'] = { uid: 'g-s01', email: 'googler@s01.test', email_verified: true, name: 'Googler One', picture: null, firebase: { sign_in_provider: 'google.com' } };
+    const g = await call('POST', '/api/auth/google', { idToken: 'tok-google-s01' }, null, ipOf(4));
+    const gChange = await profile(g.body.accessToken, { email: 'googler-new@s01.test' });
+    check('S-01 an account without a password can still change its contact email (no password exists to ask for)', g.status === 200 && gChange.status === 200 && gChange.body.user.has_password === false, gChange.body);
+
+    // ---------- S-02: sessions can be revoked, tokens are hashed and rotated ----------
+    const s = await reg('sessy', 5);
+    check('S-02 refresh tokens are stored hashed, never in plain text', await count('SELECT count(*) c FROM sessions WHERE token = $1', [s.refresh]) === 0 && await count('SELECT count(*) c FROM sessions WHERE token = $1', [sha(s.refresh)]) === 1);
+    check('S-02 a legacy plain-text session row no longer authenticates', (await q(`INSERT INTO sessions (user_id, token, expires_at) VALUES ($1, 'legacy-plain-token', NOW() + interval '1 day')`, [s.id]), (await call('POST', '/api/auth/refresh', { refreshToken: 'legacy-plain-token' })).status === 403));
+    const r1 = await call('POST', '/api/auth/refresh', { refreshToken: s.refresh });
+    check('S-02 refreshing returns a NEW refresh token (rotation)', r1.status === 200 && !!r1.body.refreshToken && r1.body.refreshToken !== s.refresh && !!r1.body.accessToken, Object.keys(r1.body));
+    const oldRow = await one('SELECT EXTRACT(EPOCH FROM (expires_at - NOW()))::int AS secs FROM sessions WHERE token = $1', [sha(s.refresh)]);
+    check('S-02 the previous token is cut down to a short grace period (<= 60s), not left alive for days', oldRow.secs <= 60 && oldRow.secs > 0, oldRow);
+    check('S-02 inside the grace period the old token still works once more (two tabs refreshing together are safe)', (await call('POST', '/api/auth/refresh', { refreshToken: s.refresh })).status === 200);
+    await q('UPDATE sessions SET expires_at = NOW() - interval \'1 second\' WHERE token = $1', [sha(s.refresh)]);
+    check('S-02 after the grace period a replayed (stolen) old token is refused', (await call('POST', '/api/auth/refresh', { refreshToken: s.refresh })).status === 403);
+    check('S-02 the newest token keeps working and rotates again', (await call('POST', '/api/auth/refresh', { refreshToken: r1.body.refreshToken })).status === 200);
+    check('S-02 oversized refresh tokens are rejected before touching the database', (await call('POST', '/api/auth/refresh', { refreshToken: 'a'.repeat(500) })).status === 401);
+
+    // logout really revokes
+    const lo = await call('POST', '/api/auth/login', { email: s.email, password: s.pw }, null, ipOf(6));
+    const outBefore = await call('POST', '/api/auth/refresh', { refreshToken: lo.body.refreshToken });
+    const out = await call('POST', '/api/auth/logout', { refreshToken: outBefore.body.refreshToken });
+    check('S-02 logout endpoint exists and answers 200', out.status === 200);
+    check('S-02 after logout the refresh token is dead on the server (not just forgotten by the browser)', (await call('POST', '/api/auth/refresh', { refreshToken: outBefore.body.refreshToken })).status === 403);
+    check('S-02 logout without a token / with garbage still answers 200 (no token probing)', (await call('POST', '/api/auth/logout', {})).status === 200 && (await call('POST', '/api/auth/logout', { refreshToken: 'nope' })).status === 200);
+
+    // password change signs out every other device and the stolen refresh token
+    const p = await reg('pwchange', 7);
+    const deviceB = await call('POST', '/api/auth/login', { email: p.email, password: p.pw }, null, ipOf(8));
+    mark = mails.length;
+    const chg = await call('POST', '/api/auth/update-password', { currentPassword: p.pw, newPassword: 'BrandNewPass456' }, p.tok);
+    check('S-02 password change succeeds and returns a fresh session for this device', chg.status === 200 && !!chg.body.accessToken && !!chg.body.refreshToken, Object.keys(chg.body));
+    check('S-02 password change revokes this account\'s OTHER sessions (a stolen refresh token dies)', (await call('POST', '/api/auth/refresh', { refreshToken: deviceB.body.refreshToken })).status === 403 && (await call('POST', '/api/auth/refresh', { refreshToken: p.refresh })).status === 403);
+    check('S-02 the fresh pair returned by the password change works', (await call('POST', '/api/auth/refresh', { refreshToken: chg.body.refreshToken })).status === 200);
+    await sleep(300);
+    check('S-02 the owner is emailed that the password was changed', mails.slice(mark).some(m => m.to === p.email && m.subject.includes('password was changed')));
+    check('S-02 other accounts\' sessions are untouched by someone else\'s password change', (await call('POST', '/api/auth/refresh', { refreshToken: (await call('POST', '/api/auth/login', { email: s.email, password: s.pw }, null, ipOf(9))).body.refreshToken })).status === 200);
+
+    // ---------- P-01 / S-07: nothing in the repository can recreate the exposed admin or forge tokens ----------
+    const serverDir = env.SERVER;
+    const seed = fs.readFileSync(pathx.join(serverDir, 'src/seed.ts'), 'utf8');
+    check('P-01 the seed script no longer creates an admin or contains a hard-coded password', !/admin123/.test(seed) && !/bcrypt\.hash\(/.test(seed) && !/super@infamous\.com/.test(seed));
+    const looseScripts = fs.readdirSync(serverDir).filter(f => /\.(js|mjs)$/.test(f)).filter(f => /\|\|\s*'secret'|jwt\.sign\(|onrender\.com/.test(fs.readFileSync(pathx.join(serverDir, f), 'utf8')));
+    check('S-07 no script in server/ signs tokens, uses a fallback secret or calls the live API', looseScripts.length === 0, looseScripts);
+    const tracked = cpx.spawnSync('git', ['ls-files', 'server/dist'], { cwd: pathx.join(serverDir, '..'), encoding: 'utf8' });
+    check('S-07 the stale compiled build is not tracked in git', tracked.status === 0 && tracked.stdout.trim() === '', tracked.stdout);
+    const jwtFallback = cpx.spawnSync('git', ['grep', '-n', '-F', "|| 'secret'", '--', 'server/src', 'src'], { cwd: pathx.join(serverDir, '..'), encoding: 'utf8' });
+    check('S-07 no tracked source falls back to a well-known JWT secret', jwtFallback.stdout.trim() === '', jwtFallback.stdout);
+  }
+
+  // ---------------- GOOGLE + PHONE ACCOUNT LINKING (no duplicate accounts, no silent merges) ----------------
+  {
+    const now = () => Math.floor(Date.now() / 1000);
+    const ip = (n) => xff(`10.96.0.${n}`);
+    const gToken = (name, uid, email) => { env.firebaseTokens[name] = { uid, email, email_verified: true, name: 'Link Tester', picture: null, firebase: { sign_in_provider: 'google.com', identities: { 'google.com': [uid], email: [email] } } }; return name; };
+    // Phone token as Firebase issues it AFTER linkWithPhoneNumber on a Google user: same uid, both identities
+    const linkedPhoneToken = (name, uid, phone, authTime = now()) => { env.firebaseTokens[name] = { uid, phone_number: phone, auth_time: authTime, firebase: { sign_in_provider: 'phone', identities: { phone: [phone], 'google.com': [uid] } } }; return name; };
+    // Phone token of a phone-only Firebase user (what signInWithPhoneNumber gives)
+    const phoneOnlyToken = (name, uid, phone, authTime = now()) => { env.firebaseTokens[name] = { uid, phone_number: phone, auth_time: authTime, firebase: { sign_in_provider: 'phone', identities: { phone: [phone] } } }; return name; };
+    const link = (access, idToken) => call('POST', '/api/account/link-phone', { idToken }, access);
+    const owned = async (id) => ({
+      orders: await count('SELECT count(*) c FROM orders WHERE user_id=$1', [id]),
+      addresses: await count('SELECT count(*) c FROM addresses WHERE user_id=$1', [id]),
+      cartItems: await count('SELECT count(*) c FROM cart_items ci JOIN cart c ON c.id = ci.cart_id WHERE c.user_id=$1', [id]),
+      credit: Number((await one('SELECT credit_balance FROM users WHERE id=$1', [id])).credit_balance),
+      ledger: await count('SELECT count(*) c FROM credit_ledger WHERE user_id=$1', [id]),
+    });
+    const usersWith = (col, val) => count(`SELECT count(*) c FROM users WHERE ${col} = $1`, [val]);
+    const PH = '+919800011111';
+
+    // --- 1. Google login creates a customer
+    const g1 = await call('POST', '/api/auth/google', { idToken: gToken('tok-link-g1', 'g-link-1', 'linker1@link.test') }, null, ip(1));
+    const U = g1.body.user.id;
+    check('LINK 1 Google login creates a customer account', g1.status === 200 && !!U && g1.body.user.google_id === 'g-link-1', g1.body);
+    // give the customer real data
+    await q(`INSERT INTO addresses (user_id, full_name, phone, address_line1, city, state, postal_code, country, is_default) VALUES ($1,'Link Tester','+919000000000','1 Test Street','Mumbai','MH','400001','India',true)`, [U]);
+    const prodRow = await one(`SELECT id AS variant_id FROM product_variants WHERE sku = 'CR-A'`);
+    await call('POST', '/api/cart/items', { variantId: prodRow.variant_id, quantity: 1 }, g1.body.accessToken);
+    await q(`INSERT INTO orders (order_number,user_id,total_amount,status,shipping_address) VALUES ('LINK-ORDER-1',$1,999,'DELIVERED','{}'::json)`, [U]);
+    await call('POST', `/api/admin/customers/${U}/credit`, { amount: 250, reason: 'Link test credit' }, ADMIN);
+    const before = await owned(U);
+    check('LINK 1 setup: the customer has an order, a cart line, an address and store credit', before.orders === 1 && before.addresses === 1 && before.cartItems === 1 && before.credit === 250 && before.ledger === 1, before);
+
+    // --- 2. A number typed into Personal Info is NOT proof of ownership
+    const typed = await call('PUT', '/api/profile', { first_name: 'Link', last_name: 'Tester', email: 'linker1@link.test', phone_number: PH }, g1.body.accessToken);
+    check('LINK 2 a phone typed into Personal Info is stored as UNVERIFIED', typed.status === 200 && typed.body.user.phone_number === PH && typed.body.user.phone_verified === false, typed.body);
+    const stranger = await call('POST', '/api/auth/phone', { idToken: phoneOnlyToken('tok-stranger-phone', 'p-stranger', PH) }, null, ip(2));
+    check('LINK 2 so phone login with that number does NOT open the Google account (a separate account is created: no silent merge)', stranger.status === 200 && stranger.body.user.id !== U, stranger.body.user && stranger.body.user.id);
+    const strangerOwned = await owned(stranger.body.user.id);
+    check('LINK 2 and the Google customer\'s orders, cart, address and credit are untouched by that', JSON.stringify({ ...await owned(U) }) === JSON.stringify(before));
+    // free the number again for the real linking test (the stranger account stays: it is a different person's account)
+    await q('UPDATE users SET phone_number = NULL, phone_verified = false WHERE id = $1', [stranger.body.user.id]);
+
+    // --- 3. Linking requires: our session AND a fresh OTP-verified phone token
+    const goodTok = linkedPhoneToken('tok-linked-g1', 'g-link-1', PH);
+    check('LINK 3 linking without a session is refused (401)', (await call('POST', '/api/account/link-phone', { idToken: goodTok })).status === 401);
+    check('LINK 3 linking with a forged / unknown token is refused (401)', (await link(g1.body.accessToken, 'not-a-real-token')).status === 401);
+    check('LINK 3 a Google token without any phone is not phone proof (401)', (await link(g1.body.accessToken, 'tok-link-g1')).status === 401);
+    check('LINK 3 a stale phone token (OTP confirmed long ago) is refused (401)', (await link(g1.body.accessToken, linkedPhoneToken('tok-stale', 'g-link-1', PH, now() - 3600))).status === 401);
+    check('LINK 3 a malformed phone number is refused (401)', (await link(g1.body.accessToken, linkedPhoneToken('tok-badphone', 'g-link-1', '12345'))).status === 401);
+    check('LINK 3 none of those refused attempts verified the number', (await one('SELECT phone_verified FROM users WHERE id=$1', [U])).phone_verified === false);
+
+    // --- 4. The real link
+    const linked = await link(g1.body.accessToken, goodTok);
+    const row = await one('SELECT id, phone_number, phone_verified, google_id FROM users WHERE id=$1', [U]);
+    check('LINK 4 the signed-in Google customer links the OTP-verified number (same Firebase uid)', linked.status === 200 && row.phone_verified === true && row.phone_number === PH && row.google_id === 'g-link-1', linked.body);
+    check('LINK 4 linking again is harmless (idempotent)', (await link(g1.body.accessToken, goodTok)).status === 200);
+
+    // --- 5. Phone login now resolves to the SAME internal user (and the same Firebase uid)
+    const p1 = await call('POST', '/api/auth/phone', { idToken: linkedPhoneToken('tok-linked-login', 'g-link-1', PH) }, null, ip(3));
+    check('LINK 5 phone login with the linked number resolves to the SAME internal user id', p1.status === 200 && p1.body.user.id === U && p1.body.user.email === 'linker1@link.test', p1.body.user);
+    const g2 = await call('POST', '/api/auth/google', { idToken: 'tok-link-g1' }, null, ip(4));
+    check('LINK 5 Google login after linking still resolves to the same user', g2.status === 200 && g2.body.user.id === U);
+    // phone sign-in token issued with the phone-only uid (not linked in Firebase) but verified number on our side
+    const p2 = await call('POST', '/api/auth/phone', { idToken: phoneOnlyToken('tok-phone-only-login', 'p-someone', PH) }, null, ip(5));
+    check('LINK 5 a phone-only Firebase login with the verified number also lands on the same internal user', p2.status === 200 && p2.body.user.id === U, p2.body.user && p2.body.user.id);
+
+    // --- 6. Repeated logins and refreshes never create duplicates
+    let refresh = p1.body.refreshToken;
+    for (let i = 0; i < 3; i++) {
+      await call('POST', '/api/auth/google', { idToken: 'tok-link-g1' }, null, ip(6));
+      await call('POST', '/api/auth/phone', { idToken: 'tok-linked-login' }, null, ip(7));
+      const r = await call('POST', '/api/auth/refresh', { refreshToken: refresh });
+      if (r.body.refreshToken) refresh = r.body.refreshToken;
+    }
+    check('LINK 6 repeated Google/phone logins and refreshes leave exactly one user for the uid, the phone and the email', await usersWith('google_id', 'g-link-1') === 1 && await usersWith('phone_number', PH) === 1 && await count(`SELECT count(*) c FROM users WHERE LOWER(email) = 'linker1@link.test'`) === 1);
+    const after = await owned(U);
+    check('LINK 6 orders, cart, address and store credit are still on the same account, unchanged and not duplicated', JSON.stringify(after) === JSON.stringify(before), { before, after });
+
+    // --- 7. A number already linked to another account is never silently attached
+    const g3 = await call('POST', '/api/auth/google', { idToken: gToken('tok-link-g3', 'g-link-3', 'linker3@link.test') }, null, ip(8));
+    const V = g3.body.user.id, QPH = '+919800022222';
+    await link(g3.body.accessToken, linkedPhoneToken('tok-linked-g3', 'g-link-3', QPH));
+    const vBefore = await one('SELECT id, email, phone_number, phone_verified, google_id, name FROM users WHERE id=$1', [V]);
+    const uBefore = await one('SELECT phone_number, phone_verified FROM users WHERE id=$1', [U]);
+    const collide = await link(g1.body.accessToken, phoneOnlyToken('tok-q-phone', 'p-q', QPH));
+    check('LINK 7 attaching a number that is verified on another account is refused (409)', collide.status === 409 && collide.body.code === 'PHONE_ALREADY_LINKED', collide.body);
+    const leaked = JSON.stringify(collide.body);
+    check('LINK 7 the refusal reveals nothing about the other customer (no id, email, name, uid)', !leaked.includes(String(V)) && !leaked.includes('linker3') && !leaked.includes('Link Tester') && !leaked.includes('g-link-3'), leaked);
+    check('LINK 7 neither account is modified by the collision', JSON.stringify(await one('SELECT id, email, phone_number, phone_verified, google_id, name FROM users WHERE id=$1', [V])) === JSON.stringify(vBefore) && JSON.stringify(await one('SELECT phone_number, phone_verified FROM users WHERE id=$1', [U])) === JSON.stringify(uBefore));
+    check('LINK 7 and the other customer\'s Firebase identity cannot be attached to this account either', (await link(g1.body.accessToken, linkedPhoneToken('tok-steal-uid', 'g-link-3', '+919800033333'))).status === 409 && (await one('SELECT google_id FROM users WHERE id=$1', [V])).google_id === 'g-link-3' && (await one('SELECT google_id FROM users WHERE id=$1', [U])).google_id === 'g-link-1');
+    check('LINK 7 typing that number into Personal Info says clearly it is taken (409, not a server error)', (await call('PUT', '/api/profile', { first_name: 'Link', last_name: 'Tester', email: 'linker1@link.test', phone_number: QPH }, g1.body.accessToken)).status === 409);
+    check('LINK 7 phone login for the other customer\'s number still opens THEIR account only', (await call('POST', '/api/auth/phone', { idToken: 'tok-linked-g3' }, null, ip(9))).body.user.id === V);
+
+    // --- 8. A phone verification that belongs to somebody else's Google account is refused
+    check('LINK 8 a Google account cannot adopt a phone verification issued for another Google identity', (await link(g1.body.accessToken, linkedPhoneToken('tok-other-google', 'g-someone-else', '+919800044444'))).status === 403);
+    check('LINK 8 a password account cannot adopt a phone that is attached to a Google account', (await (async () => { const w = await call('POST', '/api/auth/register', { name: 'Pw Owner', email: 'pwowner@link.test', password: 'PwOwnerPass123' }, null, ip(10)); return (await link(w.body.accessToken, linkedPhoneToken('tok-pw-google', 'g-not-pw', '+919800055555'))).status; })()) === 403);
+
+    // --- 9. Accounts with no Firebase identity (email+password) can verify a number by OTP and then use phone login
+    const w = await call('POST', '/api/auth/register', { name: 'Pw Customer', email: 'pwcustomer@link.test', password: 'PwCustomerPass123' }, null, ip(11));
+    const W = w.body.user.id, WPH = '+919800066666';
+    await q(`INSERT INTO orders (order_number,user_id,total_amount,status,shipping_address) VALUES ('LINK-ORDER-W',$1,500,'DELIVERED','{}'::json)`, [W]);
+    const wLink = await link(w.body.accessToken, phoneOnlyToken('tok-w-phone', 'p-w', WPH));
+    check('LINK 9 a password customer verifies their number by OTP', wLink.status === 200 && (await one('SELECT phone_verified FROM users WHERE id=$1', [W])).phone_verified === true, wLink.body);
+    const wLogin = await call('POST', '/api/auth/phone', { idToken: 'tok-w-phone' }, null, ip(12));
+    check('LINK 9 phone login with that number then opens the SAME password account (orders intact)', wLogin.status === 200 && wLogin.body.user.id === W && await count('SELECT count(*) c FROM orders WHERE user_id=$1', [W]) === 1);
+
+    // --- 10. Firebase-linked but our database was not told (e.g. the browser closed): phone login still resolves, no duplicate
+    const g4 = await call('POST', '/api/auth/google', { idToken: gToken('tok-link-g4', 'g-link-4', 'linker4@link.test') }, null, ip(13));
+    const X = g4.body.user.id, XPH = '+919800077777';
+    const usersBefore = await count('SELECT count(*) c FROM users');
+    const x1 = await call('POST', '/api/auth/phone', { idToken: linkedPhoneToken('tok-x-linked', 'g-link-4', XPH) }, null, ip(14));
+    check('LINK 10 a phone token carrying a Firebase uid we know resolves to that customer instead of creating a duplicate', x1.status === 200 && x1.body.user.id === X && await count('SELECT count(*) c FROM users') === usersBefore, x1.body.user && x1.body.user.id);
+    check('LINK 10 and it records the number as verified on that account', (await one('SELECT phone_number, phone_verified FROM users WHERE id=$1', [X])).phone_verified === true);
+
+    // --- 11. Changing the number later requires verifying again
+    const chg = await call('PUT', '/api/profile', { first_name: 'Link', last_name: 'Tester', email: 'linker1@link.test', phone_number: '+919800088888' }, g1.body.accessToken);
+    check('LINK 11 changing the saved number drops the verified status (it must be verified again)', chg.status === 200 && chg.body.user.phone_verified === false);
+    const gone = await call('POST', '/api/auth/phone', { idToken: 'tok-linked-login' }, null, ip(15));
+    check('LINK 11 the profile edit does not strand the account: the Firebase-linked phone token still resolves to the same user', gone.status === 200 && gone.body.user.id === U);
+
+    // --- 12. profile exposes only the customer\'s own identifiers
+    const prof = await call('GET', '/api/profile', null, g1.body.accessToken);
+    check('LINK 12 GET /api/profile returns the customer\'s own phone_verified flag and Firebase uid for the app', prof.status === 200 && 'phone_verified' in prof.body.user && prof.body.user.firebase_uid === 'g-link-1', prof.body.user);
   }
 
   // ---------------- CORS ----------------

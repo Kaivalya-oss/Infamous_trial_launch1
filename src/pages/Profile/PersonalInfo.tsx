@@ -5,6 +5,7 @@ import api from '../../lib/axios';
 import { useAuth } from '../../context/AuthContext';
 import { Input } from '../../components/ui/Input';
 import { Button } from '../../components/ui/Button';
+import PhoneVerification from '../../components/PhoneVerification';
 
 export default function PersonalInfo() {
   const { user, updateUser } = useAuth();
@@ -13,6 +14,15 @@ export default function PersonalInfo() {
   const [email, setEmail] = useState('');
   const [phone, setPhone] = useState('');
   const [address, setAddress] = useState('');
+  // Changing the login email needs the current password (only for accounts that have one)
+  const [originalEmail, setOriginalEmail] = useState('');
+  // Phone verification (OTP) is offered only where phone sign-in is switched on
+  const phoneLoginEnabled = import.meta.env.VITE_ENABLE_PHONE_LOGIN === 'true';
+  const [phoneVerified, setPhoneVerified] = useState(false);
+  const [savedPhone, setSavedPhone] = useState('');
+  const [firebaseUid, setFirebaseUid] = useState<string | null>(null);
+  const [hasPassword, setHasPassword] = useState(false);
+  const [currentPassword, setCurrentPassword] = useState('');
   const [emailVerified, setEmailVerified] = useState(true);
   const [verifyMsg, setVerifyMsg] = useState('');
   const [isSending, setIsSending] = useState(false);
@@ -34,6 +44,11 @@ export default function PersonalInfo() {
           setFirstName(fName);
           setLastName(lName);
           setEmail(u.email || '');
+          setOriginalEmail(u.email || '');
+          setHasPassword(u.has_password === true);
+          setPhoneVerified(u.phone_verified === true);
+          setSavedPhone(u.phone_number || '');
+          setFirebaseUid(u.firebase_uid || null);
           setPhone(u.phone_number || '');
           setAddress(u.address || '');
           setEmailVerified(u.email_verified === true);
@@ -81,8 +96,14 @@ export default function PersonalInfo() {
     }
   };
 
+  const emailChanging = hasPassword && !!originalEmail && email.trim().toLowerCase() !== originalEmail.trim().toLowerCase();
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (emailChanging && !currentPassword) {
+      setErrorMsg('Enter your current password to change your email address.');
+      return;
+    }
     setIsLoading(true);
     setErrorMsg('');
     setIsSuccess(false);
@@ -93,11 +114,16 @@ export default function PersonalInfo() {
         last_name: lastName,
         email,
         phone_number: phone,
-        address
+        address,
+        ...(emailChanging ? { currentPassword } : {})
       });
 
       const updated = response.data?.user;
       if (updated) {
+        setOriginalEmail(updated.email || '');
+        setPhoneVerified(updated.phone_verified === true);
+        setSavedPhone(updated.phone_number || '');
+        setCurrentPassword('');
         setEmailVerified(updated.email_verified === true);
         setVerifyMsg(updated.email_verified === true ? '' : 'We sent a verification link to your email address.');
         updateUser({
@@ -151,6 +177,15 @@ export default function PersonalInfo() {
               value={email}
               onChange={(e) => setEmail(e.target.value)}
             />
+            {emailChanging && (
+              <Input
+                label="Current password (required to change your email)"
+                type="password"
+                autoComplete="current-password"
+                value={currentPassword}
+                onChange={(e) => setCurrentPassword(e.target.value)}
+              />
+            )}
             {email && !emailVerified && (
               <div className="-mt-3 flex flex-wrap items-center gap-3 text-sm text-amber-700 bg-amber-50 px-4 py-3 rounded-xl">
                 <span>Your email is not verified yet.</span>
@@ -165,6 +200,19 @@ export default function PersonalInfo() {
               value={phone}
               onChange={(e) => setPhone(e.target.value)}
             />
+            {phoneLoginEnabled && savedPhone && savedPhone === phone && (
+              <PhoneVerification
+                savedPhone={savedPhone}
+                verified={phoneVerified}
+                firebaseUid={firebaseUid}
+                onVerified={(verifiedPhone) => {
+                  setPhoneVerified(true);
+                  setSavedPhone(verifiedPhone);
+                  setPhone(verifiedPhone);
+                  updateUser({ phone_number: verifiedPhone, phone_verified: true });
+                }}
+              />
+            )}
 
             <div className="pt-4 border-t border-black/10 mt-4">
               <h3 className="text-sm font-medium mb-4">Saved Address</h3>

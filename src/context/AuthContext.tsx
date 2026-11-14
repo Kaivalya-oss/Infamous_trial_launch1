@@ -1,4 +1,5 @@
 import { createContext, useContext, useState, type ReactNode } from 'react';
+import api from '../lib/axios';
 
 export interface User {
   id: string | number;
@@ -38,6 +39,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   const logout = () => {
+    // Revoke the refresh token on the server too (best effort: signing out must never fail)
+    const refreshToken = localStorage.getItem('infamous_refresh_token');
+    if (refreshToken) api.post('/api/auth/logout', { refreshToken }).catch(() => {});
     setToken(null);
     setUser(null);
     localStorage.removeItem('infamous_token');

@@ -14,7 +14,8 @@ Object.assign(process.env, {
   RAZORPAY_KEY_ID: 'rzp_test_local', RAZORPAY_KEY_SECRET: 'local_test_secret',
   FIREBASE_PROJECT_ID: 'test-project', CLOUDINARY_CLOUD_NAME: 'x', CLOUDINARY_API_KEY: 'x', CLOUDINARY_API_SECRET: 'x',
   RAZORPAY_WEBHOOK_SECRET: 'whsec_test_local',
-  ACCOUNT_CACHE_TTL_MS: '0',          // always read suspension/role from the DB in tests
+  ACCOUNT_CACHE_TTL_MS: '0',
+  LINK_PHONE_LIMIT: '100',             // phone-linking attempts per customer per hour (the default is 10)          // always read suspension/role from the DB in tests
   AUTH_IP_RATE_LIMIT: '600',           // generous so the suite itself is never throttled; the limiter is exercised at the end
   UPLOAD_MAX_BYTES: '2048',            // tiny cap so the upload size limit can be tested
   DISABLE_PAYMENT_RECONCILER: '1',     // the poller is triggered explicitly via the admin endpoint

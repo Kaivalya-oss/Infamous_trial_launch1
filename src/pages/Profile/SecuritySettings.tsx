@@ -8,6 +8,7 @@ import axios from 'axios';
 import { CheckCircle2 } from 'lucide-react';
 import { Input } from '../../components/ui/Input';
 import { Button } from '../../components/ui/Button';
+import { useAuth } from '../../context/AuthContext';
 
 const passwordSchema = z.object({
   currentPassword: z.string().min(1, "Current password is required"),
@@ -25,6 +26,7 @@ const passwordSchema = z.object({
 type PasswordFormValues = z.infer<typeof passwordSchema>;
 
 export default function SecuritySettings() {
+  const { user, login } = useAuth();
   const [isLoading, setIsLoading] = useState(false);
   const [isSuccess, setIsSuccess] = useState(false);
 
@@ -35,10 +37,12 @@ export default function SecuritySettings() {
   const onSubmit = async (data: PasswordFormValues) => {
     setIsLoading(true);
     try {
-      await api.post('/api/auth/update-password', {
+      const res = await api.post('/api/auth/update-password', {
         currentPassword: data.currentPassword,
         newPassword: data.newPassword
       });
+      // All other devices were signed out by the server; this one carries on with a fresh session.
+      if (res.data?.accessToken && res.data?.refreshToken && user) login(res.data.accessToken, res.data.refreshToken, user);
       
       setIsSuccess(true);
       reset();

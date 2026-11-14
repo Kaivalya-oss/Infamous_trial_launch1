@@ -39,6 +39,10 @@ api.interceptors.request.use(
   (error) => Promise.reject(error)
 );
 
+// The server rotates the refresh token on every refresh. Several requests can fail with 401 at the same moment, so
+// they share ONE refresh call per area (customer / admin) instead of each spending the token.
+const refreshInFlight: Record<string, Promise<string> | undefined> = {};
+
 // Response interceptor for Refresh Token logic
 api.interceptors.response.use(
   (response) => response,
@@ -77,16 +81,18 @@ api.interceptors.response.use(
           throw new Error('Session expired: Please log in again');
         }
         
-        // Attempt to refresh
+        // Attempt to refresh (shared by every request that failed at the same time)
         const baseURL = api.defaults.baseURL || '';
-        const refreshResponse = await axios.post(`${baseURL}/api/auth/refresh`, {
-          refreshToken
-        });
-        
-        const newAccessToken = refreshResponse.data.accessToken;
-        
-        // Save new token
-        localStorage.setItem(tokenKey, newAccessToken);
+        if (!refreshInFlight[tokenKey]) {
+          refreshInFlight[tokenKey] = axios.post(`${baseURL}/api/auth/refresh`, { refreshToken })
+            .then((refreshResponse) => {
+              localStorage.setItem(tokenKey, refreshResponse.data.accessToken);
+              if (refreshResponse.data.refreshToken) localStorage.setItem(refreshTokenKey, refreshResponse.data.refreshToken);
+              return refreshResponse.data.accessToken as string;
+            })
+            .finally(() => { refreshInFlight[tokenKey] = undefined; });
+        }
+        const newAccessToken = await refreshInFlight[tokenKey]!;
         
         // Update header for original request and retry
         if (originalRequest.headers && typeof originalRequest.headers.set === 'function') {

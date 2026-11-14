@@ -71,6 +71,9 @@ export function AdminAuthProvider({ children }: { children: React.ReactNode }) {
   };
 
   const logout = () => {
+    // Revoke the refresh token on the server too (best effort: signing out must never fail)
+    const refreshToken = localStorage.getItem('infamous_admin_refresh_token');
+    if (refreshToken) api.post('/api/auth/logout', { refreshToken }).catch(() => {});
     setAdmin(null);
     localStorage.removeItem('infamous_admin_token');
     localStorage.removeItem('infamous_admin_refresh_token');

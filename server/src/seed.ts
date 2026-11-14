@@ -2,7 +2,6 @@ import { Pool } from 'pg';
 import dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
-import bcrypt from 'bcrypt';
 
 dotenv.config();
 
@@ -20,22 +19,10 @@ async function runSeed() {
     await pool.query(schema);
     console.log('✅ Schema executed successfully.');
 
-    // 2. Seed Admin User
-    const adminEmail = 'super@infamous.com';
-    const adminCheck = await pool.query('SELECT * FROM users WHERE email = $1', [adminEmail]);
-    
-    if (adminCheck.rows.length === 0) {
-      console.log('Creating Super Admin user...');
-      const adminPassword = await bcrypt.hash('admin123', 10);
-      await pool.query(
-        `INSERT INTO users (name, email, password_hash, role, email_verified) 
-         VALUES ($1, $2, $3, $4, $5)`,
-        ['Super Admin', adminEmail, adminPassword, 'SUPER_ADMIN', true]
-      );
-      console.log('✅ Admin user created. (super@infamous.com / admin123)');
-    } else {
-      console.log('✅ Admin user already exists.');
-    }
+    // 2. Admin user: deliberately NOT created here. This script used to create a default super admin with a fixed
+    //    password that was published in the repository. Create admins with create_admin.js, which takes the
+    //    email and a strong password from the environment (nothing is stored in code or git).
+    console.log('No admin user is created by this script. Use: node create_admin.js (see the comments at the top of that file).');
 
     // 3. Seed Category & Products
     const catCheck = await pool.query("SELECT * FROM categories WHERE slug = 't-shirts'");

@@ -383,11 +383,22 @@ app.get('/api/health', (req, res) => {
 // --- AUTHENTICATION ---
 const generateTokens = async (userId: number, email: string, role: string) => {
   const accessToken = jwt.sign({ userId, email, role }, JWT_SECRET, { expiresIn: '15m' });
-  const refreshToken = crypto.randomBytes(40).toString('hex');
-  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
-  await pool.query('INSERT INTO sessions (user_id, token, expires_at) VALUES ($1, $2, $3)', [userId, refreshToken, expiresAt]);
-  return { accessToken, refreshToken };
+  return { accessToken, refreshToken: await issueRefreshToken(userId) };
 };
+
+// Refresh tokens are random bearer secrets. Only their SHA-256 is stored, so a leaked database (or a log line) cannot
+// be replayed. Each refresh issues a new token; the previous one is kept alive for a short grace period so that two
+// browser tabs refreshing at the same moment do not log each other out, and then it dies.
+const REFRESH_TOKEN_DAYS = 7;
+const REFRESH_ROTATION_GRACE_SECONDS = 60;
+async function issueRefreshToken(userId: number): Promise<string> {
+  const refreshToken = crypto.randomBytes(40).toString('hex');
+  await pool.query(
+    `INSERT INTO sessions (user_id, token, expires_at) VALUES ($1, $2, NOW() + ($3 || ' days')::interval)`,
+    [userId, sha256(refreshToken), String(REFRESH_TOKEN_DAYS)]
+  );
+  return refreshToken;
+}
 
 // ---- Authentication abuse controls -------------------------------------------------------------
 // In-memory counters (single Render instance). They reset on restart and are per-instance; move to a shared
@@ -418,6 +429,12 @@ const loginAccountLimiter = rateLimit({      // many IPs guessing one account
   windowMs: WINDOW_15_MIN, limit: Number(process.env.LOGIN_ACCOUNT_FAIL_LIMIT || 50), skipSuccessfulRequests: true,
   keyGenerator: (req: any) => `acct|${loginEmailKey(req)}`,
   standardHeaders: 'draft-7', legacyHeaders: false, handler: tooManyAttempts('Too many failed sign-in attempts. Please try again in 15 minutes.'),
+});
+const emailChangeLimiter = rateLimit({      // guessing the password through the email-change form with a stolen token
+  windowMs: WINDOW_15_MIN, limit: Number(process.env.LOGIN_FAIL_LIMIT || 10) / 2, skipSuccessfulRequests: true,
+  skip: (req: any) => typeof req.body?.currentPassword !== 'string',
+  keyGenerator: (req: any) => `emailchg|${req.user?.userId}`, validate: { keyGeneratorIpFallback: false },
+  standardHeaders: 'draft-7', legacyHeaders: false, handler: tooManyAttempts('Too many failed attempts. Please try again in 15 minutes.'),
 });
 const passwordChangeLimiter = rateLimit({    // guessing the current password with a stolen access token
   windowMs: WINDOW_15_MIN, limit: Number(process.env.LOGIN_FAIL_LIMIT || 10), skipSuccessfulRequests: true,
@@ -506,11 +523,11 @@ app.post('/api/auth/login', authIpLimiter, loginPairLimiter, loginAccountLimiter
 
 app.post('/api/auth/refresh', refreshLimiter, async (req, res) => {
   const { refreshToken } = req.body;
-  if (typeof refreshToken !== 'string' || !refreshToken) return res.status(401).json({ message: 'Refresh token required' });
+  if (typeof refreshToken !== 'string' || !refreshToken || refreshToken.length > 200) return res.status(401).json({ message: 'Refresh token required' });
   // Password-reset tokens share the sessions table; they must never act as refresh tokens.
   if (refreshToken.startsWith('reset_')) return res.status(403).json({ message: 'Invalid or expired refresh token' });
   try {
-    const sessionRes = await pool.query('SELECT * FROM sessions WHERE token = $1 AND expires_at > CURRENT_TIMESTAMP', [refreshToken]);
+    const sessionRes = await pool.query('SELECT * FROM sessions WHERE token = $1 AND expires_at > CURRENT_TIMESTAMP', [sha256(refreshToken)]);
     if (sessionRes.rows.length === 0) return res.status(403).json({ message: 'Invalid or expired refresh token' });
     const session = sessionRes.rows[0];
     const userRes = await pool.query('SELECT email, role, status FROM users WHERE id = $1', [session.user_id]);
@@ -518,11 +535,30 @@ app.post('/api/auth/refresh', refreshLimiter, async (req, res) => {
     if (!user) return res.status(403).json({ message: 'User not found' });
     if (user.status === 'Suspended') return res.status(403).json(SUSPENDED_RESPONSE);
     const accessToken = jwt.sign({ userId: session.user_id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '15m' });
-    res.status(200).json({ accessToken });
+    // Rotation: hand out a new refresh token and let the old one expire after a short grace period.
+    const newRefreshToken = await issueRefreshToken(session.user_id);
+    await pool.query(`UPDATE sessions SET expires_at = LEAST(expires_at, NOW() + ($2 || ' seconds')::interval) WHERE id = $1`, [session.id, String(REFRESH_ROTATION_GRACE_SECONDS)]);
+    // Housekeeping: drop this user's expired sessions so rotation does not grow the table without bound.
+    await pool.query('DELETE FROM sessions WHERE user_id = $1 AND expires_at < NOW()', [session.user_id]);
+    res.status(200).json({ accessToken, refreshToken: newRefreshToken });
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: 'Internal server error' });
   }
+});
+
+// Sign out: the refresh token is revoked on the server, not just forgotten by the browser. Always answers 200 so
+// it cannot be used to probe which tokens exist.
+app.post('/api/auth/logout', authIpLimiter, async (req, res) => {
+  const refreshToken = req.body?.refreshToken;
+  try {
+    if (typeof refreshToken === 'string' && refreshToken.length > 0 && refreshToken.length <= 200) {
+      await pool.query('DELETE FROM sessions WHERE token = $1', [sha256(refreshToken)]);
+    }
+  } catch (error) {
+    console.error('Logout failed:', (error as Error).message);
+  }
+  res.status(200).json({ message: 'Signed out' });
 });
 
 // Firebase identity: the ONLY trusted source of Google/phone identity is a verified Firebase ID token.
@@ -621,6 +657,21 @@ app.post('/api/auth/phone', authIpLimiter, async (req, res) => {
     // typed into a profile/checkout is contact data: the verified owner takes it over and gets
     // their own account; the unverified holder keeps every other credential untouched.
     let user = (await pool.query('SELECT * FROM users WHERE phone_number = $1 AND phone_verified = true', [phoneNumber])).rows[0];
+    if (!user && decoded.uid) {
+      // The number may have been linked, inside Firebase, to the Firebase account of an existing customer (for
+      // example their Google sign-in). Firebase then issues this phone token with that SAME uid, which our database
+      // stores as users.google_id: same uid = same person, so we sign into that account instead of creating a duplicate.
+      const byUid = (await pool.query('SELECT * FROM users WHERE google_id = $1', [decoded.uid])).rows[0];
+      if (byUid) {
+        user = byUid;
+        const heldByOther = await pool.query('SELECT 1 FROM users WHERE phone_number = $1 AND id <> $2 AND phone_verified = true', [phoneNumber, byUid.id]);
+        if (heldByOther.rows.length === 0) {
+          await pool.query('UPDATE users SET phone_number = NULL, updated_at = CURRENT_TIMESTAMP WHERE phone_number = $1 AND id <> $2 AND phone_verified = false', [phoneNumber, byUid.id]);
+          const upd = await pool.query('UPDATE users SET phone_number = $1, phone_verified = true, updated_at = CURRENT_TIMESTAMP WHERE id = $2 RETURNING phone_number, phone_verified', [phoneNumber, byUid.id]);
+          user.phone_number = upd.rows[0].phone_number; user.phone_verified = upd.rows[0].phone_verified;
+        }
+      }
+    }
     if (!user) {
       await pool.query('UPDATE users SET phone_number = NULL, updated_at = CURRENT_TIMESTAMP WHERE phone_number = $1 AND phone_verified = false', [phoneNumber]);
     }
@@ -641,6 +692,84 @@ app.post('/api/auth/phone', authIpLimiter, async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// Link a verified phone number to the signed-in customer's account.
+//
+// Why this exists: a phone number typed into Personal Info is only contact data (anyone can type anyone's number),
+// so phone sign-in deliberately never trusts it. The customer therefore proves they control the number with a
+// one-time code, and proves who they are with their normal session. Both proofs are required:
+//   1. our own access token  -> this is the customer's account, and
+//   2. a fresh Firebase ID token carrying the OTP-verified phone number -> they control the number.
+// If the customer's account is bound to a Firebase (Google) identity, the phone must have been linked to THAT
+// Firebase account (same uid), so Google and phone sign-in then resolve to the same user. A number that already
+// belongs to another account is never moved or merged: the request is refused and nothing about the other
+// account is revealed.
+const linkPhoneLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, limit: Number(process.env.LINK_PHONE_LIMIT || 10),
+  keyGenerator: (req: any) => `linkphone|${req.user?.userId}`, validate: { keyGeneratorIpFallback: false },
+  standardHeaders: 'draft-7', legacyHeaders: false, handler: tooManyAttempts('Too many verification attempts. Please try again later.'),
+});
+const PHONE_TAKEN_RESPONSE = { message: 'This phone number is already associated with another INFAMOUS account, so it cannot be added here. If the number is yours, please contact customer support.', code: 'PHONE_ALREADY_LINKED' };
+const OTP_PROOF_MAX_AGE_SECONDS = 10 * 60;
+
+app.post('/api/account/link-phone', authenticateToken, linkPhoneLimiter, async (req: any, res) => {
+  const decoded = await verifyFirebaseIdToken(req, res);
+  if (!decoded) return;
+  const phone: string | undefined = typeof decoded.phone_number === 'string' ? decoded.phone_number : undefined;
+  const provider: string | undefined = decoded.firebase?.sign_in_provider;
+  const identities: Record<string, any> = decoded.firebase?.identities || {};
+  if (!phone || !/^\+\d{10,15}$/.test(phone) || (provider !== 'phone' && !identities.phone)) {
+    return res.status(401).json({ message: 'Phone verification failed. Please request a new code.' });
+  }
+  // The OTP must have been confirmed just now (a stale token from an earlier sign-in is not proof of anything new).
+  if (typeof decoded.auth_time !== 'number' || Date.now() / 1000 - decoded.auth_time > OTP_PROOF_MAX_AGE_SECONDS) {
+    return res.status(401).json({ message: 'That code has expired. Please verify your phone number again.' });
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const me = (await client.query('SELECT id, google_id FROM users WHERE id = $1 FOR UPDATE', [req.user.userId])).rows[0];
+    if (!me) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'User not found' }); }
+
+    // A number already verified on ANOTHER account is never silently attached or moved.
+    const holder = await client.query('SELECT 1 FROM users WHERE phone_number = $1 AND id <> $2 AND phone_verified = true', [phone, me.id]);
+    if (holder.rows.length > 0) { await client.query('ROLLBACK'); return res.status(409).json(PHONE_TAKEN_RESPONSE); }
+    // A Firebase identity that already belongs to a different INFAMOUS account cannot be attached to this one either.
+    if (decoded.uid) {
+      const otherUid = await client.query('SELECT 1 FROM users WHERE google_id = $1 AND id <> $2', [decoded.uid, me.id]);
+      if (otherUid.rows.length > 0) { await client.query('ROLLBACK'); return res.status(409).json(PHONE_TAKEN_RESPONSE); }
+    }
+    // The verification must belong to THIS customer's Firebase identity, where they have one.
+    if (me.google_id) {
+      const sameFirebaseAccount = decoded.uid === me.google_id;
+      const phoneOnlyIdentity = provider === 'phone' && !identities['google.com'] && !identities['password'];
+      if (!sameFirebaseAccount && !phoneOnlyIdentity) {
+        await client.query('ROLLBACK');
+        return res.status(403).json({ message: 'This verification does not belong to your account. Please sign in with the same Google account and try again.' });
+      }
+    } else if (identities['google.com']) {
+      // The phone is attached to somebody's Google account that is not this customer's.
+      await client.query('ROLLBACK');
+      return res.status(403).json({ message: 'This verification does not belong to your account.' });
+    }
+
+    // Free the number from unverified, merely-typed claims on other accounts, then record it as verified.
+    await client.query('UPDATE users SET phone_number = NULL, updated_at = CURRENT_TIMESTAMP WHERE phone_number = $1 AND id <> $2 AND phone_verified = false', [phone, me.id]);
+    const upd = await client.query(
+      'UPDATE users SET phone_number = $1, phone_verified = true, updated_at = CURRENT_TIMESTAMP WHERE id = $2 RETURNING id, phone_number, phone_verified',
+      [phone, me.id]
+    );
+    await client.query('COMMIT');
+    res.status(200).json({ message: 'Phone number verified. You can now sign in with it.', user: upd.rows[0] });
+  } catch (error: any) {
+    await client.query('ROLLBACK').catch(() => {});
+    if (error?.code === '23505') return res.status(409).json(PHONE_TAKEN_RESPONSE);
+    console.error('Link phone failed:', error?.message);
+    res.status(500).json({ message: 'Internal server error' });
+  } finally {
+    client.release();
   }
 });
 
@@ -752,7 +881,7 @@ app.post('/api/auth/update-password', authenticateToken, passwordChangeLimiter, 
   if (passwordError) return res.status(400).json({ message: passwordError });
 
   try {
-    const userRes = await pool.query('SELECT password_hash, auth_provider FROM users WHERE id = $1', [userId]);
+    const userRes = await pool.query('SELECT password_hash, auth_provider, name, email, role FROM users WHERE id = $1', [userId]);
     if (userRes.rows.length === 0) {
       return res.status(404).json({ message: 'User not found' });
     }
@@ -769,8 +898,11 @@ app.post('/api/auth/update-password', authenticateToken, passwordChangeLimiter, 
 
     const newHash = await bcrypt.hash(newPassword, 10);
     await pool.query('UPDATE users SET password_hash = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [newHash, userId]);
-
-    return res.status(200).json({ message: 'Password updated successfully' });
+    // Every other device (and any stolen refresh token) is signed out; this device continues with a fresh pair.
+    await pool.query('DELETE FROM sessions WHERE user_id = $1', [userId]);
+    const tokens = await generateTokens(userId, user.email, user.role);
+    if (user.email) sendTemplate(user.email, emailTemplates.passwordChanged(user.name)).catch(() => {});
+    return res.status(200).json({ message: 'Password updated successfully', ...tokens });
   } catch (error) {
     console.error('Update password error:', error);
     return res.status(500).json({ message: 'Internal server error' });
@@ -782,7 +914,7 @@ app.get('/api/profile', authenticateToken, async (req: any, res) => {
   const userId = req.user.userId;
   try {
     const userRes = await pool.query(
-      'SELECT id, first_name, last_name, name, email, phone_number, role, email_verified, phone_verified FROM users WHERE id = $1',
+      'SELECT id, first_name, last_name, name, email, phone_number, role, email_verified, phone_verified, (password_hash IS NOT NULL) AS has_password, google_id AS firebase_uid FROM users WHERE id = $1',
       [userId]
     );
     if (userRes.rows.length === 0) {
@@ -813,20 +945,43 @@ app.get('/api/profile', authenticateToken, async (req: any, res) => {
   }
 });
 
-app.put('/api/profile', authenticateToken, async (req: any, res) => {
+app.put('/api/profile', authenticateToken, emailChangeLimiter, async (req: any, res) => {
   const userId = req.user.userId;
-  const { first_name, last_name, email, phone_number, address } = req.body;
+  const { first_name, last_name, email, phone_number, address, currentPassword } = req.body;
 
   if (!email || typeof email !== 'string' || !email.includes('@')) {
     return res.status(400).json({ message: 'Valid email address is required' });
   }
 
   try {
-    const prevEmail = (await pool.query('SELECT email FROM users WHERE id = $1', [userId])).rows[0]?.email;
+    const prev = (await pool.query('SELECT email, name, password_hash FROM users WHERE id = $1', [userId])).rows[0];
+    const prevEmail = prev?.email;
+    // The login email is a credential: with it, "forgot password" hands the account over. Changing it on an account
+    // that has a password therefore needs that password (so a stolen access token alone is not enough).
+    const emailIsChanging = !!prevEmail && normalizeEmail(prevEmail) !== normalizeEmail(email);
+    if (emailIsChanging && prev.password_hash) {
+      if (typeof currentPassword !== 'string' || !currentPassword || currentPassword.length > 1000) {
+        return res.status(403).json({ message: 'Enter your current password to change your email address.', code: 'PASSWORD_REQUIRED_FOR_EMAIL_CHANGE' });
+      }
+      if (!(await bcrypt.compare(currentPassword, prev.password_hash))) {
+        return res.status(403).json({ message: 'Your current password is incorrect.', code: 'PASSWORD_REQUIRED_FOR_EMAIL_CHANGE' });
+      }
+    }
     // Check if email belongs to another user
     const existingEmail = await pool.query('SELECT id FROM users WHERE LOWER(email) = LOWER($1) AND id != $2', [email, userId]);
     if (existingEmail.rows.length > 0) {
       return res.status(400).json({ message: 'Email address is already in use by another account' });
+    }
+
+    // A phone number is unique across accounts. Someone else's number (verified or merely typed there) cannot be
+    // stored on this profile; say so clearly instead of failing with a server error. Nothing about the other
+    // account is revealed beyond the fact that the number is not available here.
+    const typedPhone = typeof phone_number === 'string' ? phone_number.trim() : '';
+    if (typedPhone) {
+      const taken = await pool.query('SELECT 1 FROM users WHERE phone_number = $1 AND id <> $2', [typedPhone, userId]);
+      if (taken.rows.length > 0) {
+        return res.status(409).json({ message: 'This phone number is already associated with another account and cannot be added to your profile. If it is your number, please contact customer support.', code: 'PHONE_IN_USE' });
+      }
     }
 
     const cleanFirstName = (first_name || '').trim();
@@ -841,13 +996,17 @@ app.put('/api/profile', authenticateToken, async (req: any, res) => {
            email_verified = CASE WHEN LOWER(email) IS NOT DISTINCT FROM LOWER($4::text) THEN email_verified ELSE false END,
            phone_verified = CASE WHEN phone_number IS NOT DISTINCT FROM $5::text THEN phone_verified ELSE false END
        WHERE id = $6
-       RETURNING id, first_name, last_name, name, email, phone_number, role, email_verified, phone_verified`,
+       RETURNING id, first_name, last_name, name, email, phone_number, role, email_verified, phone_verified, (password_hash IS NOT NULL) AS has_password`,
       [cleanFirstName, cleanLastName, fullName, email, phone_number || null, userId]
     );
 
     const user = updateRes.rows[0];
     if (user && user.email_verified === false && normalizeEmail(prevEmail) !== normalizeEmail(user.email)) {
       sendVerificationEmail(user.id, user.name, user.email);
+    }
+    // Tell the previous address, so the owner finds out even if someone else made the change.
+    if (user && emailIsChanging) {
+      sendTemplate(prevEmail, emailTemplates.emailChanged(prev.name, user.email)).catch(() => {});
     }
 
     // Upsert default shipping address if provided

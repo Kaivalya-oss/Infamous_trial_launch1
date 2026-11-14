@@ -1,5 +1,5 @@
 import { initializeApp } from 'firebase/app';
-import { getAuth, GoogleAuthProvider, RecaptchaVerifier, signInWithPopup, signInWithPhoneNumber, type Auth } from 'firebase/auth';
+import { getAuth, GoogleAuthProvider, RecaptchaVerifier, signInWithPopup, signInWithPhoneNumber, linkWithPhoneNumber, type Auth } from 'firebase/auth';
 
 const firebaseConfig = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
@@ -27,4 +27,4 @@ try {
 export { auth };
 export const googleProvider = new GoogleAuthProvider();
 
-export { signInWithPopup, signInWithPhoneNumber, RecaptchaVerifier };
+export { signInWithPopup, signInWithPhoneNumber, linkWithPhoneNumber, RecaptchaVerifier };

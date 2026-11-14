@@ -72,6 +72,15 @@ export const emailTemplates = {
     subject: 'Your password was changed — INFAMOUS',
     html: layout(`<p>Hi ${esc(name || 'there')},</p><p>Your INFAMOUS password was just changed and all devices were signed out. If this was not you, reset your password again immediately and contact us.</p>`),
   }),
+  // Sent to the OLD address when the login email changes. The new address is only shown masked.
+  emailChanged: (name: string, newEmail: string) => {
+    const [local, domain] = String(newEmail).split('@');
+    const masked = `${(local || '').slice(0, 1)}***@${domain || ''}`;
+    return {
+      subject: 'Your account email was changed — INFAMOUS',
+      html: layout(`<p>Hi ${esc(name || 'there')},</p><p>The email address on your INFAMOUS account was changed to <strong>${esc(masked)}</strong>. If you made this change, no action is needed.</p><p><strong>If this was not you</strong>, contact us immediately at ${esc(SUPPORT_EMAIL)} or ${esc(SUPPORT_PHONE)} so we can secure your account.</p>`),
+    };
+  },
   orderConfirmation: (order: any, customer: any, items: any[]) => {
     const rows = items.map((i) => `<tr><td style="padding:8px;border-bottom:1px solid #eee">${esc(i.product_name)}</td><td style="padding:8px;border-bottom:1px solid #eee">${esc(i.sku)}</td><td style="padding:8px;border-bottom:1px solid #eee">${esc(i.quantity)}</td><td style="padding:8px;border-bottom:1px solid #eee">₹${esc(i.price)}</td></tr>`).join('');
     return {
