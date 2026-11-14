@@ -112,8 +112,8 @@ async function startApp(port = 0) {
   base = `http://127.0.0.1:${httpServer.address().port}`;
   // wait for the server's inline startup migrations
   for (let i = 0; i < 50; i++) {
-    const r = await pool.query(`SELECT to_regclass('checkout_payment_intents') t, (SELECT count(*) FROM pg_indexes WHERE indexname='idx_exchanges_razorpay_payment_id') i`);
-    if (r.rows[0].t && Number(r.rows[0].i) === 1) break;
+    const r = await pool.query(`SELECT to_regclass('checkout_payment_intents') t, (SELECT count(*) FROM pg_indexes WHERE indexname='idx_exchanges_razorpay_payment_id') i, (SELECT count(*) FROM information_schema.columns WHERE table_name='product_returns' AND column_name='stock_restored') m`);
+    if (r.rows[0].t && Number(r.rows[0].i) === 1 && Number(r.rows[0].m) === 1) break;
     await new Promise(r => setTimeout(r, 100));
   }
   return base;

@@ -48,12 +48,16 @@ export async function sendEmail(to: string, subject: string, html: string, text?
   }
 }
 
+// Customer-care contact shown in every email footer (same details as the Contact page).
+export const SUPPORT_EMAIL = 'contact.infamous24@gmail.com';
+export const SUPPORT_PHONE = '+91 9675666878';
+
 const button = (href: string, label: string) =>
   `<p style="margin:24px 0"><a href="${esc(href)}" style="background:#111;color:#fff;padding:12px 24px;border-radius:999px;text-decoration:none;display:inline-block">${esc(label)}</a></p>` +
   `<p style="color:#888;font-size:12px">If the button does not work, copy this link into your browser:<br>${esc(href)}</p>`;
 
 const layout = (body: string) =>
-  `<div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;color:#222"><h1 style="font-style:italic;letter-spacing:1px">INFAMOUS</h1>${body}<hr style="border:none;border-top:1px solid #eee;margin:32px 0 12px"><p style="color:#888;font-size:12px">You received this email because of activity on your INFAMOUS account. If this was not you, you can ignore it.</p></div>`;
+  `<div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;color:#222"><h1 style="font-style:italic;letter-spacing:1px">INFAMOUS</h1>${body}<hr style="border:none;border-top:1px solid #eee;margin:32px 0 12px"><p style="color:#888;font-size:12px">You received this email because of activity on your INFAMOUS account. If this was not you, you can ignore it.</p><p style="color:#888;font-size:12px">INFAMOUS, 145, Jaipur House, Agra, Uttar Pradesh – 282010, India · ${SUPPORT_EMAIL} · ${SUPPORT_PHONE}</p></div>`;
 
 export const emailTemplates = {
   verifyEmail: (name: string, link: string) => ({
@@ -72,7 +76,7 @@ export const emailTemplates = {
     const rows = items.map((i) => `<tr><td style="padding:8px;border-bottom:1px solid #eee">${esc(i.product_name)}</td><td style="padding:8px;border-bottom:1px solid #eee">${esc(i.sku)}</td><td style="padding:8px;border-bottom:1px solid #eee">${esc(i.quantity)}</td><td style="padding:8px;border-bottom:1px solid #eee">₹${esc(i.price)}</td></tr>`).join('');
     return {
       subject: `Order Confirmed — #${order.order_number}`,
-      html: layout(`<p>Hi ${esc(customer.name || 'there')},</p><p>Your order <strong>#${esc(order.order_number)}</strong> has been confirmed.</p><table style="width:100%;border-collapse:collapse;margin:16px 0"><thead><tr style="background:#f5f5f5"><th style="padding:8px;text-align:left">Product</th><th style="padding:8px;text-align:left">SKU</th><th style="padding:8px;text-align:left">Qty</th><th style="padding:8px;text-align:left">Price</th></tr></thead><tbody>${rows}</tbody></table><p><strong>Total: ₹${esc(order.total_amount)}</strong></p>${Number(order.credit_applied) > 0 ? `<p>Store credit used: −₹${esc(order.credit_applied)}<br><strong>Amount to pay: ₹${esc((Number(order.total_amount) - Number(order.credit_applied)).toFixed(2))}</strong></p>` : ''}<p><strong>Payment: ${esc(order.payment_method === 'CREDIT' ? 'Store credit' : (order.payment_method || 'N/A'))}</strong></p><p>Thank you for shopping with INFAMOUS.</p>`),
+      html: layout(`<p>Hi ${esc(customer.name || 'there')},</p><p>Your order <strong>#${esc(order.order_number)}</strong> has been confirmed.</p><table style="width:100%;border-collapse:collapse;margin:16px 0"><thead><tr style="background:#f5f5f5"><th style="padding:8px;text-align:left">Product</th><th style="padding:8px;text-align:left">SKU</th><th style="padding:8px;text-align:left">Qty</th><th style="padding:8px;text-align:left">Price</th></tr></thead><tbody>${rows}</tbody></table><p>Shipping: Free</p><p><strong>Total: ₹${esc(order.total_amount)}</strong></p>${Number(order.credit_applied) > 0 ? `<p>Store credit used: −₹${esc(order.credit_applied)}<br><strong>Amount to pay: ₹${esc((Number(order.total_amount) - Number(order.credit_applied)).toFixed(2))}</strong></p>` : ''}<p><strong>Payment: ${esc(order.payment_method === 'CREDIT' ? 'Store credit' : (order.payment_method || 'N/A'))}</strong></p>${order.delivery_estimate ? `<p><strong>Delivery:</strong> ${esc(order.delivery_estimate)}. Estimates depend on serviceability and operational conditions.</p>` : ''}<p>Thank you for shopping with INFAMOUS.</p>`),
     };
   },
   adminOrder: (order: any, customer: any) => ({
@@ -88,7 +92,7 @@ export const emailTemplates = {
     };
     const [subject, line] = copy[status] || ['Order update', 'has been updated to ' + status + '.'];
     const extra = (tracking ? `<p><strong>Tracking number:</strong> ${esc(tracking)}</p>` : '') +
-      (status === 'CANCELLED' && refund && refund !== 'NONE' ? '<p>If you paid online, your refund has been started and usually reaches your account in 5-7 working days.</p>' : '') +
+      (status === 'CANCELLED' && refund && refund !== 'NONE' ? '<p>If you paid online, a refund to your original payment method has been initiated. How long it takes to appear depends on your bank or payment provider.</p>' : '') +
       (status === 'CANCELLED' && creditRestored > 0 ? `<p>₹${esc(creditRestored)} of store credit used on this order has been returned to your account.</p>` : '');
     return { subject: `${subject} — #${orderNumber}`, html: layout(`<p>Hi ${esc(name || 'there')},</p><p>Your order <strong>#${esc(orderNumber)}</strong> ${line}</p>${extra}<p><a href="${esc(appBaseUrl())}/profile/orders">View your orders</a></p>`) };
   },
@@ -96,7 +100,8 @@ export const emailTemplates = {
     const copy: Record<string, string> = {
       APPROVED: 'has been approved.', AWAITING_PAYMENT: 'has been approved. Please pay the exchange fee from your account to continue.',
       PAYMENT_CONFIRMED: 'has been approved and is ready for pickup scheduling.', REJECTED: 'could not be approved.',
-      PICKUP_SCHEDULED: 'pickup has been scheduled.', ITEM_RECEIVED: 'item has been received at our warehouse.',
+      PICKUP_SCHEDULED: 'pickup has been scheduled.', ITEM_RECEIVED: kind === 'Return' ? 'item has been received and will now be inspected.' : 'item has been received.',
+      INSPECTION_FAILED: 'item did not pass our inspection, so a refund or store credit could not be issued. The reason is given below; please contact us if you have questions.',
       DISPATCHED: 'replacement has been dispatched.', REFUND_INITIATED: 'refund has been initiated.',
       COMPLETED: 'is complete.', CANCELLED: 'has been cancelled.',
     };

@@ -61,6 +61,12 @@ export default function Orders() {
                     <div>
                       <p className="text-xs text-textSecondary uppercase tracking-[1px] mb-1">Total Amount</p>
                       <p className="font-medium">₹{parseFloat(order.total_amount).toLocaleString()}</p>
+                      {Number(order.credit_applied) > 0 && <p className="text-xs text-green-700 mt-0.5">Store credit used: −₹{Number(order.credit_applied).toLocaleString()}</p>}
+                    </div>
+                    <div>
+                      <p className="text-xs text-textSecondary uppercase tracking-[1px] mb-1">Shipping</p>
+                      <p className="font-medium text-green-700">Free Shipping</p>
+                      {order.delivery_estimate && <p className="text-xs text-textSecondary mt-0.5 max-w-[220px]">{order.delivery_estimate}</p>}
                     </div>
                   </div>
                   

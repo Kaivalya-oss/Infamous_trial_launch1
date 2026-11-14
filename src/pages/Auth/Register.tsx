@@ -115,6 +115,11 @@ export default function Register() {
               <p className="text-red-500 text-sm mt-1">{errors.root.message}</p>
             )}
 
+            <p className="text-xs text-textSecondary font-light">
+              By creating an account you agree to our{' '}
+              <Link to="/terms-and-conditions" target="_blank" className="underline underline-offset-2">Terms &amp; Conditions</Link> and{' '}
+              <Link to="/privacy-policy" target="_blank" className="underline underline-offset-2">Privacy Policy</Link>. INFAMOUS is intended for individuals aged 18 or older.
+            </p>
             <Button type="submit" isLoading={isLoading} className="mt-4 w-full">
               Register
             </Button>

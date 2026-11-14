@@ -193,7 +193,8 @@ export default function AdminOrders() {
 
               <div className="grid grid-cols-2 gap-4 mb-6">
                 <div><p className="text-xs text-white/40 uppercase tracking-[1px]">Customer</p><p className="text-sm mt-1">{selectedOrder.customer_name}</p><p className="text-xs text-white/60">{selectedOrder.customer_email}</p><p className="text-xs text-white/60">{selectedOrder.customer_phone || 'No phone'}</p></div>
-                <div><p className="text-xs text-white/40 uppercase tracking-[1px]">Payment</p><p className="text-sm mt-1">{selectedOrder.payment_method} — <span className={selectedOrder.payment_status === 'PAID' ? 'text-green-400' : 'text-yellow-400'}>{selectedOrder.payment_status}</span></p><p className="text-sm font-medium mt-1">₹{parseFloat(selectedOrder.total_amount).toLocaleString()}</p></div>
+                <div><p className="text-xs text-white/40 uppercase tracking-[1px]">Payment</p><p className="text-sm mt-1">{selectedOrder.payment_method} — <span className={selectedOrder.payment_status === 'PAID' ? 'text-green-400' : 'text-yellow-400'}>{selectedOrder.payment_status}</span></p><p className="text-sm font-medium mt-1">₹{parseFloat(selectedOrder.total_amount).toLocaleString()}</p>{Number(selectedOrder.credit_applied) > 0 && <p className="text-xs text-green-400 mt-1">Store credit used: ₹{Number(selectedOrder.credit_applied).toLocaleString()}</p>}</div>
+                <div className="col-span-2"><p className="text-xs text-white/40 uppercase tracking-[1px]">Shipping &amp; delivery promise</p><p className="text-sm mt-1">Free Shipping{selectedOrder.delivery_estimate ? ` · ${selectedOrder.delivery_estimate}` : ''}</p>{selectedOrder.delivery_type && <p className="text-xs text-white/50 mt-0.5">Promise saved when the order was placed: {String(selectedOrder.delivery_type).replace(/_/g, ' ')}</p>}</div>
               </div>
 
               {address && (

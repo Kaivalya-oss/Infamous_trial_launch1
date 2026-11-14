@@ -345,7 +345,10 @@ const count = async (sql, p) => Number((await one(sql, p)).c);
   const sv = await stock(ids.v1);
   for (const s of ['PICKUP_SCHEDULED', 'ITEM_RECEIVED']) await call('PATCH', `/api/admin/returns/${ret.body.returnRequest.id}/status`, { status: s }, ADMIN);
   const again = await call('PATCH', `/api/admin/returns/${ret.body.returnRequest.id}/status`, { status: 'ITEM_RECEIVED' }, ADMIN);
-  check('return stock restored exactly once', (await stock(ids.v1)) === sv + 1 && again.status === 400);
+  check('return: receiving the item does not restock before inspection', (await stock(ids.v1)) === sv && again.status === 400);
+  const passed = await call('PATCH', `/api/admin/returns/${ret.body.returnRequest.id}/status`, { status: 'REFUND_INITIATED' }, ADMIN);
+  const passedAgain = await call('PATCH', `/api/admin/returns/${ret.body.returnRequest.id}/status`, { status: 'REFUND_INITIATED' }, ADMIN);
+  check('return stock restored exactly once, when inspection passes', passed.status === 200 && passedAgain.status === 400 && (await stock(ids.v1)) === sv + 1);
   check('NEW_RETURN notification', await count(`SELECT count(*) c FROM admin_notifications WHERE type='NEW_RETURN'`) === 1);
   // RETURN CONCURRENCY: 5 simultaneous returns for one item -> exactly one
   const rc = await deliveredOrder(ids.carol, ids.v1, 1299);
@@ -1253,6 +1256,137 @@ const count = async (sql, p) => Number((await one(sql, p)).c);
     await call('DELETE', `/api/admin/sales/${saleId}`, null, ADMIN);
     await q('DELETE FROM sales');
     check('SALE with all sales gone the price is the list price again', Number((await priceOf(sv)).price) === 1000);
+  }
+
+  // ---------------- FREE SHIPPING, DELIVERY PROMISE, RETURN INSPECTION, LOG REDACTION ----------------
+  {
+    const mails = env.mails;
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    const shipping = require(require('path').join(env.SERVER, 'src/shipping.ts'));
+    const P = (pin, iso) => shipping.deliveryPromise(pin, new Date(iso));
+
+    // --- the 5 PM cutoff is India time, whatever the server clock is (ISO times below are UTC)
+    check('SHIP 11:29 UTC = 4:59 PM IST -> Mumbai same-day', P('400001', '2026-11-16T11:29:00Z').deliveryType === 'SAME_DAY');
+    check('SHIP 11:30 UTC = 5:00 PM IST -> Mumbai within 24 hours', P('400001', '2026-11-16T11:30:00Z').deliveryType === 'WITHIN_24_HOURS');
+    check('SHIP 16:59 UTC (before 5 PM on a UTC clock) is 10:29 PM IST -> NOT same-day', P('400001', '2026-11-16T16:59:00Z').deliveryType === 'WITHIN_24_HOURS');
+    check('SHIP 18:35 UTC = 00:05 AM IST next day -> same-day again', P('400001', '2026-11-16T18:35:00Z').deliveryType === 'SAME_DAY');
+    check('SHIP 03:00 UTC = 8:30 AM IST -> same-day', P('400001', '2026-11-16T03:00:00Z').deliveryType === 'SAME_DAY' && shipping.hourInIndia(new Date('2026-11-16T03:00:00Z')) === 8);
+    const std = P('282010', '2026-11-16T05:00:00Z');
+    check('SHIP outside Mumbai -> 4–6 days at any time of day', std.deliveryType === 'STANDARD' && std.estimatedDelivery.includes('4–6 days') && P('110001', '2026-11-16T15:00:00Z').deliveryType === 'STANDARD');
+    check('SHIP every promise is free', [P('400001', '2026-11-16T03:00:00Z'), P('400001', '2026-11-16T15:00:00Z'), std].every(p => p.charge === 0 && p.freeShipping === true));
+    check('SHIP malformed pincodes never get the Mumbai promise', P('4000', '2026-11-16T03:00:00Z').deliveryType === 'STANDARD' && P('', '2026-11-16T03:00:00Z').deliveryType === 'STANDARD');
+
+    // --- API: free, and agrees with the same function
+    const expectMumbai = shipping.deliveryPromise('400001');
+    const apiM = await call('POST', '/api/shipping/calculate', { pincode: '400001' });
+    const apiS = await call('POST', '/api/shipping/calculate', { pincode: '282010' });
+    check('SHIP API returns a zero charge and free-shipping flag', apiM.status === 200 && apiM.body.shipping.charge === 0 && apiM.body.shipping.freeShipping === true && apiS.body.shipping.charge === 0, apiM.body);
+    check('SHIP API estimate matches the backend rule (Mumbai now / outside Mumbai)', apiM.body.shipping.deliveryType === expectMumbai.deliveryType && apiM.body.shipping.estimatedDelivery === expectMumbai.estimatedDelivery && apiS.body.shipping.deliveryType === 'STANDARD' && apiS.body.shipping.estimatedDelivery === 'Estimated delivery in 4–6 days', apiS.body);
+    check('SHIP API no longer exposes the old ₹100/₹150 amounts', !JSON.stringify(apiM.body).includes('150') && !JSON.stringify(apiS.body).includes('100'));
+    check('SHIP API rejects an invalid pincode', (await call('POST', '/api/shipping/calculate', { pincode: '12' })).status === 400);
+
+    // --- orders: nothing is added for shipping and the promise is saved on the order
+    let seq = 0;
+    const mkUser = async (name) => {
+      const email = `${name}@ship.test`;
+      const id = (await one(`INSERT INTO users (name,email,password_hash,phone_number,email_verified) VALUES ($1,$2,$3,$4,true) RETURNING id`, [name, email, await bcrypt.hash('ShipPass12', 4), `+9197000${String(10000 + (++seq)).slice(1)}`])).id;
+      await q('INSERT INTO cart (user_id) VALUES ($1)', [id]);
+      return { id, email, tok: (await login(email, 'ShipPass12')).accessToken };
+    };
+    const catId = (await one('SELECT id FROM categories LIMIT 1')).id;
+    const prod = (await one(`INSERT INTO products (name,slug,status,category_id) VALUES ('Ship Tee','ship-tee','PUBLISHED',$1) RETURNING id`, [catId])).id;
+    const v = (await one(`INSERT INTO product_variants (product_id,sku,color,size,price,stock) VALUES ($1,'SH-A','Grey','M',700,50) RETURNING id`, [prod])).id;
+    const U = await mkUser('ship1');
+    const AGRA = { ...ADDR, city: 'Agra', state: 'Uttar Pradesh', pincode: '282010' };
+    const items = [{ variant_id: v, quantity: 1 }];
+    const orderRow = (id) => one('SELECT total_amount, credit_applied, delivery_type, delivery_estimate FROM orders WHERE id=$1', [id]);
+    const payRow = (id) => one('SELECT amount, payment_method FROM payments WHERE order_id=$1', [id]);
+
+    // capture server logs while orders are placed, to prove no phone number / SMS text is written
+    const logged = []; const realLog = console.log;
+    console.log = (...a) => { logged.push(a.map(String).join(' ')); };
+    const codM = await call('POST', '/api/checkout/cod', { items, address: ADDR }, U.tok);
+    const codS = await call('POST', '/api/checkout/cod', { items, address: AGRA }, U.tok);
+    await sleep(150);
+    console.log = realLog;
+    const oM = await orderRow(codM.body.orderId), oS = await orderRow(codS.body.orderId);
+    check('SHIP COD order total is the item price only (no shipping added)', codM.status === 200 && Number(oM.total_amount) === 700 && Number((await payRow(codM.body.orderId)).amount) === 700 && codM.body.amountDue === 700, codM.body);
+    check('SHIP Mumbai order saves the delivery promise in force when it was created', oM.delivery_type === shipping.deliveryPromise('400001').deliveryType && ['SAME_DAY', 'WITHIN_24_HOURS'].includes(oM.delivery_type) && !!oM.delivery_estimate, oM);
+    check('SHIP outside-Mumbai order saves the 4–6 day estimate', oS.delivery_type === 'STANDARD' && oS.delivery_estimate === 'Estimated delivery in 4–6 days', oS);
+    check('LOGS placing orders writes no phone number and no SMS text to the logs', logged.some(l => l.includes('[SMS]')) && !logged.some(l => /\+?91\s?9\d{9}|9000000000|Your (COD )?order #/.test(l)), logged.filter(l => l.includes('SMS')).slice(0, 2));
+    const detail = await call('GET', `/api/orders/${codS.body.orderId}`, null, U.tok);
+    check('SHIP order details expose the saved delivery estimate', detail.status === 200 && detail.body.order.delivery_type === 'STANDARD' && detail.body.order.delivery_estimate.includes('4–6 days'));
+    await sleep(150);
+    const cm = mails.find(m => m.to === U.email && m.subject.includes('Order Confirmed') && m.html.includes('4–6 days'));
+    check('SHIP confirmation email says shipping is free and gives the estimate', !!cm && cm.html.includes('Shipping: Free'));
+    check('EMAIL footer carries the customer-care contact details', !!cm && cm.html.includes('contact.infamous24@gmail.com') && cm.html.includes('+91 9675666878') && cm.html.includes('Agra'));
+
+    // Razorpay: amount is the item price; the promise is saved when the order is created after payment
+    const rz = await call('POST', '/api/checkout/create-order', { items, address: AGRA }, U.tok);
+    const vr = await call('POST', '/api/checkout/verify-payment', { razorpay_order_id: rz.body.razorpayOrderId, razorpay_payment_id: 'pay_SH1', razorpay_signature: sig(rz.body.razorpayOrderId, 'pay_SH1'), address: AGRA }, U.tok);
+    const oR = await one('SELECT id, total_amount, delivery_type FROM orders WHERE user_id=$1 ORDER BY id DESC LIMIT 1', [U.id]);
+    check('SHIP Razorpay charges the item price only and the order keeps its promise', rz.body.amount === 70000 && vr.status === 200 && Number(oR.total_amount) === 700 && oR.delivery_type === 'STANDARD', { amount: rz.body.amount, vr: vr.status });
+
+    // store credit: full and partial
+    await call('POST', `/api/admin/customers/${U.id}/credit`, { amount: 1000, reason: 'Shipping test credit' }, ADMIN);
+    const full = await call('POST', '/api/checkout/credit', { items, address: ADDR }, U.tok);
+    check('SHIP full store-credit order: credit equals the item price, nothing extra for shipping', full.status === 200 && full.body.creditApplied === 700 && full.body.amountDue === 0 && !!(await orderRow(full.body.orderId)).delivery_type, full.body);
+    const part = await call('POST', '/api/checkout/cod', { items, address: AGRA, useCredit: true }, U.tok);
+    check('SHIP part store-credit order: 300 credit + 400 to pay = 700, no shipping', part.status === 200 && part.body.creditApplied === 300 && part.body.amountDue === 400 && Number((await orderRow(part.body.orderId)).total_amount) === 700, part.body);
+    const rzc = await call('POST', '/api/admin/customers/' + U.id + '/credit', { amount: 200, reason: 'Shipping test credit 2' }, ADMIN);
+    const rz2 = await call('POST', '/api/checkout/create-order', { items, address: ADDR, useCredit: true }, U.tok);
+    check('SHIP Razorpay with part credit charges price minus credit, no shipping', rzc.status === 200 && rz2.status === 200 && rz2.body.amount === 50000 && rz2.body.creditApplied === 200, rz2.body);
+
+    // --- returns: inspection outcome
+    const R = await mkUser('ship2');
+    const stock0 = await stock(v);
+    const mkReturn = async (method) => {
+      const d = await deliveredOrder(R.id, v, 700);
+      const r = await call('POST', '/api/returns', { order_item_id: d.itemId, reason: 'Size', ...(method ? { refund_method: method } : {}) }, R.tok);
+      return { ...d, id: r.body.returnRequest.id, res: r };
+    };
+    const step = (id, status, admin_notes) => call('PATCH', `/api/admin/returns/${id}/status`, { status, admin_notes }, ADMIN);
+
+    const ok = await mkReturn('CREDIT');
+    check('RETURN-INSPECT submitting a request does not claim approval of the refund', ok.res.status === 201 && /inspected/i.test(ok.res.body.message) && !/approved/i.test(ok.res.body.message), ok.res.body.message);
+    await step(ok.id, 'PICKUP_SCHEDULED');
+    await step(ok.id, 'ITEM_RECEIVED');
+    check('RETURN-INSPECT receiving the parcel does not put stock back or pay anything', await stock(v) === stock0 && Number((await one('SELECT credit_balance FROM users WHERE id=$1', [R.id])).credit_balance) === 0);
+    const pass = await step(ok.id, 'REFUND_INITIATED');
+    check('RETURN-INSPECT inspection passed: stock restored once and the credit issued', pass.status === 200 && await stock(v) === stock0 + 1 && Number((await one('SELECT credit_balance FROM users WHERE id=$1', [R.id])).credit_balance) === 700);
+    check('RETURN-INSPECT the pass step cannot be repeated (no second restock or credit)', (await step(ok.id, 'REFUND_INITIATED')).status === 400 && await stock(v) === stock0 + 1 && Number((await one('SELECT credit_balance FROM users WHERE id=$1', [R.id])).credit_balance) === 700);
+
+    const bad = await mkReturn('CREDIT');
+    await step(bad.id, 'PICKUP_SCHEDULED');
+    check('RETURN-INSPECT inspection cannot fail before the item is received', (await step(bad.id, 'INSPECTION_FAILED', 'Worn and washed')).status === 400);
+    await step(bad.id, 'ITEM_RECEIVED');
+    check('RETURN-INSPECT a failed inspection needs a recorded reason', (await step(bad.id, 'INSPECTION_FAILED')).status === 400 && (await step(bad.id, 'INSPECTION_FAILED', ' ')).status === 400);
+    const mark = mails.length, refundsBefore = env.razorpayRefunds.length, stockBefore = await stock(v);
+    const fail = await step(bad.id, 'INSPECTION_FAILED', 'Item was worn and the tags were removed <b>');
+    const badRow = await one('SELECT status, admin_notes, credit_issued, cash_refund_amount, stock_restored FROM product_returns WHERE id=$1', [bad.id]);
+    check('RETURN-INSPECT inspection failed is recorded with its reason and kept (not deleted)', fail.status === 200 && badRow.status === 'INSPECTION_FAILED' && badRow.admin_notes.includes('worn'), badRow);
+    check('RETURN-INSPECT a failed inspection issues no refund, no credit and restocks nothing', Number(badRow.credit_issued) === 0 && Number(badRow.cash_refund_amount) === 0 && badRow.stock_restored === false && await stock(v) === stockBefore && env.razorpayRefunds.length === refundsBefore && Number((await one('SELECT credit_balance FROM users WHERE id=$1', [R.id])).credit_balance) === 700);
+    await sleep(200);
+    const fm = mails.slice(mark).find(m => m.to === R.email && m.subject.includes('Return'));
+    check('RETURN-INSPECT the customer is emailed the outcome and the (escaped) reason', !!fm && fm.html.includes('did not pass our inspection') && fm.html.includes('tags were removed &lt;b&gt;') && !fm.html.includes('removed <b>'), fm && fm.html.slice(0, 200));
+    check('RETURN-INSPECT a failed return is final: no refund step, no completion, no cancellation', (await step(bad.id, 'REFUND_INITIATED')).status === 400 && (await step(bad.id, 'COMPLETED')).status === 400 && (await step(bad.id, 'CANCELLED', 'x y z')).status === 400);
+    check('RETURN-INSPECT the same item cannot be submitted for return again after failing', (await call('POST', '/api/returns', { order_item_id: bad.itemId, reason: 'Again' }, R.tok)).status === 409);
+    const listed = (await call('GET', '/api/returns', null, R.tok)).body.returns.find(r => r.id === bad.id);
+    check('RETURN-INSPECT the customer sees the failed status and the reason in their account', !!listed && listed.status === 'INSPECTION_FAILED' && listed.admin_notes.includes('worn'));
+
+    // rows received under the old behaviour (stock already restored then) are never restocked twice
+    const legacy = await mkReturn();
+    await q(`UPDATE product_returns SET status='ITEM_RECEIVED', stock_restored=TRUE WHERE id=$1`, [legacy.id]);
+    await q(`INSERT INTO payments (order_id,user_id,payment_method,amount,status) VALUES ($1,$2,'COD',700,'PAID')`, [legacy.orderId, R.id]);
+    const stockL = await stock(v);
+    await step(legacy.id, 'REFUND_INITIATED');
+    check('RETURN-INSPECT a return already restocked before this change is not restocked again', await stock(v) === stockL);
+
+    // 8 days after delivery: outside the window for both returns and exchanges
+    const late = await deliveredOrder(R.id, v, 700, 1, 8);
+    check('RETURN 7-day window: a request on day 8 is refused', (await call('POST', '/api/returns', { order_item_id: late.itemId, reason: 'Late' }, R.tok)).status === 403);
+    const inTime = await deliveredOrder(R.id, v, 700, 1, 6);
+    check('RETURN 7-day window: a request on day 6 is accepted', (await call('POST', '/api/returns', { order_item_id: inTime.itemId, reason: 'In time' }, R.tok)).status === 201);
   }
 
   // ---------------- CORS ----------------

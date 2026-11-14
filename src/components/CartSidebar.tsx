@@ -97,6 +97,10 @@ export default function CartSidebar() {
             {/* Footer */}
             {items.length > 0 && (
               <div className="p-6 border-t border-black/10 bg-white/50 backdrop-blur-md">
+                <div className="flex justify-between items-center mb-2 text-sm">
+                  <span className="text-textSecondary">Shipping</span>
+                  <span className="font-medium text-green-700">Free Shipping</span>
+                </div>
                 <div className="flex justify-between items-center mb-6">
                   <span className="font-medium text-textSecondary">Subtotal</span>
                   <span className="font-serif text-2xl">₹{cartTotal.toLocaleString()}</span>

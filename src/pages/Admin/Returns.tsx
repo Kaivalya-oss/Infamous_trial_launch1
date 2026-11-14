@@ -4,9 +4,10 @@ import { motion } from 'framer-motion';
 import { RefreshCw, CheckCircle, XCircle, Search, Package, Truck, IndianRupee, X } from 'lucide-react';
 
 const STATUS_CFG: Record<string, { label: string; color: string }> = {
-  APPROVED:          { label: 'Approved',          color: 'bg-green-500/20 text-green-400' },
+  APPROVED:          { label: 'Requested',         color: 'bg-green-500/20 text-green-400' },
   PICKUP_SCHEDULED:  { label: 'Pickup Scheduled',  color: 'bg-purple-500/20 text-purple-400' },
   ITEM_RECEIVED:     { label: 'Item Received',     color: 'bg-cyan-500/20 text-cyan-400' },
+  INSPECTION_FAILED: { label: 'Inspection Failed', color: 'bg-red-500/20 text-red-400' },
   REFUND_INITIATED:  { label: 'Refund Initiated',  color: 'bg-orange-500/20 text-orange-400' },
   COMPLETED:         { label: 'Completed',         color: 'bg-blue-500/20 text-blue-400' },
   CANCELLED:         { label: 'Cancelled',         color: 'bg-white/10 text-white/40' },
@@ -42,7 +43,11 @@ function ActionButtons({ returnItem, onAction }: { returnItem: any; onAction: (i
       );
       break;
     case 'ITEM_RECEIVED':
-      actions.push({ status: 'REFUND_INITIATED', label: 'Refund / Issue Credit', style: 'bg-orange-500/20 hover:bg-orange-500/30 text-orange-400', icon: IndianRupee, needsNotes: false });
+      // The received item is inspected. Passed -> refund / credit (stock goes back on sale). Failed -> no refund; the reason is emailed to the customer.
+      actions.push(
+        { status: 'REFUND_INITIATED', label: 'Inspection Passed: Refund / Credit', style: 'bg-orange-500/20 hover:bg-orange-500/30 text-orange-400', icon: IndianRupee, needsNotes: false },
+        { status: 'INSPECTION_FAILED', label: 'Inspection Failed', style: 'bg-red-500/20 hover:bg-red-500/30 text-red-400', icon: XCircle, needsNotes: true }
+      );
       break;
     case 'REFUND_INITIATED':
       actions.push({ status: 'COMPLETED', label: 'Mark Completed', style: 'bg-blue-500/20 hover:bg-blue-500/30 text-blue-400', icon: CheckCircle, needsNotes: false });
@@ -125,7 +130,7 @@ export default function AdminReturns() {
     if (status === 'REFUND_INITIATED') {
       const r = returns.find(x => x.id === id);
       const how = r?.refund_method === 'CREDIT' ? 'add store credit' : 'refund the original payment (online orders) or flag a manual refund (cash on delivery)';
-      if (!window.confirm(`This will ${how} for ₹${Number(r?.refund_amount || 0).toFixed(0)} right now and cannot be undone. Continue?`)) return;
+      if (!window.confirm(`Confirm the item passed inspection. This will ${how} for ₹${Number(r?.refund_amount || 0).toFixed(0)} right now and cannot be undone. Continue?`)) return;
     }
     try {
       const res = await api.patch(`/api/admin/returns/${id}/status`, { status, admin_notes: adminNotes || undefined });
@@ -182,7 +187,7 @@ export default function AdminReturns() {
             />
           </div>
           <div className="flex gap-2 flex-wrap">
-            {['ALL', 'APPROVED', 'PICKUP_SCHEDULED', 'ITEM_RECEIVED', 'REFUND_INITIATED', 'COMPLETED', 'CANCELLED'].map(s => (
+            {['ALL', 'APPROVED', 'PICKUP_SCHEDULED', 'ITEM_RECEIVED', 'INSPECTION_FAILED', 'REFUND_INITIATED', 'COMPLETED', 'CANCELLED'].map(s => (
               <button
                 key={s}
                 onClick={() => setStatusFilter(s)}

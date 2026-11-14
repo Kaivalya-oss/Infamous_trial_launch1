@@ -11,6 +11,7 @@ import crypto from 'crypto';
 import Razorpay from 'razorpay';
 import { sendTemplate, emailTemplates, appBaseUrl } from './email';
 import { SALES_MIGRATION, saleJoin, effectivePrice, compareAtPrice, validateSale } from './sales';
+import { deliveryPromise, LAUNCH_MIGRATION } from './shipping';
 import { CREDIT_MIGRATION, addCredit, spendCredit, postCredit, splitRefund, round2 } from './credits';
 import { initializeApp, getApps } from 'firebase-admin/app';
 import { getAuth as getFirebaseAdminAuth } from 'firebase-admin/auth';
@@ -61,7 +62,9 @@ async function sendAdminOrderNotification(order: any, customer: any) {
 function logSmsNotification(phone: string, message: string) {
   // SMS provider integration point - configure SMS_PROVIDER_API_KEY env var
   // For now, log the SMS that would be sent
-  console.log(`[SMS] To: ${phone} | Message: ${message}`);
+  // Never log the phone number or the message text: both are personal data.
+  void phone; void message;
+  console.log('[SMS] notification skipped: no SMS provider configured');
   // TODO: Integrate with Twilio/MSG91 when SMS_PROVIDER_API_KEY is set
 }
 
@@ -192,6 +195,7 @@ const intentsMigration = pool.query(`
 intentsMigration
   .then(() => pool.query(CREDIT_MIGRATION))
   .then(() => pool.query(SALES_MIGRATION))
+  .then(() => pool.query(LAUNCH_MIGRATION))
   .catch((err: any) => console.error('Failed to migrate store credit / sales:', err.message));
 // Separate statement so a failure here can never roll back the table above
 pool.query(`
@@ -1236,10 +1240,12 @@ async function createOrderTransaction(
     throw new Error('Order total changed after payment was created. Please contact support with your payment ID.');
   }
 
+  // Delivery promise as of the moment the order is created (not when the pincode was first typed)
+  const promise = deliveryPromise(address.pincode);
   const orderNumber = `INF-${new Date().getFullYear()}-${crypto.randomInt(10000, 99999)}`;
   const orderRes = await client.query(
-    `INSERT INTO orders (order_number, user_id, total_amount, status, shipping_address, customer_email, customer_phone, idempotency_key, credit_applied) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
-    [orderNumber, userId, totalAmount, 'CONFIRMED', JSON.stringify(address), finalEmail, finalPhone, idempotencyKey || null, creditApplied]
+    `INSERT INTO orders (order_number, user_id, total_amount, status, shipping_address, customer_email, customer_phone, idempotency_key, credit_applied, delivery_type, delivery_estimate) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
+    [orderNumber, userId, totalAmount, 'CONFIRMED', JSON.stringify(address), finalEmail, finalPhone, idempotencyKey || null, creditApplied, promise.deliveryType, promise.estimatedDelivery]
   );
   const order = orderRes.rows[0];
   if (creditApplied > 0) await spendCredit(client, userId, creditApplied, order.id, `Order ${orderNumber}`);
@@ -1379,7 +1385,7 @@ const MAX_REFUND_ATTEMPTS = 5;
 function paymentIssueMessage(paymentId: string, reason?: string, refund: 'REFUNDED' | 'PENDING' | 'NONE' = 'PENDING') {
   const refundText = refund === 'REFUNDED'
     ? 'A full refund has been issued to your original payment method.'
-    : 'A full refund is being processed automatically; if you do not see it within a few days, contact support with this payment ID.';
+    : 'A full refund has been initiated automatically. How long it takes to appear depends on your bank or payment provider; contact support with this payment ID if you need help.';
   return `We received your payment (ID ${paymentId}) but could not confirm your order${reason ? `: ${reason}` : '.'} ${refundText}`;
 }
 
@@ -1853,36 +1859,17 @@ app.post('/api/shipping/calculate', (req, res) => {
       });
     }
 
-    const isMumbai = pincode.startsWith('400');
-    const currentHour = new Date().getHours();
-    
-    let deliveryType = 'STANDARD';
-    let charge = 100;
-    let estimatedDelivery = '3-5 Business Days';
-    let slot = null;
-
-    if (isMumbai) {
-      if (currentHour < 17) {
-        deliveryType = 'SAME_DAY';
-        charge = 150;
-        estimatedDelivery = 'Today by 9 PM';
-        slot = 'Evening Slot';
-      } else {
-        deliveryType = 'NEXT_DAY';
-        charge = 100;
-        estimatedDelivery = 'Tomorrow by 9 PM';
-        slot = 'Next Day Slot';
-      }
-    }
-
+    // Shipping is free. The estimate comes from one place (./shipping) and uses India time for the 5 PM cutoff.
+    // It is re-evaluated and saved on the order when the order is actually created.
+    const promise = deliveryPromise(pincode);
     return res.status(200).json({
       success: true,
       shipping: {
         available: true,
-        charge,
-        estimatedDelivery,
-        deliveryType,
-        slot
+        charge: promise.charge,
+        freeShipping: true,
+        estimatedDelivery: promise.estimatedDelivery,
+        deliveryType: promise.deliveryType
       }
     });
   } catch (error) {
@@ -3689,7 +3676,9 @@ app.get('/api/admin/logistics', verifyAdmin, async (req, res) => {
 const RETURN_TRANSITIONS: Record<string, string[]> = {
   APPROVED:          ['PICKUP_SCHEDULED', 'CANCELLED'],
   PICKUP_SCHEDULED:  ['ITEM_RECEIVED', 'CANCELLED'],
-  ITEM_RECEIVED:     ['REFUND_INITIATED'],
+  // Received items are inspected: passed -> REFUND_INITIATED (refund / credit), failed -> INSPECTION_FAILED (no refund)
+  ITEM_RECEIVED:     ['REFUND_INITIATED', 'INSPECTION_FAILED'],
+  INSPECTION_FAILED: [],
   REFUND_INITIATED:  ['COMPLETED'],
   COMPLETED:         [],
   CANCELLED:         [],
@@ -3794,7 +3783,7 @@ app.post('/api/returns', authenticateToken, async (req: any, res) => {
 
     res.status(201).json({
       success: true,
-      message: 'Return request submitted and approved',
+      message: 'Return request submitted. We will arrange a pickup; refunds and credit are issued after the item is received and inspected.',
       returnRequest: returnRecord,
     });
   } catch (error) {
@@ -3895,7 +3884,10 @@ app.patch('/api/admin/returns/:id/status', verifyAdmin, async (req: any, res) =>
   const { id } = req.params;
   const { status, admin_notes } = req.body;
 
-  const validStatuses = ['PICKUP_SCHEDULED', 'ITEM_RECEIVED', 'REFUND_INITIATED', 'COMPLETED', 'CANCELLED'];
+  const validStatuses = ['PICKUP_SCHEDULED', 'ITEM_RECEIVED', 'INSPECTION_FAILED', 'REFUND_INITIATED', 'COMPLETED', 'CANCELLED'];
+  if (status === 'INSPECTION_FAILED' && (typeof admin_notes !== 'string' || admin_notes.trim().length < 3 || admin_notes.length > 1000)) {
+    return res.status(400).json({ message: 'Please record why the item failed inspection (3-1000 characters). The reason is sent to the customer.' });
+  }
   if (!validStatuses.includes(status)) {
     return res.status(400).json({ message: `Invalid status. Must be one of: ${validStatuses.join(', ')}` });
   }
@@ -3936,12 +3928,13 @@ app.patch('/api/admin/returns/:id/status', verifyAdmin, async (req: any, res) =>
       }
     }
 
-    // On ITEM_RECEIVED, restore stock
-    if (status === 'ITEM_RECEIVED') {
-      await client.query(
-        'UPDATE product_variants SET stock = stock + $1 WHERE id = $2',
-        [returnRecord.quantity, returnRecord.variant_id]
-      );
+    // Returned stock goes back on sale only after inspection has passed (the refund / credit step), and only
+    // once per return. Receiving the parcel (ITEM_RECEIVED) or a failed inspection never restocks.
+    if (status === 'REFUND_INITIATED') {
+      const first = await client.query('UPDATE product_returns SET stock_restored = TRUE WHERE id = $1 AND stock_restored = FALSE RETURNING id', [id]);
+      if (first.rows.length > 0) {
+        await client.query('UPDATE product_variants SET stock = stock + $1 WHERE id = $2', [returnRecord.quantity, returnRecord.variant_id]);
+      }
     }
 
     const updateRes = await client.query(`

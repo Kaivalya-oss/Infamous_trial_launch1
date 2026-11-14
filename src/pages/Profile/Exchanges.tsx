@@ -82,6 +82,8 @@ const STATUS_CONFIG: Record<string, { label: string; color: string; icon: any }>
   PICKUP_SCHEDULED:  { label: 'Pickup Scheduled',     color: 'bg-purple-500/15 text-purple-600 border-purple-400/30', icon: Truck },
   ITEM_RECEIVED:     { label: 'Item Received',        color: 'bg-cyan-500/15 text-cyan-600 border-cyan-400/30', icon: Package },
   REFUND_INITIATED:  { label: 'Refund Initiated',     color: 'bg-amber-500/15 text-amber-600 border-amber-400/30', icon: IndianRupee },
+  INSPECTION_FAILED: { label: 'Inspection Not Passed', color: 'bg-red-500/15 text-red-600 border-red-400/30', icon: XCircle },
+  RETURN_REQUESTED:  { label: 'Request Received',     color: 'bg-blue-500/15 text-blue-600 border-blue-400/30', icon: Clock },
   DISPATCHED:        { label: 'Dispatched',           color: 'bg-indigo-500/15 text-indigo-600 border-indigo-400/30', icon: Truck },
   COMPLETED:         { label: 'Completed',            color: 'bg-green-500/15 text-green-700 border-green-400/30', icon: CheckCircle2 },
   REJECTED:          { label: 'Rejected',             color: 'bg-red-500/15 text-red-600 border-red-400/30', icon: XCircle },
@@ -693,8 +695,8 @@ function ReturnModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: (
                     <p className="text-xs font-medium tracking-[1px] uppercase text-textSecondary mb-2">How would you like your refund?</p>
                     <div className="flex flex-col gap-2">
                       {([
-                        ['ORIGINAL', 'Refund to my original payment', 'Online payments go back to the card/UPI used (5-7 working days). Cash-on-delivery orders are refunded by our team by bank/UPI transfer.'],
-                        ['CREDIT', 'Store credit', 'Added to your INFAMOUS account as soon as we receive the item. Use it on any future order. It does not expire and cannot be withdrawn as cash.'],
+                        ['ORIGINAL', 'Refund to my original payment', 'Online payments go back to the original payment method; how long it takes to appear depends on your bank or payment provider. Cash-on-delivery orders are refunded by our team by bank transfer or UPI, and our support team may contact you for the details needed.'],
+                        ['CREDIT', 'Store credit', 'Added to your INFAMOUS account once the returned item has been received and has passed inspection. It does not expire, cannot be withdrawn as cash and cannot be transferred.'],
                       ] as const).map(([value, title, hint]) => (
                         <button
                           key={value}
@@ -711,7 +713,7 @@ function ReturnModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: (
 
                   <div className="p-4 rounded-[14px] bg-green-50 border border-green-200/60 text-xs text-green-800 flex gap-2">
                     <CheckCircle2 size={14} className="shrink-0 mt-0.5" />
-                    <span>Your return will be approved immediately. Our team will schedule a pickup and {refundMethod === 'CREDIT' ? 'add the store credit' : 'process your refund'} after the item is received and inspected.</span>
+                    <span>Our team will contact you to arrange the pickup. The item is inspected when we receive it: it must be unworn, unwashed and undamaged, with its original tags and packaging. {refundMethod === 'CREDIT' ? 'Store credit is added' : 'Your refund is initiated'} once it passes inspection.</span>
                   </div>
                 </div>
 
@@ -1025,7 +1027,7 @@ export default function Exchanges() {
                     </div>
                   </div>
                   <div className="flex flex-col gap-2 items-start md:items-end shrink-0">
-                    <StatusBadge status={ret.status} />
+                    <StatusBadge status={ret.status === 'APPROVED' ? 'RETURN_REQUESTED' : ret.status} />
                   </div>
                 </div>
               ))}
@@ -1045,7 +1047,7 @@ export default function Exchanges() {
                     <p className="font-medium text-sm">{ret.product_name} / {ret.size}</p>
                     <p className="text-xs text-textSecondary mt-0.5">{new Date(ret.created_at).toLocaleDateString()} · ₹{parseFloat(ret.refund_amount).toLocaleString()}</p>
                   </div>
-                  <StatusBadge status={ret.status} />
+                  <StatusBadge status={ret.status === 'APPROVED' ? 'RETURN_REQUESTED' : ret.status} />
                 </div>
               ))}
             </div>

@@ -91,6 +91,12 @@ export default function OrderSuccess() {
             </div>
           </div>
 
+          <div className="mb-8 p-4 rounded-[16px] bg-green-50 border border-green-200 text-sm">
+            <p className="font-medium text-green-800">Free Shipping</p>
+            {order.delivery_estimate && <p className="text-green-800/90 mt-1">{order.delivery_estimate}</p>}
+            <p className="text-xs text-green-700/80 mt-1">Delivery estimates are subject to serviceability and operational conditions.</p>
+          </div>
+
           {/* Items */}
           <h3 className="text-sm font-medium uppercase tracking-[1px] text-textSecondary mb-4">Items Ordered</h3>
           <div className="flex flex-col gap-4 mb-8">

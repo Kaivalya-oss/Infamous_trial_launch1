@@ -48,6 +48,8 @@ export default function Checkout() {
   const [creditBalance, setCreditBalance] = useState(0);
   const [useCredit, setUseCredit] = useState(true);
   const [deliveryType, setDeliveryType] = useState<string | null>(null);
+  // Delivery estimate text comes from the server (single source of truth, India time for the 5 PM cutoff)
+  const [deliveryEstimate, setDeliveryEstimate] = useState('');
   const [selectedSlot, setSelectedSlot] = useState<string | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [addressData, setAddressData] = useState<CheckoutFormValues | null>(null);
@@ -120,8 +122,11 @@ export default function Checkout() {
   useEffect(() => {
     if (watchPincode && watchPincode.length === 6) {
       api.post('/api/shipping/calculate', { pincode: watchPincode })
-        .then(response => setDeliveryType(response.data.shipping?.deliveryType || 'STANDARD'))
-        .catch(() => setDeliveryType(null));
+        .then(response => {
+          setDeliveryType(response.data.shipping?.deliveryType || 'STANDARD');
+          setDeliveryEstimate(response.data.shipping?.estimatedDelivery || '');
+        })
+        .catch(() => { setDeliveryType(null); setDeliveryEstimate(''); });
     } else {
       setDeliveryType(null);
     }
@@ -425,24 +430,11 @@ export default function Checkout() {
                     {deliveryType && (
                       <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} className="mb-8">
                         <h3 className="text-sm font-medium mb-4 flex items-center gap-2"><Truck size={16} /> Delivery Estimate</h3>
-                        {deliveryType === 'SAME_DAY' && (
-                          <div className="bg-green-50 border border-green-200 p-4 rounded-[16px]">
-                            <p className="font-medium text-green-800">Express Delivery Available!</p>
-                            <p className="text-xs text-green-600/80 mt-1">Your order can be delivered today.</p>
-                          </div>
-                        )}
-                        {deliveryType === 'NEXT_DAY' && (
-                          <div className="bg-orange-50 border border-orange-200 p-4 rounded-[16px]">
-                            <p className="font-medium text-orange-800">Next Day Delivery</p>
-                            <p className="text-xs text-orange-600/80 mt-1">Your order will arrive tomorrow.</p>
-                          </div>
-                        )}
-                        {deliveryType === 'STANDARD' && (
-                          <div className="bg-gray-50 border border-gray-200 p-4 rounded-[16px]">
-                            <p className="font-medium text-gray-800">Standard Delivery</p>
-                            <p className="text-xs text-gray-500 mt-1">Estimated: 4-6 Business Days</p>
-                          </div>
-                        )}
+                        <div className="bg-green-50 border border-green-200 p-4 rounded-[16px]">
+                          <p className="font-medium text-green-800">Free Shipping</p>
+                          <p className="text-sm text-green-800/90 mt-1">{deliveryEstimate || 'Estimated delivery in 4–6 days'}</p>
+                          <p className="text-xs text-green-700/80 mt-1">The estimate is confirmed when your order is placed and is subject to serviceability and operational conditions.</p>
+                        </div>
                       </motion.div>
                     )}
                   </AnimatePresence>
@@ -508,6 +500,12 @@ export default function Checkout() {
                       'Select a Payment Method'
                     )}
                   </Button>
+                  <p className="text-xs text-textSecondary mt-4 text-center">
+                    By placing your order you agree to our{' '}
+                    <Link to="/terms-and-conditions" target="_blank" className="underline underline-offset-2">Terms &amp; Conditions</Link>,{' '}
+                    <Link to="/returns-refunds" target="_blank" className="underline underline-offset-2">Returns &amp; Refunds</Link> and{' '}
+                    <Link to="/privacy-policy" target="_blank" className="underline underline-offset-2">Privacy Policy</Link>.
+                  </p>
                 </div>
               </div>
             </>
@@ -548,7 +546,7 @@ export default function Checkout() {
               </div>
               <div className="flex justify-between text-textSecondary">
                 <span>Shipping</span>
-                <span>Calculated at delivery</span>
+                <span className="text-green-700 font-medium">Free Shipping</span>
               </div>
               {creditApplied > 0 && (
                 <div className="flex justify-between text-green-700">
